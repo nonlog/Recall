@@ -140,8 +140,9 @@ full product direction:
 - when no project or repo is provided outside a Git repository, it defaults to
   personal scope over the recent `30d` window;
 - it renders project and personal conversation timelines, chunks long sessions,
-  filters low-level transcript artifacts, and emits a small discussion-prompt
-  layer.
+  filters low-level transcript artifacts, emits deterministic source-role,
+  project-activity, and task-shape summaries, and emits a small
+  discussion-prompt layer.
 
 The implemented baseline does not yet support a TUI output mode, proposal
 persistence, or instruction-file patch application.
@@ -279,11 +280,14 @@ Recall reflect for <scope>:
 
 1. Scope summary
 2. Timeline
-3. Observed workflow patterns
-4. Discussion prompts
-5. Calibration targets confirmed by the user
-6. Optional proposals
-7. Follow-up checks from previous calibrations
+3. Source roles
+4. Project activity
+5. Task shapes
+6. Observed workflow patterns
+7. Discussion prompts
+8. Calibration targets confirmed by the user
+9. Optional proposals
+10. Follow-up checks from previous calibrations
 ```
 
 The main timeline should read like a concise history of human intent and agent
@@ -307,7 +311,24 @@ conversation:
     {
       "source": "claude-code",
       "observed_role": "Exploration and broad planning",
+      "sessions": 2,
+      "timeline_moments": 6,
       "evidence_moments": ["moment-1", "moment-3"]
+    }
+  ],
+  "project_summaries": [
+    {
+      "project": "/path/to/repo",
+      "sessions": 3,
+      "timeline_moments": 12,
+      "sources": ["codex", "claude-code"]
+    }
+  ],
+  "task_shapes": [
+    {
+      "shape": "planning",
+      "timeline_moments": 4,
+      "evidence_moments": ["moment-1", "moment-5"]
     }
   ],
   "timeline": [
@@ -369,7 +390,8 @@ the data plane and query protocol.
 - `recall-reflect` is an official extension binary with manifest support.
 - Project and personal reflection work from `metadata,messages`.
 - Text and JSON output render the selected scope kind, project/repo scope,
-  timeline phases, observed patterns, and proposal stubs.
+  timeline phases, source-role summaries, project-activity summaries, task-shape
+  summaries, observed patterns, and proposal stubs.
 - Low-level transcript artifacts are hidden or summarized by default.
 
 ### Completed Milestone: Personal And Project Scopes
@@ -381,17 +403,21 @@ the data plane and query protocol.
   the recent `30d` time window.
 - Text and JSON output include a stable scope kind.
 
-### Next Milestone: Broader Reflection Signals
+### Completed Milestone: Broader Reflection Signals
 
 - Personal reflection provides deterministic source, project, and task-shape
   summaries without reading SQLite directly.
 
-### Later Milestone: Interactive Review
+### Next Milestone: Interactive Review
 
-- `recall reflect` opens the TUI by default.
+- `recall reflect` can open a TUI review workbench.
 - TUI shows actionable observations with evidence ids.
 - TUI previews instruction-file patches.
 - Apply writes only approved instruction-file patches.
+
+### Later Milestone: Interactive Review Polish
+
+- `recall reflect` opens the TUI by default.
 - `--format json` emits machine-readable scope, observations, evidence, and
   proposal stubs.
 
