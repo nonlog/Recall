@@ -1,6 +1,6 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -2643,26 +2643,10 @@ impl App {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) {
-        let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-            ("pbcopy", &[])
-        } else if cfg!(target_os = "windows") {
-            ("clip.exe", &[])
-        } else {
-            ("xclip", &["-selection", "clipboard"])
-        };
-
-        match Command::new(cmd).args(args).stdin(Stdio::piped()).spawn() {
-            Ok(mut child) => {
-                if let Some(ref mut stdin) = child.stdin {
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                let _ = child.wait();
-                self.status_message = Some("Copied to clipboard".to_string());
-            }
-            Err(_) => {
-                self.status_message = Some(format!("Failed to copy ({cmd} not found)"));
-            }
-        }
+        self.status_message = Some(match crate::utils::copy_to_clipboard(text) {
+            Ok(()) => "Copied to clipboard".to_string(),
+            Err(error) => error.to_string(),
+        });
     }
 
     fn start_export(&mut self) {

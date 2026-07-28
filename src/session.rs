@@ -1,7 +1,5 @@
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::adapters;
 use crate::config::AppConfig;
@@ -583,7 +581,7 @@ fn cmd_session_share(
     };
 
     if copy_url {
-        copy_to_clipboard(&url)?;
+        crate::utils::copy_to_clipboard(&url)?;
     }
     if open {
         crate::utils::open_url_in_default_browser(&url)?;
@@ -976,25 +974,6 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("pbcopy", &[])
-    } else if cfg!(target_os = "windows") {
-        ("clip.exe", &[])
-    } else {
-        ("xclip", &["-selection", "clipboard"])
-    };
-    let mut child = Command::new(program).args(args).stdin(Stdio::piped()).spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("{program} exited with status {status}");
     }
     Ok(())
 }
