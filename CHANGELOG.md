@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/samzong/Recall/compare/v0.4.0...v0.4.1) (2026-08-11)
+
+
+### Documentation
+
+* **changelog:** back-fill history and the 0.4.0 upgrade note ([#126](https://github.com/samzong/Recall/issues/126)) ([27e3fc1](https://github.com/samzong/Recall/commit/27e3fc1f01c166fa01bed6dcce69247635840a20))
+
 ## [0.4.0](https://github.com/samzong/Recall/compare/v0.3.0...v0.4.0) (2026-08-11)
 
 
