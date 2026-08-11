@@ -1,0 +1,16 @@
+#!/bin/sh
+# Regenerates CHANGELOG.md for the version being released. cargo-release runs
+# this as its pre-release hook, so the changelog lands in the release commit and
+# is therefore part of the tag it describes.
+set -eu
+
+version="${1:?usage: regenerate-changelog <version>}"
+
+if ! command -v git-cliff >/dev/null 2>&1; then
+	echo "regenerate-changelog: git-cliff is not installed." >&2
+	echo "  brew install git-cliff" >&2
+	exit 1
+fi
+
+git-cliff --tag "v${version}" --output CHANGELOG.md
+echo "regenerate-changelog: CHANGELOG.md updated for v${version}"

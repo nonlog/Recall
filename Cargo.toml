@@ -84,3 +84,6 @@ push-remote = "origin"
 pre-release-commit-message = "chore(release): bump to v{{version}}"
 tag-message = "v{{version}}"
 tag-name = "v{{version}}"
+# Keeps CHANGELOG.md in the release commit, so the tag contains the changelog
+# describing it. Requires git-cliff; the hook fails loudly if it is missing.
+pre-release-hook = ["scripts/regenerate-changelog", "{{version}}"]

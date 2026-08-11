@@ -34,12 +34,19 @@ covers extension crates and the `bench_api` shim that `benches/` compiles
 against. Build a single extension with `cargo build -p recall-<name>`.
 
 Core releases use cargo-release: `make release-patch` is a dry run; add
-`EXECUTE=1` to bump, commit, tag, and push. The `v*` tag triggers the GitHub
+`EXECUTE=1` to bump, commit, tag, and push. A pre-release hook regenerates
+`CHANGELOG.md` from the conventional-commit history with git-cliff, so the
+changelog is part of the release commit and of the tag that it describes, and
+the GitHub release notes are read back out of it. `CHANGELOG.md` is generated —
+fix a wrong entry by fixing the commit message, not the file. Release commit
+messages and merge commits are filtered out; anything that is not a
+conventional commit is dropped, so a squash-merge title is what ends up in the
+changelog. The `v*` tag triggers the GitHub
 Actions binary build. Extensions release independently: bumping an extension's
 package version in a PR is the release intent — after merge, a workflow creates
 the `recall-<name>-v<version>` tag, builds binaries, and regenerates the
 catalog. One-time setup: `git config core.hooksPath .githooks` enables the DCO
-signoff hook.
+signoff hook, and `brew install git-cliff` is required to cut a release.
 
 ## Architecture
 
