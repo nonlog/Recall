@@ -51,6 +51,28 @@
               "url": "https://github.com/samzong/Recall/releases/download/recall-reflect-v0.1.0/recall-reflect-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
+        },
+        "0.2.0": {
+          "min_recall": "0.4.0",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "116b8ceca12b9bc906d421f9de945197bbc16ef4cfa35876755abaef32f7ff0c",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-reflect-v0.2.0/recall-reflect-v0.2.0-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "a03647adf962f1115597dc70fb97850cf60ce7ac34fccce8294b3840536df0a6",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-reflect-v0.2.0/recall-reflect-v0.2.0-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "45f4b93611aaa323a1eda9fe09b5a1d9ce5a8ca6eef3fbaa94e8e9cc9c830e6b",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-reflect-v0.2.0/recall-reflect-v0.2.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "7878f059a3498f72448dd0a062c5428c975cffbcde8728fc927ce08cf4147c1f",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-reflect-v0.2.0/recall-reflect-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
         }
       }
     }
