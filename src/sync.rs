@@ -427,14 +427,6 @@ impl SyncJob {
         existing: &mut ExistingState,
         purged_excluded_ids: &mut HashSet<String>,
     ) -> Result<()> {
-        if let Some(cutoff) = self.since_ts {
-            let ts = raw.updated_at.unwrap_or(raw.started_at);
-            if ts < cutoff {
-                self.stats.filtered_out += 1;
-                return Ok(());
-            }
-        }
-
         let raw_source_id = raw.source_id.clone();
 
         // Runs before every write and delete below, so a scoped sync can never
@@ -463,6 +455,31 @@ impl SyncJob {
                 self.stats.excluded_out += 1;
             }
             return Ok(());
+        }
+
+        // Path evidence drives exclusions, so backfill it after scope/exclusion
+        // checks even when content falls outside the configured sync window.
+        if let Some(source_file_path) = raw.source_file_path.as_deref()
+            && let Some(stored) = existing.paths.get_mut(&raw_source_id)
+            && stored.source_file_path.as_deref() != Some(source_file_path)
+        {
+            self.store.update_session_fields(
+                source_id,
+                &raw_source_id,
+                None,
+                None,
+                None,
+                Some(source_file_path),
+            )?;
+            stored.source_file_path = Some(source_file_path.to_string());
+        }
+
+        if let Some(cutoff) = self.since_ts {
+            let ts = raw.updated_at.unwrap_or(raw.started_at);
+            if ts < cutoff {
+                self.stats.filtered_out += 1;
+                return Ok(());
+            }
         }
 
         let existing_repo_fields = existing.paths.get(&raw_source_id).filter(|old| {
@@ -949,6 +966,8 @@ mod tests {
     struct StaticAdapter {
         updated_at: i64,
         messages: &'static [&'static str],
+        source_file_path: Option<&'static str>,
+        optimized: bool,
     }
 
     impl SourceAdapter for StaticAdapter {
@@ -971,14 +990,25 @@ mod tests {
                     timestamp: Some(self.updated_at + seq as i64),
                 })
                 .collect();
-            Ok(vec![RawSession::search_only(
-                "raw1",
-                None,
-                1_000,
-                Some(self.updated_at),
-                None,
-                messages,
-            )])
+            let mut raw =
+                RawSession::search_only("raw1", None, 1_000, Some(self.updated_at), None, messages);
+            raw.source_file_path = self.source_file_path.map(str::to_string);
+            Ok(vec![raw])
+        }
+
+        fn scan_for_sync(
+            &self,
+            _store: &Store,
+            _since_ts: Option<i64>,
+            _include_events: bool,
+        ) -> anyhow::Result<Option<crate::adapters::SyncScanResult>> {
+            if !self.optimized {
+                return Ok(None);
+            }
+            Ok(Some(crate::adapters::SyncScanResult {
+                sessions: self.scan()?,
+                stats: Default::default(),
+            }))
         }
 
         fn resume_command(&self, _source_id: &str) -> Option<ResumeCommand> {
@@ -1237,8 +1267,12 @@ mod tests {
     #[test]
     fn sync_job_refreshes_changed_session_through_adapter_seam() {
         schema::register_sqlite_vec();
-        let initial: Vec<Box<dyn SourceAdapter>> =
-            vec![Box::new(StaticAdapter { updated_at: 2_000, messages: &["first"] })];
+        let initial: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
+            updated_at: 2_000,
+            messages: &["first"],
+            source_file_path: None,
+            optimized: false,
+        })];
         let mut job = SyncJob::new(
             SyncRunOptions {
                 force: false,
@@ -1258,8 +1292,12 @@ mod tests {
         job.run(&initial).unwrap();
         assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(2_000), 1)));
 
-        let updated: Vec<Box<dyn SourceAdapter>> =
-            vec![Box::new(StaticAdapter { updated_at: 3_000, messages: &["first", "second"] })];
+        let updated: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
+            updated_at: 3_000,
+            messages: &["first", "second"],
+            source_file_path: None,
+            optimized: false,
+        })];
         job.run(&updated).unwrap();
 
         assert_eq!(job.store.session_meta("test", "raw1").unwrap(), Some((Some(3_000), 2)));
@@ -1268,6 +1306,68 @@ mod tests {
         assert_eq!(
             messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
             ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn source_path_backfill_runs_after_scope_and_before_time_filter() {
+        schema::register_sqlite_vec();
+        let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
+            updated_at: 2_000,
+            messages: &[],
+            source_file_path: Some("/tmp/session.jsonl"),
+            optimized: true,
+        })];
+        let mut config = AppConfig::default();
+        config.sync_window = crate::config::SyncWindow::Today;
+        let mut global_job = SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+                scope: ProjectScope::Global,
+            },
+            Store::open_in_memory().unwrap(),
+            config,
+            &adapters,
+        )
+        .unwrap();
+        global_job.store.insert_session(&session("global", "test", "raw1")).unwrap();
+
+        global_job.run(&adapters).unwrap();
+
+        assert_eq!(
+            global_job.store.session_paths_for_source("test").unwrap()[0]
+                .source_file_path
+                .as_deref(),
+            Some("/tmp/session.jsonl")
+        );
+
+        let mut scoped_job = SyncJob::new(
+            SyncRunOptions {
+                force: false,
+                verbose: false,
+                emit: false,
+                usage_only: false,
+                backfill_events: false,
+                sources: None,
+                scope: ProjectScope::Directory("/repo/root".to_string()),
+            },
+            Store::open_in_memory().unwrap(),
+            AppConfig::default(),
+            &adapters,
+        )
+        .unwrap();
+        scoped_job.store.insert_session(&session("scoped", "test", "raw1")).unwrap();
+
+        scoped_job.run(&adapters).unwrap();
+
+        assert_eq!(
+            scoped_job.store.session_paths_for_source("test").unwrap()[0].source_file_path,
+            None
         );
     }
 
@@ -1301,5 +1401,40 @@ mod tests {
         assert_eq!(count, 1);
         assert!(deleted.contains("s1"));
         assert!(store.session_paths_for_source("claude-code").unwrap().is_empty());
+    }
+
+    #[test]
+    fn excluded_source_file_path_blocks_fresh_and_force_sync() {
+        for force in [false, true] {
+            schema::register_sqlite_vec();
+            let adapters: Vec<Box<dyn SourceAdapter>> = vec![Box::new(StaticAdapter {
+                updated_at: 2_000,
+                messages: &[],
+                source_file_path: Some("/tmp/private-sessions/session.jsonl"),
+                optimized: true,
+            })];
+            let mut config = AppConfig::default();
+            config.excluded_paths = vec!["**/private-sessions".to_string()];
+            let mut job = SyncJob::new(
+                SyncRunOptions {
+                    force,
+                    verbose: false,
+                    emit: false,
+                    usage_only: false,
+                    backfill_events: false,
+                    sources: None,
+                    scope: ProjectScope::Global,
+                },
+                Store::open_in_memory().unwrap(),
+                config,
+                &adapters,
+            )
+            .unwrap();
+
+            job.run(&adapters).unwrap();
+
+            assert!(job.store.session_paths_for_source("test").unwrap().is_empty());
+            assert_eq!(job.stats.excluded_out, 1);
+        }
     }
 }
