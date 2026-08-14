@@ -1,5 +1,38 @@
 # Changelog
 
+
+## [0.5.0](https://github.com/samzong/Recall/compare/v0.4.0...v0.5.0) (2026-08-14)
+
+
+### Features
+
+* **adapters:** add DeepSeek Harness support ([#129](https://github.com/samzong/Recall/issues/129))
+
+
+### Fixes
+
+* **deps:** close known RustSec vulnerabilities ([#130](https://github.com/samzong/Recall/issues/130))
+* **release:** gate builds on validated tags ([#131](https://github.com/samzong/Recall/issues/131))
+* **config:** fail closed on invalid settings ([#132](https://github.com/samzong/Recall/issues/132))
+* **sync:** honor excluded transcript paths ([#133](https://github.com/samzong/Recall/issues/133))
+* **export:** read JSONL from one snapshot ([#134](https://github.com/samzong/Recall/issues/134))
+* **export:** replace JSONL targets atomically ([#135](https://github.com/samzong/Recall/issues/135))
+* **share:** prevent deploying unmanaged directory contents ([#136](https://github.com/samzong/Recall/issues/136))
+* **cli:** reject invalid time filters ([#137](https://github.com/samzong/Recall/issues/137))
+* **search:** bound semantic pagination ([#138](https://github.com/samzong/Recall/issues/138))
+* **info:** read indexed source stats ([#139](https://github.com/samzong/Recall/issues/139))
+* **tui:** move usage refresh off event loop ([#140](https://github.com/samzong/Recall/issues/140))
+
+
+### Documentation
+
+* **changelog:** back-fill history and the 0.4.0 upgrade note ([#126](https://github.com/samzong/Recall/issues/126))
+
+
+### revert
+
+* **release:** put version choice back in the maintainer's hands ([#128](https://github.com/samzong/Recall/issues/128))
+
 ## [0.4.0](https://github.com/samzong/Recall/compare/v0.3.0...v0.4.0) (2026-08-11)
 
 
