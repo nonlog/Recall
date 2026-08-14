@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{BufWriter, Seek, Write};
 
 use anyhow::{Result, anyhow};
 use serde::Serialize;
@@ -14,6 +14,7 @@ use crate::types::{
 
 pub(crate) const RECORD_SCHEMA_VERSION: u32 = 5;
 const RECORD_TYPE: &str = "session";
+const EXPORT_IN_MEMORY_DB_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExportIncludes {
@@ -175,6 +176,7 @@ pub(crate) fn write_jsonl<W: Write>(
     options: &ExportOptions,
     mut writer: W,
 ) -> Result<()> {
+    let snapshot = store.conn.unchecked_transaction()?;
     let sessions = if options.session_ids.is_empty() {
         store.list_export_sessions(
             options.sources.as_deref(),
@@ -194,7 +196,26 @@ pub(crate) fn write_jsonl<W: Write>(
         sessions
     };
 
-    write_jsonl_for_sessions(store, sessions, options.includes, &mut writer)
+    let (records, mut spool) = collect_session_records(
+        store,
+        sessions,
+        options.includes,
+        !options.session_ids.is_empty(),
+    )?;
+    if let Some(spool) = spool.as_mut() {
+        spool.flush()?;
+    }
+    snapshot.commit()?;
+    if let Some(spool) = spool {
+        let mut file = spool.into_inner()?;
+        file.rewind()?;
+        std::io::copy(&mut file, &mut writer)?;
+    } else {
+        for record in records {
+            write_session_record(&mut writer, &record)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn session_record_value(
@@ -213,12 +234,19 @@ pub(crate) fn session_record_value(
     ))?)
 }
 
-fn write_jsonl_for_sessions<W: Write>(
+fn collect_session_records(
     store: &Store,
     sessions: Vec<Session>,
     includes: ExportIncludes,
-    mut writer: W,
-) -> Result<()> {
+    force_spool: bool,
+) -> Result<(Vec<ExportSessionRecord>, Option<BufWriter<std::fs::File>>)> {
+    let page_count: usize = store.conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: usize = store.conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let mut records = Vec::new();
+    let mut spool = (force_spool
+        || page_count.saturating_mul(page_size) > EXPORT_IN_MEMORY_DB_LIMIT)
+        .then(|| tempfile::tempfile().map(BufWriter::new))
+        .transpose()?;
     for session in sessions {
         let topology = store.session_topology(&session.id)?;
         let messages =
@@ -234,10 +262,18 @@ fn write_jsonl_for_sessions<W: Write>(
             Vec::new()
         };
         let record = build_session_record(session, topology, messages, usage_events, events);
-        serde_json::to_writer(&mut writer, &record)?;
-        writer.write_all(b"\n")?;
+        if let Some(file) = spool.as_mut() {
+            write_session_record(file, &record)?;
+        } else {
+            records.push(record);
+        }
     }
+    Ok((records, spool))
+}
 
+fn write_session_record<W: Write>(mut writer: W, record: &ExportSessionRecord) -> Result<()> {
+    serde_json::to_writer(&mut writer, record)?;
+    writer.write_all(b"\n")?;
     Ok(())
 }
 
