@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use crate::adapters;
 use crate::config::AppConfig;
+use crate::db::session_store::IndexedSourceStats;
 use crate::db::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -14,86 +17,24 @@ pub(crate) enum InfoFormat {
 struct SourceSummary {
     label: String,
     id: String,
-    sessions: usize,
-    messages: usize,
+    sessions: u64,
+    messages: u64,
     range: String,
     error: Option<String>,
 }
 
 pub(crate) fn run(format: InfoFormat) -> Result<()> {
-    let all = adapters::all_adapters();
     let labels = adapters::source_labels();
     let mut config = AppConfig::load()?;
     config.normalize_sources(&labels);
     let store = Store::open()?;
+    let source_stats = store.indexed_source_stats()?;
     let progress = store.semantic_progress().unwrap_or_default();
     let worker = store.background_job_status("pipeline").unwrap_or_default();
 
-    let mut rows = Vec::new();
-    let mut grand_sessions = 0usize;
-    let mut grand_messages = 0usize;
-
-    for adapter in &all {
-        let id = adapter.id();
-        let label =
-            labels.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str()).unwrap_or(id).to_string();
-
-        match adapter.scan_summary() {
-            Ok(Some(summary)) => {
-                grand_sessions += summary.sessions;
-                grand_messages += summary.messages;
-
-                rows.push(SourceSummary {
-                    label,
-                    id: id.to_string(),
-                    sessions: summary.sessions,
-                    messages: summary.messages,
-                    range: format_date_range(summary.oldest_started_at, summary.newest_started_at),
-                    error: None,
-                });
-            }
-            Ok(None) => match adapter.scan() {
-                Ok(sessions) => {
-                    let session_count = sessions.len();
-                    let message_count: usize = sessions.iter().map(|s| s.messages.len()).sum();
-                    let oldest = sessions.iter().map(|s| s.started_at).min();
-                    let newest = sessions.iter().map(|s| s.started_at).max();
-
-                    grand_sessions += session_count;
-                    grand_messages += message_count;
-
-                    rows.push(SourceSummary {
-                        label,
-                        id: id.to_string(),
-                        sessions: session_count,
-                        messages: message_count,
-                        range: format_date_range(oldest, newest),
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    rows.push(SourceSummary {
-                        label,
-                        id: id.to_string(),
-                        sessions: 0,
-                        messages: 0,
-                        range: "-".to_string(),
-                        error: Some(e.to_string()),
-                    });
-                }
-            },
-            Err(e) => {
-                rows.push(SourceSummary {
-                    label,
-                    id: id.to_string(),
-                    sessions: 0,
-                    messages: 0,
-                    range: "-".to_string(),
-                    error: Some(e.to_string()),
-                });
-            }
-        }
-    }
+    let rows = source_summaries(&labels, &source_stats);
+    let grand_sessions = rows.iter().map(|row| row.sessions).sum::<u64>();
+    let grand_messages = rows.iter().map(|row| row.messages).sum::<u64>();
 
     if matches!(format, InfoFormat::Json) {
         println!(
@@ -150,7 +91,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
         .max("Messages".len())
         .max(grand_messages.to_string().len());
 
-    println!("Source Scan");
+    println!("Indexed Sources");
     println!(
         "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  Range",
         source = "Source",
@@ -176,7 +117,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     }
     println!(
         "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}",
-        source = "Total scanned",
+        source = "Total indexed",
         sessions = grand_sessions,
         messages = grand_messages
     );
@@ -213,6 +154,38 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     Ok(())
 }
 
+fn source_summaries(
+    labels: &[(String, String)],
+    source_stats: &HashMap<String, IndexedSourceStats>,
+) -> Vec<SourceSummary> {
+    let mut sources = labels.to_vec();
+    let mut unknown_sources = source_stats
+        .keys()
+        .filter(|source| !labels.iter().any(|(id, _)| id == *source))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown_sources.sort();
+    sources.extend(unknown_sources.into_iter().map(|id| (id.clone(), id)));
+
+    sources
+        .into_iter()
+        .map(|(id, label)| {
+            let stats = source_stats.get(&id);
+            SourceSummary {
+                label,
+                sessions: stats.map_or(0, |stats| stats.sessions),
+                messages: stats.map_or(0, |stats| stats.messages),
+                range: format_date_range(
+                    stats.and_then(|stats| stats.oldest_started_at),
+                    stats.and_then(|stats| stats.newest_started_at),
+                ),
+                id,
+                error: None,
+            }
+        })
+        .collect()
+}
+
 fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
     if oldest.is_none() && newest.is_none() {
         return "-".to_string();
@@ -228,4 +201,47 @@ fn format_date_range(oldest: Option<i64>, newest: Option<i64>) -> String {
         .unwrap_or_else(|| "-".to_string());
 
     format!("{oldest} -> {newest}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::db::session_store::IndexedSourceStats;
+
+    #[test]
+    fn source_summaries_include_unregistered_indexed_sources() {
+        let labels = vec![("codex".to_string(), "CDX".to_string())];
+        let stats = HashMap::from([
+            (
+                "codex".to_string(),
+                IndexedSourceStats {
+                    sessions: 1,
+                    messages: 2,
+                    oldest_started_at: Some(10),
+                    newest_started_at: Some(20),
+                },
+            ),
+            (
+                "future-agent".to_string(),
+                IndexedSourceStats {
+                    sessions: 3,
+                    messages: 4,
+                    oldest_started_at: Some(30),
+                    newest_started_at: Some(40),
+                },
+            ),
+        ]);
+
+        let rows = source_summaries(&labels, &stats);
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["codex", "future-agent"]
+        );
+        assert_eq!(rows[1].label, "future-agent");
+        assert_eq!(rows[1].sessions, 3);
+        assert_eq!(rows[1].messages, 4);
+    }
 }
