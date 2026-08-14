@@ -17,6 +17,15 @@ const PROVIDER_CLOUDFLARE_PAGES: &str = "cloudflare-pages";
 const PAGES_PROJECT_NAME_FIELD: &str = "Project Name";
 const PAGES_PROJECT_DOMAINS_FIELD: &str = "Project Domains";
 const MAX_PAGES_ASSET_BYTES: usize = 25 * 1024 * 1024;
+const PUBLISH_DIR_MARKER: &str = ".recall-share";
+const PUBLISH_DIR_MARKER_CONTENT: &str = "Recall-managed share directory\n";
+const LEGACY_HEADERS: &str = "/*\n  X-Robots-Tag: noindex, nofollow\n  X-Frame-Options: DENY\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: no-referrer\n";
+const SHARE_HTML_PREFIX: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex,nofollow\">";
+const SHARE_HTML_SIGNATURES: [&str; 3] = [
+    "body{margin:0;background:#f6f7f9;color:#17181c;font:15px/1.6",
+    "--page-bg: #F5F5F7;\n  --content-bg: #FFFFFF;",
+    "--page-bg:#FAF9F6;--surface:#FFFFFF;--user-surface:#FFFFFF;",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct SharePreview {
@@ -237,9 +246,61 @@ fn configured_project_domain(share: &ShareConfig) -> Result<String> {
 fn init_publish_dir(publish_dir: &Path) -> Result<()> {
     fs::create_dir_all(publish_dir)
         .with_context(|| format!("failed to create {}", publish_dir.display()))?;
+    let marker = publish_dir.join(PUBLISH_DIR_MARKER);
+    let managed =
+        fs::read_to_string(&marker).is_ok_and(|contents| contents == PUBLISH_DIR_MARKER_CONTENT);
+    if publish_dir_is_unmanaged(publish_dir, managed)? {
+        bail!(
+            "publish directory {} is not managed by Recall; choose an empty directory",
+            publish_dir.display()
+        );
+    }
+    if !managed {
+        fs::write(&marker, PUBLISH_DIR_MARKER_CONTENT)?;
+    }
     fs::write(publish_dir.join("_headers"), HEADERS)?;
     fs::write(publish_dir.join("robots.txt"), ROBOTS)?;
     Ok(())
+}
+
+fn publish_dir_is_unmanaged(publish_dir: &Path, managed: bool) -> Result<bool> {
+    let mut has_entries = false;
+    let mut has_headers = false;
+    let mut has_robots = false;
+    for entry in fs::read_dir(publish_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Ok(true);
+        }
+        has_entries = true;
+        match entry.file_name().to_str() {
+            Some(PUBLISH_DIR_MARKER) if managed => {}
+            Some("_headers") => {
+                let contents = fs::read_to_string(entry.path())?;
+                if contents != HEADERS && contents != LEGACY_HEADERS {
+                    return Ok(true);
+                }
+                has_headers = true;
+            }
+            Some("robots.txt") => {
+                if fs::read_to_string(entry.path())? != ROBOTS {
+                    return Ok(true);
+                }
+                has_robots = true;
+            }
+            Some(name) if name.ends_with(".html") => {
+                let html = fs::read_to_string(entry.path())?;
+                if !html.starts_with(SHARE_HTML_PREFIX)
+                    || !SHARE_HTML_SIGNATURES.iter().any(|signature| html.contains(signature))
+                    || !html.ends_with("</body></html>")
+                {
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(true),
+        }
+    }
+    Ok(!managed && has_entries && !(has_headers && has_robots))
 }
 
 fn ensure_wrangler_available() -> Result<()> {
@@ -427,6 +488,43 @@ mod tests {
     #[test]
     fn share_id_sanitizes_path_chars() {
         assert_eq!(share_id_for_session(&session("foo/bar baz")), "foo-bar-baz");
+    }
+
+    #[test]
+    fn publish_dir_rejects_unmanaged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("canary-secret"), "do not publish").unwrap();
+
+        let error = init_publish_dir(dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("not managed by Recall"));
+        assert!(!dir.path().join("_headers").exists());
+        assert!(!dir.path().join("robots.txt").exists());
+
+        let spoofed = tempfile::tempdir().unwrap();
+        fs::write(spoofed.path().join(PUBLISH_DIR_MARKER), "not Recall").unwrap();
+        assert!(init_publish_dir(spoofed.path()).is_err());
+
+        let managed = tempfile::tempdir().unwrap();
+        init_publish_dir(managed.path()).unwrap();
+        assert!(managed.path().join(PUBLISH_DIR_MARKER).is_file());
+        init_publish_dir(managed.path()).unwrap();
+        fs::write(managed.path().join("later-canary"), "do not publish").unwrap();
+        assert!(init_publish_dir(managed.path()).is_err());
+
+        let legacy = tempfile::tempdir().unwrap();
+        fs::write(legacy.path().join("_headers"), HEADERS).unwrap();
+        fs::write(legacy.path().join("robots.txt"), ROBOTS).unwrap();
+        let session = session("legacy-session");
+        let meta = collect_session_display_meta(&session, &[]);
+        fs::write(
+            legacy.path().join("legacy-session.html"),
+            render_session_html(&session, &[], &meta),
+        )
+        .unwrap();
+        init_publish_dir(legacy.path()).unwrap();
+        assert!(legacy.path().join(PUBLISH_DIR_MARKER).is_file());
+        init_publish_dir(legacy.path()).unwrap();
     }
 
     fn session(source_id: &str) -> Session {
