@@ -26,7 +26,11 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
         parse(&raw_args)?
     };
     if matches!(command, Command::Launch(_)) {
-        update::maybe_before_launch(paths, env, &raw_args)?;
+        // Updating is incidental to launching: a broken state file, an
+        // unwritable config dir, or a failed install must not stop the harness.
+        if let Err(error) = update::maybe_before_launch(paths, env, &raw_args) {
+            eprintln!("[rx] update skipped: {error:#}");
+        }
     }
     match command {
         Command::Help => {
@@ -58,24 +62,16 @@ rx — launch agent harnesses through a configured API gateway
 
 Usage:
   rx <harness> [args...]
-  rx config set gateway <openrouter|tokener>
-  rx config set key <openrouter|tokener> <key>
+  rx --gateway <profile> <harness> [args...]
+  rx config set gateway <profile>
+  rx config set key <profile> <key>
   rx config get [name]
   rx update [--yes]
-
-Options:
-  --gateway <openrouter|tokener>   select gateway for this launch
-  -h, --help                       show this help
-  -V, --version                    show version
+  rx debug --help
 
 Environment:
-  RX_NO_UPDATE=1                   skip launch-time update checks
-  RX_NO_INSTALL=1                  skip offering to install a missing harness
-
-Developer: rx debug --help
-
-With no gateway configured, rx execs the harness unchanged.
-Gateway flags are stripped; every other argument is passed through.
+  RX_NO_UPDATE=1     skip launch-time update checks
+  RX_NO_INSTALL=1    skip offering to install a missing harness
 "
 }
 
