@@ -1,6 +1,34 @@
 # Changelog
 
 
+## [0.5.1](https://github.com/samzong/Recall/compare/v0.5.0...v0.5.1) (2026-08-23)
+
+
+### Features
+
+* **adapters:** add kimi-code source adapter ([#141](https://github.com/samzong/Recall/issues/141))
+* **rx:** add rx gateway launcher for agent harnesses ([#146](https://github.com/samzong/Recall/issues/146))
+* **rx:** install missing harnesses and seed Claude catalogs ([#147](https://github.com/samzong/Recall/issues/147))
+* **rx:** allow named gateway profiles over shared drivers ([#148](https://github.com/samzong/Recall/issues/148))
+
+
+### Fixes
+
+* **sync:** skip command envelopes when deriving session titles ([#142](https://github.com/samzong/Recall/issues/142))
+* **rx:** harden profile keys and release dry runs ([#149](https://github.com/samzong/Recall/issues/149))
+* **rx:** align version identity and serialize catalog seeds ([#150](https://github.com/samzong/Recall/issues/150))
+
+
+### Refactors
+
+* **db:** derive scope message totals from session counts ([#144](https://github.com/samzong/Recall/issues/144))
+
+
+### Documentation
+
+* **trace:** add recall trace CLI design proposal ([#143](https://github.com/samzong/Recall/issues/143))
+
+
 ## [0.5.0](https://github.com/samzong/Recall/compare/v0.4.0...v0.5.0) (2026-08-14)
 
 
