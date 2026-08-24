@@ -1,5 +1,32 @@
 {
   "extensions": {
+    "powercontext": {
+      "description": "Backfill Recall sessions into PowerContext Content Sources",
+      "versions": {
+        "0.1.0": {
+          "min_recall": "0.4.0",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "90f56a50f2b92d84a273c26d4ddccae94f5e192895f8f72380d42ab95f0df646",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "4c2f86ad625332b64816026f192ccd5893467b570afc785d2cc49d7d340e063a",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "be919ee56b283d759709a28f6b32d6e90629d6ccb681942252dc0ef1f7feac1a",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "449d7fe44897b14c33bebc48652e894851877bff947b7cfc365d7da22df249b7",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        }
+      }
+    },
     "probe": {
       "description": "Official Recall extension host probe",
       "versions": {
