@@ -18,6 +18,7 @@ pub(crate) enum AppMode {
     HandoffTarget,
     Subagents,
     ConfirmResume,
+    ConfirmDelete,
 }
 
 #[derive(Clone, Copy)]

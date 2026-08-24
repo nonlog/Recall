@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::tui::app::App;
+use crate::tui::delete_state::DeleteOrigin;
 use crate::tui::share_state::{AppMode, ResumeOrigin};
 use crate::tui::theme::THEME;
 
@@ -179,6 +180,13 @@ pub(crate) fn render(f: &mut Frame, app: &App) {
                 _ => search::render_search(f, app),
             }
             popups::render_confirm_resume(f, app);
+        }
+        AppMode::ConfirmDelete => {
+            match app.pending_delete.as_ref().map(|pending| pending.origin) {
+                Some(DeleteOrigin::Viewing) => viewing::render_viewing(f, app),
+                _ => search::render_search(f, app),
+            }
+            popups::render_confirm_delete(f, app);
         }
     }
 }
