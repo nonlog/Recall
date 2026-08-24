@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::handoff;
+use crate::session_delete::DeleteMode;
 use crate::tui::app::App;
 use crate::tui::search_state::{PanelFocus, ProjectPickerRow, SourcePickerRow};
 use crate::tui::share_state::PendingCommandAction;
@@ -581,6 +582,104 @@ pub(super) fn render_confirm_resume(f: &mut Frame, app: &App) {
     f.render_widget(widget, popup);
 }
 
+pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
+    let Some(pending) = app.pending_delete.as_ref() else {
+        return;
+    };
+
+    let area = f.area();
+    let width = area.width.clamp(48, 84);
+    let height: u16 = 12;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let (mode_label, mode_note, mode_color) = match pending.mode {
+        DeleteMode::Trash => (
+            "Trash",
+            "Move native session data to Recall trash when supported.",
+            THEME.success,
+        ),
+        DeleteMode::IndexOnly => (
+            "Index only",
+            "Keep native Agent data; a later sync may index it again.",
+            THEME.info,
+        ),
+        DeleteMode::Permanent => (
+            "Permanent",
+            "Delete native session data without a Recall recovery copy.",
+            THEME.error,
+        ),
+    };
+
+    let source_label = app.source_label_for(&pending.session.source);
+    let title = truncate_to_width(&pending.session.title, width.saturating_sub(18) as usize);
+    let source_id = truncate_to_width(&pending.session.source_id, width.saturating_sub(18) as usize);
+    let deleting = app.delete_rx.is_some();
+
+    let block = Block::default()
+        .title(" Delete session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if pending.mode == DeleteMode::Permanent {
+            THEME.error
+        } else {
+            THEME.accent
+        }))
+        .style(Style::default().bg(THEME.popup_bg));
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Source:  ", Style::default().fg(THEME.text_muted)),
+            Span::styled(
+                source_label.to_string(),
+                Style::default().fg(THEME.source).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(title, Style::default().fg(THEME.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Session: ", Style::default().fg(THEME.text_muted)),
+            Span::styled(source_id, Style::default().fg(THEME.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Mode:    ", Style::default().fg(THEME.text_muted)),
+            Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw("          "),
+            Span::styled(mode_note, Style::default().fg(THEME.text_muted)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [T] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("trash  ", Style::default().fg(THEME.text)),
+            Span::styled("[I] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("index only  ", Style::default().fg(THEME.text)),
+            Span::styled("[P] ", Style::default().fg(THEME.error).add_modifier(Modifier::BOLD)),
+            Span::styled("permanent", Style::default().fg(THEME.text)),
+        ]),
+    ];
+
+    if deleting {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Deleting...", Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  [Y/Enter] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("confirm   ", Style::default().fg(THEME.text)),
+            Span::styled("[N/Esc] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(THEME.text)),
+        ]));
+    }
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
 pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let semantic_span = if app.semantic_progress.total_sessions > 0 {
         let mut text = format!(
@@ -622,6 +721,8 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" preview  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Enter", Style::default().fg(THEME.accent)),
                     Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Del", Style::default().fg(THEME.error)),
+                    Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+F", Style::default().fg(THEME.accent)),
                     Span::styled(" filter  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
@@ -651,6 +752,8 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" sessions  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Enter", Style::default().fg(THEME.accent)),
                     Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Del", Style::default().fg(THEME.error)),
+                    Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Esc", Style::default().fg(THEME.accent)),
                     Span::styled(" back", Style::default().fg(THEME.text_muted)),
                 ];

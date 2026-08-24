@@ -75,6 +75,7 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
 
     loop {
         app.poll_share_publish();
+        app.poll_delete(&store);
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
         }

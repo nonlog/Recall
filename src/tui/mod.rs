@@ -1,4 +1,5 @@
 pub(crate) mod app;
+pub(crate) mod delete_state;
 pub(crate) mod event;
 pub(crate) mod layout;
 pub(crate) mod runner;
