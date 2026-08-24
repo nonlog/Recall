@@ -1,6 +1,20 @@
 # Changelog
 
 
+## [0.5.2](https://github.com/samzong/Recall/compare/v0.5.1...v0.5.2) (2026-08-24)
+
+
+### Features
+
+* **rx:** add provider management ([#162](https://github.com/samzong/Recall/issues/162))
+
+
+### Fixes
+
+* **rx:** reconcile seeded catalog ownership ([#163](https://github.com/samzong/Recall/issues/163))
+* **tui:** preserve contrast in light terminals ([#164](https://github.com/samzong/Recall/issues/164))
+
+
 ## [0.5.1](https://github.com/samzong/Recall/compare/v0.5.0...v0.5.1) (2026-08-23)
 
 
