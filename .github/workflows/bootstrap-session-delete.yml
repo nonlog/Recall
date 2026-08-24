@@ -1,0 +1,47 @@
+name: Bootstrap session delete
+
+on:
+  push:
+    branches: [feat/session-delete]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/session-delete
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply source patch
+        run: python3 scripts/apply-session-delete.py
+      - name: Format Rust
+        run: cargo fmt --all
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/ort.pyke.io
+          key: ort-${{ hashFiles('Cargo.lock') }}
+      - name: Run project gate
+        run: make check
+      - name: Commit implementation
+        run: |
+          rm scripts/apply-session-delete.py .github/workflows/bootstrap-session-delete.yml
+          git config user.name "nonlog"
+          git config user.email "61723005+nonlog@users.noreply.github.com"
+          git add -A
+          git commit -s -m "feat(session): add safe session deletion"
+          git push origin HEAD:feat/session-delete
