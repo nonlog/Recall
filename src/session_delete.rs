@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -179,7 +179,15 @@ pub(crate) fn execute(
 fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     let source_path = session.source_file_path.as_deref().map(PathBuf::from);
     let roots = match session.source.as_str() {
-        "codex" | "pi" | "gemini-cli" => source_path.into_iter().collect(),
+        "codex" => source_path.into_iter().collect(),
+        "pi" => source_path
+            .and_then(|path| pi_session_file(&path, &session.source_id))
+            .into_iter()
+            .collect(),
+        "gemini-cli" => source_path
+            .and_then(|path| gemini_session_file(&path, &session.source_id))
+            .into_iter()
+            .collect(),
         "claude-code" => claude_session_roots(session, source_path.as_deref())?,
         "grok" => source_path
             .and_then(|path| grok_session_root(&path, &session.source_id))
@@ -214,6 +222,69 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     };
 
     normalize_roots(roots)
+}
+
+fn pi_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") || !path.is_file() {
+        return None;
+    }
+
+    let stem = path.file_stem()?.to_str()?;
+    let filename_id = stem
+        .rsplit_once('_')
+        .map(|(_, tail)| tail)
+        .filter(|tail| uuid::Uuid::try_parse(tail).is_ok())
+        .unwrap_or(stem);
+
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(256) {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|value| value.as_str()) != Some("session") {
+            continue;
+        }
+        return (value.get("id").and_then(|value| value.as_str()) == Some(source_id))
+            .then(|| path.to_path_buf());
+    }
+
+    (filename_id == source_id).then(|| path.to_path_buf())
+}
+
+fn gemini_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    gemini_session_file_under(path, source_id, &home.join(".gemini").join("tmp"))
+}
+
+fn gemini_session_file_under(path: &Path, source_id: &str, gemini_tmp: &Path) -> Option<PathBuf> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("json") || !path.is_file() {
+        return None;
+    }
+    if path.parent()?.file_name()?.to_str()? != "chats" {
+        return None;
+    }
+    if !canonical_path_is_within(path, gemini_tmp) {
+        return None;
+    }
+
+    let file = fs::File::open(path).ok()?;
+    let value: serde_json::Value = serde_json::from_reader(BufReader::new(file)).ok()?;
+    let indexed_id = value
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .or_else(|| path.file_stem().and_then(|stem| stem.to_str()))?;
+    (indexed_id == source_id).then(|| path.to_path_buf())
+}
+
+fn canonical_path_is_within(path: &Path, base: &Path) -> bool {
+    let Ok(path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(base) = fs::canonicalize(base) else {
+        return false;
+    };
+    path != base && path.starts_with(base)
 }
 
 fn file_parent_with_name(path: &Path, expected_names: &[&str]) -> Option<PathBuf> {
@@ -292,14 +363,15 @@ fn antigravity_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
 
 fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
-    if let Some(path) = indexed_path {
-        roots.push(path.to_path_buf());
-    }
-
     let Some(home) = dirs::home_dir() else {
-        return normalize_roots(roots);
+        return Ok(roots);
     };
     let claude_dir = home.join(".claude");
+    if let Some(path) = indexed_path
+        && claude_indexed_path_is_allowed(path, &session.source_id, &claude_dir)
+    {
+        roots.push(path.to_path_buf());
+    }
     for base in [claude_dir.join("projects"), claude_dir.join("transcripts")] {
         if !base.exists() {
             continue;
@@ -321,6 +393,18 @@ fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Resul
     }
 
     normalize_roots(roots)
+}
+
+fn claude_indexed_path_is_allowed(path: &Path, source_id: &str, claude_dir: &Path) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+        || path.file_stem().and_then(|stem| stem.to_str()) != Some(source_id)
+    {
+        return false;
+    }
+
+    [claude_dir.join("projects"), claude_dir.join("transcripts")]
+        .iter()
+        .any(|base| canonical_path_is_within(path, base))
 }
 
 fn normalize_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -636,13 +720,78 @@ mod tests {
     fn file_backed_sources_plan_exact_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        fs::write(&path, "data").unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"session","id":"s1"}
+"#,
+        )
+        .unwrap();
         let session = session("pi", "s1", Some(path.to_string_lossy().into_owned()));
 
         let plan = plan(&session, DeleteMode::Trash).unwrap();
 
         assert_eq!(plan.native_roots, vec![path]);
         assert!(plan.native_command.is_none());
+    }
+
+    #[test]
+    fn pi_rejects_mismatched_session_header_even_when_filename_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expected.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+
+        assert!(pi_session_file(&path, "expected").is_none());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn pi_accepts_matching_session_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unrelated-name.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"pi-session\"}\n").unwrap();
+
+        assert_eq!(pi_session_file(&path, "pi-session"), Some(path));
+    }
+
+    #[test]
+    fn gemini_session_path_requires_chats_tree_and_matching_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let gemini_tmp = dir.path().join("tmp");
+        let chats = gemini_tmp.join("project-hash").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let path = chats.join("session.json");
+        fs::write(&path, r#"{"sessionId":"gemini-session","messages":[]}"#).unwrap();
+
+        assert_eq!(
+            gemini_session_file_under(&path, "gemini-session", &gemini_tmp),
+            Some(path.clone())
+        );
+        assert!(gemini_session_file_under(&path, "other", &gemini_tmp).is_none());
+
+        let outside = dir.path().join("outside").join("chats");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_path = outside.join("session.json");
+        fs::write(&outside_path, r#"{"sessionId":"gemini-session"}"#).unwrap();
+        assert!(gemini_session_file_under(&outside_path, "gemini-session", &gemini_tmp).is_none());
+    }
+
+    #[test]
+    fn claude_indexed_path_must_be_inside_known_claude_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let projects = claude_dir.join("projects").join("project");
+        fs::create_dir_all(&projects).unwrap();
+        let allowed = projects.join("session-id.jsonl");
+        fs::write(&allowed, "{}\n").unwrap();
+
+        assert!(claude_indexed_path_is_allowed(&allowed, "session-id", &claude_dir));
+        assert!(!claude_indexed_path_is_allowed(&allowed, "other-id", &claude_dir));
+
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_path = outside.join("session-id.jsonl");
+        fs::write(&outside_path, "{}\n").unwrap();
+        assert!(!claude_indexed_path_is_allowed(&outside_path, "session-id", &claude_dir));
     }
 
     #[test]
