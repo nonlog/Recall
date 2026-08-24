@@ -35,8 +35,9 @@ jobs:
         run: |
           set -eu
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [ -z "$version" ] || [ "$RELEASE_TAG" != "v$version" ]; then
-            echo "::error::release tag $RELEASE_TAG does not match Cargo.toml version ${version:-missing}"
+          escaped_version="${version//./\\.}"
+          if [ -z "$version" ] || { [ "$RELEASE_TAG" != "v$version" ] && ! [[ "$RELEASE_TAG" =~ ^v${escaped_version}\.[1-9][0-9]*$ ]]; }; then
+            echo "::error::release tag $RELEASE_TAG must be v${version:-missing} or a fork patch tag such as v${version:-missing}.1"
             exit 1
           fi
           if [ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" ]; then

@@ -13,6 +13,8 @@ This fork intentionally carries a session-deletion feature on top of upstream
 
 Using the same version tag keeps Scoop manifests simple while still producing binaries that contain the fork-only deletion feature.
 
+Fork-only changes made between upstream releases use a numeric fourth component without changing `Cargo.toml`. For example, while the upstream base remains `0.5.2`, a fork-only rebuild can be tagged `v0.5.2.1`, then `v0.5.2.2`. The release workflow accepts these fork patch tags and Scoop treats them as versions newer than the base release. When upstream `v0.5.3` arrives, normal synchronization resumes with `v0.5.3`.
+
 ## Conflict behavior
 
 The sync is fail-closed. If a future upstream release conflicts with the custom deletion implementation, the workflow aborts the merge, leaves `main` unchanged, creates an issue titled `Upstream sync conflict: <tag>`, and does not create a release tag. Resolve that conflict manually, retain the deletion feature, run `make check`, and then publish the matching release tag.
