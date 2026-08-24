@@ -1,6 +1,17 @@
 # Changelog
 
 
+## [0.5.3](https://github.com/samzong/Recall/compare/v0.5.2...v0.5.3) (2026-08-24)
+
+
+### Features
+
+* **rx:** add provider model catalogs ([#165](https://github.com/samzong/Recall/issues/165))
+* **rx:** add DeepSeek Harness support ([#166](https://github.com/samzong/Recall/issues/166))
+* **search:** improve multi-term relevance ([#167](https://github.com/samzong/Recall/issues/167))
+* **powercontext:** add recall backfill extension ([#168](https://github.com/samzong/Recall/issues/168))
+
+
 ## [0.5.2](https://github.com/samzong/Recall/compare/v0.5.1...v0.5.2) (2026-08-24)
 
 
