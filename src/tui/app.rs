@@ -448,7 +448,8 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.delete_rx.is_some() {
-                self.status_message = Some("Deletion in progress; wait for it to finish".to_string());
+                self.status_message =
+                    Some("Deletion in progress; wait for it to finish".to_string());
             } else {
                 self.should_quit = true;
             }
@@ -1626,7 +1627,8 @@ impl App {
         let Some(session) = session else {
             return;
         };
-        let mode = if session.is_import || matches!(session.source.as_str(), "cursor" | "kiro-cli") {
+        let mode = if session.is_import || matches!(session.source.as_str(), "cursor" | "kiro-cli")
+        {
             DeleteMode::IndexOnly
         } else {
             DeleteMode::Trash
@@ -3678,12 +3680,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &store);
 
         assert!(!app.should_quit);
-        assert!(
-            app.status_message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Deletion in progress")
-        );
+        assert!(app.status_message.as_deref().unwrap_or_default().contains("Deletion in progress"));
     }
 
     #[test]

@@ -595,26 +595,21 @@ pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
     let popup = Rect::new(x, y, width, height);
 
     let (mode_label, mode_note, mode_color) = match pending.mode {
-        DeleteMode::Trash => (
-            "Trash",
-            "Move native session data to Recall trash when supported.",
-            THEME.success,
-        ),
-        DeleteMode::IndexOnly => (
-            "Index only",
-            "Keep native Agent data; a later sync may index it again.",
-            THEME.info,
-        ),
-        DeleteMode::Permanent => (
-            "Permanent",
-            "Delete native session data without a Recall recovery copy.",
-            THEME.error,
-        ),
+        DeleteMode::Trash => {
+            ("Trash", "Move native session data to Recall trash when supported.", THEME.success)
+        }
+        DeleteMode::IndexOnly => {
+            ("Index only", "Keep native Agent data; a later sync may index it again.", THEME.info)
+        }
+        DeleteMode::Permanent => {
+            ("Permanent", "Delete native session data without a Recall recovery copy.", THEME.error)
+        }
     };
 
     let source_label = app.source_label_for(&pending.session.source);
     let title = truncate_to_width(&pending.session.title, width.saturating_sub(18) as usize);
-    let source_id = truncate_to_width(&pending.session.source_id, width.saturating_sub(18) as usize);
+    let source_id =
+        truncate_to_width(&pending.session.source_id, width.saturating_sub(18) as usize);
     let deleting = app.delete_rx.is_some();
 
     let block = Block::default()
@@ -664,13 +659,22 @@ pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
     if deleting {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("Deleting...", Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Deleting...",
+                Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+            ),
         ]));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("  [Y/Enter] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  [Y/Enter] ",
+                Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("confirm   ", Style::default().fg(THEME.text)),
-            Span::styled("[N/Esc] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[N/Esc] ",
+                Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("cancel", Style::default().fg(THEME.text)),
         ]));
     }
