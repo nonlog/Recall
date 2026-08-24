@@ -89,6 +89,21 @@ That's it. The DB schema, search engine, TUI source filter, and CLI `--source` f
 | `started_at` | `i64` | yes | Unix timestamp in **milliseconds**. |
 | `messages` | `Vec<RawMessage>` | yes | Ordered by time. Only `User` and `Assistant` roles. |
 
+## Optional: Add Native Delete Support
+
+If the source exposes a stable, non-interactive command that deletes a session and keeps the source tool's own metadata consistent, implement `delete_command` on the same adapter:
+
+```rust
+fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
+    Some(ResumeCommand {
+        program: "my-tool".to_string(),
+        args: vec!["session".to_string(), "delete".to_string(), source_id.to_string()],
+    })
+}
+```
+
+Prefer an official source-tool delete command over writing a shared source database directly. Sources without a stable native delete API should leave this method unset; Recall will only enable native deletion when it has an explicit safe strategy and otherwise requires `--index-only`.
+
 ## Optional: Add Usage Support
 
 Usage is not a separate adapter. It is token data attached to the same

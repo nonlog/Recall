@@ -27,8 +27,24 @@ recall export --project all > recall-export.jsonl # export all sessions
 recall import recall-export.jsonl --dry-run  # preview an import
 recall session list  # list sessions for agents/scripts
 recall session share --id <session-id> --format json  # publish one selected session
+recall session delete --id <session-id> --dry-run  # preview safe session deletion
 recall info  # index stats and worker status
 ```
+
+### Delete sessions
+
+`recall session delete` removes one selected session from Recall and, when the source has a safe native deletion path, from the source agent as well.
+
+```bash
+recall session delete --id <session-id> --dry-run   # preview only
+recall session delete --id <session-id>             # safe default: keep a Recall trash backup
+recall session delete --id <session-id> --permanent # no Recall trash backup
+recall session delete --id <session-id> --index-only # leave source-agent data untouched
+```
+
+Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, Antigravity, Gemini, Grok, Copilot, Cline, DeepSeek Harness, and Kimi Code use their indexed per-session file or directory. Cursor and Kiro currently require `--index-only`; Recall deliberately does not write their shared SQLite databases directly.
+
+The default trash is stored under Recall's data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
 
 With Skill use **Recall** is the best way.
 

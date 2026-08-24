@@ -38,6 +38,13 @@ impl SourceAdapter for CodexAdapter {
         })
     }
 
+    fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(ResumeCommand {
+            program: "codex".to_string(),
+            args: vec!["delete".to_string(), "--force".to_string(), source_id.to_string()],
+        })
+    }
+
     fn app_command(&self, source_id: &str) -> Option<ResumeCommand> {
         Some(open_url_command(codex_thread_url(source_id)))
     }

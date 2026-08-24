@@ -2,12 +2,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+use crate::adapters::{self, ResumeCommand};
 use crate::db::store::Store;
 use crate::types::Session;
 
@@ -32,6 +34,7 @@ impl DeleteMode {
 pub(crate) struct DeletePlan {
     pub(crate) mode: DeleteMode,
     pub(crate) native_roots: Vec<PathBuf>,
+    pub(crate) native_command: Option<ResumeCommand>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +42,7 @@ pub(crate) struct DeleteResult {
     pub(crate) mode: &'static str,
     pub(crate) deleted_from_index: bool,
     pub(crate) native_paths: Vec<String>,
+    pub(crate) native_command: Option<String>,
     pub(crate) trash_dir: Option<String>,
 }
 
@@ -49,22 +53,43 @@ struct TrashManifest<'a> {
     source_id: &'a str,
     deleted_at_ms: i64,
     original_paths: Vec<String>,
+    native_delete_command: Option<String>,
 }
 
 pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
     if mode == DeleteMode::IndexOnly || session.is_import {
-        return Ok(DeletePlan { mode: DeleteMode::IndexOnly, native_roots: Vec::new() });
+        return Ok(DeletePlan {
+            mode: DeleteMode::IndexOnly,
+            native_roots: Vec::new(),
+            native_command: None,
+        });
     }
 
+    let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
-    if native_roots.is_empty() {
+    if native_command.is_none() && native_roots.is_empty() {
         anyhow::bail!(
             "native deletion is not supported for source {}; use --index-only to remove only the Recall index entry",
             session.source
         );
     }
 
-    Ok(DeletePlan { mode, native_roots })
+    if mode == DeleteMode::Trash
+        && native_command.is_some()
+        && native_roots.is_empty()
+        && session.source != "opencode"
+    {
+        anyhow::bail!(
+            "{} supports native deletion, but Recall cannot create a safety backup for this session; retry with --permanent or --index-only",
+            session.source
+        );
+    }
+
+    Ok(DeletePlan {
+        mode,
+        native_roots,
+        native_command,
+    })
 }
 
 pub(crate) fn execute(
@@ -78,35 +103,69 @@ pub(crate) fn execute(
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
+    let native_command = plan.native_command.as_ref().map(ResumeCommand::display);
 
     if dry_run {
         return Ok(DeleteResult {
             mode: plan.mode.as_str(),
             deleted_from_index: false,
             native_paths,
+            native_command,
             trash_dir: None,
         });
     }
 
-    let trash_move = match plan.mode {
-        DeleteMode::Trash => Some(move_to_trash(session, &plan.native_roots)?),
-        DeleteMode::Permanent => {
-            for root in &plan.native_roots {
-                remove_path(root)
-                    .with_context(|| format!("failed to permanently delete {}", root.display()))?;
+    let mut moved_trash = None;
+    let mut trash_dir = None;
+    let mut native_deleted_irreversibly = false;
+
+    match plan.mode {
+        DeleteMode::Trash => {
+            if let Some(command) = &plan.native_command {
+                let backup_dir = backup_before_native_command(session, &plan.native_roots, command)?;
+                if let Err(error) = run_native_delete_command(command) {
+                    let _ = fs::remove_dir_all(&backup_dir);
+                    return Err(error);
+                }
+                native_deleted_irreversibly = true;
+                trash_dir = Some(backup_dir);
+            } else {
+                let moved = move_to_trash(session, &plan.native_roots, None)?;
+                trash_dir = Some(moved.dir.clone());
+                moved_trash = Some(moved);
             }
-            None
         }
-        DeleteMode::IndexOnly => None,
-    };
+        DeleteMode::Permanent => {
+            if let Some(command) = &plan.native_command {
+                run_native_delete_command(command)?;
+            } else {
+                for root in &plan.native_roots {
+                    remove_path(root).with_context(|| {
+                        format!("failed to permanently delete {}", root.display())
+                    })?;
+                }
+            }
+            native_deleted_irreversibly = true;
+        }
+        DeleteMode::IndexOnly => {}
+    }
 
     if let Err(error) = store.delete_session_data(&session.source, &session.source_id) {
-        if let Some(trash_move) = &trash_move {
-            if let Err(rollback_error) = rollback_trash_move(trash_move) {
+        if let Some(moved) = &moved_trash {
+            if let Err(rollback_error) = rollback_trash_move(moved) {
                 return Err(anyhow::anyhow!(
                     "failed to delete Recall index: {error}; additionally failed to restore trashed native data: {rollback_error}"
                 ));
             }
+        }
+        if native_deleted_irreversibly {
+            let backup_note = trash_dir
+                .as_ref()
+                .map(|path| format!("; safety backup retained at {}", path.display()))
+                .unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "native session deletion succeeded, but deleting the Recall index failed: {error}{backup_note}"
+            ));
         }
         return Err(error);
     }
@@ -115,7 +174,8 @@ pub(crate) fn execute(
         mode: plan.mode.as_str(),
         deleted_from_index: true,
         native_paths,
-        trash_dir: trash_move.map(|moved| moved.dir.to_string_lossy().into_owned()),
+        native_command,
+        trash_dir: trash_dir.map(|path| path.to_string_lossy().into_owned()),
     })
 }
 
@@ -124,24 +184,114 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     let roots = match session.source.as_str() {
         "codex" | "pi" | "gemini-cli" => source_path.into_iter().collect(),
         "claude-code" => claude_session_roots(session, source_path.as_deref())?,
-        "grok" | "copilot-cli" | "cline" | "deepseek-harness" => {
-            source_path.and_then(|path| path.parent().map(Path::to_path_buf)).into_iter().collect()
-        }
+        "grok" => source_path
+            .and_then(|path| grok_session_root(&path, &session.source_id))
+            .into_iter()
+            .collect(),
+        "copilot-cli" => source_path
+            .and_then(|path| copilot_session_root(&path))
+            .into_iter()
+            .collect(),
+        "cline" => source_path
+            .and_then(|path| cline_session_root(&path, &session.source_id))
+            .into_iter()
+            .collect(),
+        "deepseek-harness" => source_path
+            .and_then(|path| deepseek_session_root(&path, &session.source_id))
+            .into_iter()
+            .collect(),
         "kimi-code" => source_path
-            .and_then(|path| path.ancestors().nth(3).map(Path::to_path_buf))
+            .and_then(|path| kimi_session_root(&path, &session.source_id))
             .into_iter()
             .collect(),
         "antigravity-cli" => source_path
-            .and_then(|path| path.ancestors().nth(3).map(Path::to_path_buf))
+            .and_then(|path| antigravity_session_root(&path, &session.source_id))
             .into_iter()
             .collect(),
-        // These adapters read shared SQLite state. Native deletion needs a
-        // source-specific transaction and is deliberately not guessed here.
-        "opencode" | "cursor" | "kiro-cli" => Vec::new(),
+        // OpenCode has an official deletion command and an export command, so
+        // it does not need direct access to the shared SQLite database here.
+        "opencode" => Vec::new(),
+        // Cursor and Kiro are shared-database sources without a known stable
+        // native delete CLI contract. Do not guess writes into their databases.
+        "cursor" | "kiro-cli" => Vec::new(),
         _ => Vec::new(),
     };
 
     normalize_roots(roots)
+}
+
+fn file_parent_with_name(path: &Path, expected_names: &[&str]) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_str()?;
+    if !expected_names.contains(&file_name) {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.parent().is_none() {
+        return None;
+    }
+    Some(parent.to_path_buf())
+}
+
+fn grok_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
+    let root = file_parent_with_name(path, &["updates.jsonl"])?;
+    (root.file_name()?.to_str()? == source_id).then_some(root)
+}
+
+fn copilot_session_root(path: &Path) -> Option<PathBuf> {
+    let root = file_parent_with_name(path, &["events.jsonl"])?;
+    let parent_name = root.parent()?.file_name()?.to_str()?;
+    (parent_name == "session-state").then_some(root)
+}
+
+fn cline_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
+    let root = file_parent_with_name(path, &["ui_messages.json"])?;
+    (root.file_name()?.to_str()? == source_id).then_some(root)
+}
+
+fn deepseek_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
+    let root = file_parent_with_name(path, &["session.jsonl", "session.jsonl.zstd"])?;
+    let encoded = root.file_name()?.to_str()?;
+    (crate::adapters::deepseek_harness::decode_dsh_session_id(encoded)? == source_id).then_some(root)
+}
+
+fn kimi_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
+    if path.file_name()?.to_str()? != "wire.jsonl" {
+        return None;
+    }
+    let main_dir = path.parent()?;
+    if main_dir.file_name()?.to_str()? != "main" {
+        return None;
+    }
+    let agents_dir = main_dir.parent()?;
+    if agents_dir.file_name()?.to_str()? != "agents" {
+        return None;
+    }
+    let root = agents_dir.parent()?;
+    if !root.file_name()?.to_str()?.starts_with("session_") {
+        return None;
+    }
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(root.join("state.json")).ok()?).ok()?;
+    let indexed_id = state
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| root.file_name().and_then(|name| name.to_str()).unwrap_or(""));
+    (indexed_id == source_id).then(|| root.to_path_buf())
+}
+
+fn antigravity_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
+    if path.file_name()?.to_str()? != "transcript.jsonl" {
+        return None;
+    }
+    let logs_dir = path.parent()?;
+    if logs_dir.file_name()?.to_str()? != "logs" {
+        return None;
+    }
+    let generated_dir = logs_dir.parent()?;
+    if generated_dir.file_name()?.to_str()? != ".system_generated" {
+        return None;
+    }
+    let root = generated_dir.parent()?;
+    (root.file_name()?.to_str()? == source_id).then(|| root.to_path_buf())
 }
 
 fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Result<Vec<PathBuf>> {
@@ -169,7 +319,9 @@ fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Resul
         }
     }
 
-    let live_meta = claude_dir.join("sessions").join(format!("{}.json", session.source_id));
+    let live_meta = claude_dir
+        .join("sessions")
+        .join(format!("{}.json", session.source_id));
     if live_meta.is_file() {
         roots.push(live_meta);
     }
@@ -189,6 +341,9 @@ fn normalize_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         if metadata.file_type().is_symlink() {
             anyhow::bail!("refusing to delete symlinked session path: {}", root.display());
         }
+        if metadata.is_dir() && root.parent().is_none() {
+            anyhow::bail!("refusing to delete a filesystem root: {}", root.display());
+        }
         let key = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         if seen.insert(key) {
             unique.push(root);
@@ -206,17 +361,96 @@ fn normalize_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(compact)
 }
 
-fn move_to_trash(session: &Session, roots: &[PathBuf]) -> Result<TrashMove> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
+fn run_native_delete_command(command: &ResumeCommand) -> Result<()> {
+    let status = Command::new(&command.program)
+        .args(&command.args)
+        .status()
+        .with_context(|| format!("failed to start native delete command: {}", command.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "native delete command failed with status {status}: {}",
+            command.display()
+        );
+    }
+    Ok(())
+}
+
+fn backup_before_native_command(
+    session: &Session,
+    roots: &[PathBuf],
+    command: &ResumeCommand,
+) -> Result<PathBuf> {
     let deleted_at_ms = Utc::now().timestamp_millis();
-    let trash_dir = data_dir.join("recall").join("trash").join(format!(
-        "{}-{}-{}",
+    let trash_dir = new_trash_dir(session, deleted_at_ms)?;
+    if let Err(error) = write_manifest(
+        session,
+        roots,
+        &trash_dir,
         deleted_at_ms,
-        sanitize_component(&session.source),
-        sanitize_component(&session.source_id)
-    ));
-    move_to_trash_at(session, roots, &trash_dir, deleted_at_ms)
+        Some(command.display()),
+    ) {
+        let _ = fs::remove_dir_all(&trash_dir);
+        return Err(error);
+    }
+
+    let backup_result = if session.source == "opencode" {
+        backup_opencode_export(session, &trash_dir)
+    } else {
+        backup_paths(roots, &trash_dir)
+    };
+    if let Err(error) = backup_result {
+        let _ = fs::remove_dir_all(&trash_dir);
+        return Err(error);
+    }
+    Ok(trash_dir)
+}
+
+fn backup_opencode_export(session: &Session, trash_dir: &Path) -> Result<()> {
+    let output = Command::new("opencode")
+        .args(["export", session.source_id.as_str()])
+        .output()
+        .context("failed to start `opencode export` for safety backup")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`opencode export` failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if output.stdout.is_empty() {
+        anyhow::bail!("`opencode export` returned an empty safety backup");
+    }
+    fs::write(trash_dir.join("session-export.json"), output.stdout)?;
+    Ok(())
+}
+
+fn backup_paths(roots: &[PathBuf], trash_dir: &Path) -> Result<()> {
+    if roots.is_empty() {
+        anyhow::bail!("no native session files are available for a safety backup");
+    }
+    for (index, root) in roots.iter().enumerate() {
+        let dest = trash_path_for_root(trash_dir, index, root);
+        copy_path(root, &dest).with_context(|| {
+            format!("failed to back up {} to {}", root.display(), dest.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn move_to_trash(
+    session: &Session,
+    roots: &[PathBuf],
+    native_command: Option<String>,
+) -> Result<TrashMove> {
+    let deleted_at_ms = Utc::now().timestamp_millis();
+    let trash_dir = new_trash_dir(session, deleted_at_ms)?;
+    move_to_trash_at(
+        session,
+        roots,
+        &trash_dir,
+        deleted_at_ms,
+        native_command,
+    )
 }
 
 #[derive(Debug)]
@@ -225,13 +459,26 @@ struct TrashMove {
     moved: Vec<(PathBuf, PathBuf)>,
 }
 
-fn move_to_trash_at(
+fn new_trash_dir(session: &Session, deleted_at_ms: i64) -> Result<PathBuf> {
+    let data_dir =
+        dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
+    let trash_dir = data_dir.join("recall").join("trash").join(format!(
+        "{}-{}-{}",
+        deleted_at_ms,
+        sanitize_component(&session.source),
+        sanitize_component(&session.source_id)
+    ));
+    fs::create_dir_all(&trash_dir)?;
+    Ok(trash_dir)
+}
+
+fn write_manifest(
     session: &Session,
     roots: &[PathBuf],
     trash_dir: &Path,
     deleted_at_ms: i64,
-) -> Result<TrashMove> {
-    fs::create_dir_all(trash_dir)?;
+    native_delete_command: Option<String>,
+) -> Result<()> {
     let manifest = TrashManifest {
         recall_session_id: &session.id,
         source: &session.source,
@@ -241,22 +488,39 @@ fn move_to_trash_at(
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
+        native_delete_command,
     };
     fs::write(
         trash_dir.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
+    Ok(())
+}
+
+fn move_to_trash_at(
+    session: &Session,
+    roots: &[PathBuf],
+    trash_dir: &Path,
+    deleted_at_ms: i64,
+    native_command: Option<String>,
+) -> Result<TrashMove> {
+    fs::create_dir_all(trash_dir)?;
+    write_manifest(
+        session,
+        roots,
+        trash_dir,
+        deleted_at_ms,
+        native_command,
+    )?;
 
     let mut moved = Vec::new();
     for (index, root) in roots.iter().enumerate() {
-        let name = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| "session-data".to_string());
-        let dest = trash_dir.join(format!("{index}-{name}"));
+        let dest = trash_path_for_root(trash_dir, index, root);
         if let Err(error) = move_path(root, &dest) {
-            let rollback = TrashMove { dir: trash_dir.to_path_buf(), moved };
+            let rollback = TrashMove {
+                dir: trash_dir.to_path_buf(),
+                moved,
+            };
             let _ = rollback_trash_move(&rollback);
             return Err(error).with_context(|| {
                 format!("failed to move {} to {}", root.display(), dest.display())
@@ -264,7 +528,19 @@ fn move_to_trash_at(
         }
         moved.push((root.clone(), dest));
     }
-    Ok(TrashMove { dir: trash_dir.to_path_buf(), moved })
+    Ok(TrashMove {
+        dir: trash_dir.to_path_buf(),
+        moved,
+    })
+}
+
+fn trash_path_for_root(trash_dir: &Path, index: usize, root: &Path) -> PathBuf {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "session-data".to_string());
+    trash_dir.join(format!("{index}-{name}"))
 }
 
 fn rollback_trash_move(trash_move: &TrashMove) -> Result<()> {
@@ -368,7 +644,11 @@ fn sanitize_component(value: &str) -> String {
             out.push('_');
         }
     }
-    if out.is_empty() { "session".to_string() } else { out }
+    if out.is_empty() {
+        "session".to_string()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]
@@ -402,21 +682,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         fs::write(&path, "data").unwrap();
-        let session = session("codex", "s1", Some(path.to_string_lossy().into_owned()));
+        let session = session("pi", "s1", Some(path.to_string_lossy().into_owned()));
 
         let plan = plan(&session, DeleteMode::Trash).unwrap();
 
         assert_eq!(plan.native_roots, vec![path]);
+        assert!(plan.native_command.is_none());
+    }
+
+    #[test]
+    fn codex_uses_native_delete_command_and_keeps_file_for_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path, "data").unwrap();
+        let session = session(
+            "codex",
+            "11111111-1111-1111-1111-111111111111",
+            Some(path.to_string_lossy().into_owned()),
+        );
+
+        let plan = plan(&session, DeleteMode::Trash).unwrap();
+        let command = plan.native_command.unwrap();
+
+        assert_eq!(plan.native_roots, vec![path]);
+        assert_eq!(command.program, "codex");
+        assert_eq!(
+            command.args,
+            vec!["delete", "--force", "11111111-1111-1111-1111-111111111111"]
+        );
+    }
+
+    #[test]
+    fn opencode_uses_native_delete_command_without_database_writes() {
+        let session = session("opencode", "ses_123", None);
+
+        let plan = plan(&session, DeleteMode::Trash).unwrap();
+        let command = plan.native_command.unwrap();
+
+        assert!(plan.native_roots.is_empty());
+        assert_eq!(command.program, "opencode");
+        assert_eq!(command.args, vec!["session", "delete", "ses_123"]);
     }
 
     #[test]
     fn directory_backed_sources_plan_session_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let session_dir = dir.path().join("session-id");
+        let session_dir = dir.path().join("session-state").join("session-id");
         fs::create_dir_all(&session_dir).unwrap();
         let path = session_dir.join("events.jsonl");
         fs::write(&path, "data").unwrap();
-        let session = session("copilot-cli", "s1", Some(path.to_string_lossy().into_owned()));
+        let session = session(
+            "copilot-cli",
+            "s1",
+            Some(path.to_string_lossy().into_owned()),
+        );
 
         let plan = plan(&session, DeleteMode::Trash).unwrap();
 
@@ -424,13 +743,32 @@ mod tests {
     }
 
     #[test]
-    fn shared_database_sources_require_index_only() {
-        let session = session("opencode", "s1", None);
+    fn malformed_directory_source_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let suspicious_dir = dir.path().join("not-session-state").join("session-id");
+        fs::create_dir_all(&suspicious_dir).unwrap();
+        let path = suspicious_dir.join("events.jsonl");
+        fs::write(&path, "data").unwrap();
+        let session = session(
+            "copilot-cli",
+            "s1",
+            Some(path.to_string_lossy().into_owned()),
+        );
+
+        let err = plan(&session, DeleteMode::Trash).unwrap_err();
+        assert!(err.to_string().contains("--index-only"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn unsupported_shared_database_sources_require_index_only() {
+        let session = session("cursor", "s1", None);
 
         let err = plan(&session, DeleteMode::Trash).unwrap_err();
         assert!(err.to_string().contains("--index-only"));
         let plan = plan(&session, DeleteMode::IndexOnly).unwrap();
         assert!(plan.native_roots.is_empty());
+        assert!(plan.native_command.is_none());
     }
 
     #[test]
@@ -438,13 +776,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.jsonl");
         fs::write(&source, "payload").unwrap();
-        let session = session("codex", "native-id", Some(source.to_string_lossy().into_owned()));
+        let session = session(
+            "pi",
+            "native-id",
+            Some(source.to_string_lossy().into_owned()),
+        );
         let trash = dir.path().join("trash-entry");
 
-        move_to_trash_at(&session, std::slice::from_ref(&source), &trash, 123).unwrap();
+        move_to_trash_at(
+            &session,
+            std::slice::from_ref(&source),
+            &trash,
+            123,
+            None,
+        )
+        .unwrap();
 
         assert!(!source.exists());
-        assert_eq!(fs::read_to_string(trash.join("0-source.jsonl")).unwrap(), "payload");
+        assert_eq!(
+            fs::read_to_string(trash.join("0-source.jsonl")).unwrap(),
+            "payload"
+        );
         let manifest = fs::read_to_string(trash.join("manifest.json")).unwrap();
         assert!(manifest.contains("native-id"));
         assert!(manifest.contains("123"));
