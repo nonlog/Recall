@@ -85,11 +85,7 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         );
     }
 
-    Ok(DeletePlan {
-        mode,
-        native_roots,
-        native_command,
-    })
+    Ok(DeletePlan { mode, native_roots, native_command })
 }
 
 pub(crate) fn execute(
@@ -122,7 +118,8 @@ pub(crate) fn execute(
     match plan.mode {
         DeleteMode::Trash => {
             if let Some(command) = &plan.native_command {
-                let backup_dir = backup_before_native_command(session, &plan.native_roots, command)?;
+                let backup_dir =
+                    backup_before_native_command(session, &plan.native_roots, command)?;
                 if let Err(error) = run_native_delete_command(command) {
                     let _ = fs::remove_dir_all(&backup_dir);
                     return Err(error);
@@ -151,12 +148,12 @@ pub(crate) fn execute(
     }
 
     if let Err(error) = store.delete_session_data(&session.source, &session.source_id) {
-        if let Some(moved) = &moved_trash {
-            if let Err(rollback_error) = rollback_trash_move(moved) {
-                return Err(anyhow::anyhow!(
-                    "failed to delete Recall index: {error}; additionally failed to restore trashed native data: {rollback_error}"
-                ));
-            }
+        if let Some(moved) = &moved_trash
+            && let Err(rollback_error) = rollback_trash_move(moved)
+        {
+            return Err(anyhow::anyhow!(
+                "failed to delete Recall index: {error}; additionally failed to restore trashed native data: {rollback_error}"
+            ));
         }
         if native_deleted_irreversibly {
             let backup_note = trash_dir
@@ -188,10 +185,9 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
             .and_then(|path| grok_session_root(&path, &session.source_id))
             .into_iter()
             .collect(),
-        "copilot-cli" => source_path
-            .and_then(|path| copilot_session_root(&path))
-            .into_iter()
-            .collect(),
+        "copilot-cli" => {
+            source_path.and_then(|path| copilot_session_root(&path)).into_iter().collect()
+        }
         "cline" => source_path
             .and_then(|path| cline_session_root(&path, &session.source_id))
             .into_iter()
@@ -226,9 +222,7 @@ fn file_parent_with_name(path: &Path, expected_names: &[&str]) -> Option<PathBuf
         return None;
     }
     let parent = path.parent()?;
-    if parent.parent().is_none() {
-        return None;
-    }
+    parent.parent()?;
     Some(parent.to_path_buf())
 }
 
@@ -251,7 +245,8 @@ fn cline_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
 fn deepseek_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
     let root = file_parent_with_name(path, &["session.jsonl", "session.jsonl.zstd"])?;
     let encoded = root.file_name()?.to_str()?;
-    (crate::adapters::deepseek_harness::decode_dsh_session_id(encoded)? == source_id).then_some(root)
+    (crate::adapters::deepseek_harness::decode_dsh_session_id(encoded)? == source_id)
+        .then_some(root)
 }
 
 fn kimi_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
@@ -270,7 +265,8 @@ fn kimi_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
     if !root.file_name()?.to_str()?.starts_with("session_") {
         return None;
     }
-    let state: serde_json::Value = serde_json::from_slice(&fs::read(root.join("state.json")).ok()?).ok()?;
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("state.json")).ok()?).ok()?;
     let indexed_id = state
         .get("id")
         .and_then(|value| value.as_str())
@@ -319,9 +315,7 @@ fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Resul
         }
     }
 
-    let live_meta = claude_dir
-        .join("sessions")
-        .join(format!("{}.json", session.source_id));
+    let live_meta = claude_dir.join("sessions").join(format!("{}.json", session.source_id));
     if live_meta.is_file() {
         roots.push(live_meta);
     }
@@ -367,10 +361,7 @@ fn run_native_delete_command(command: &ResumeCommand) -> Result<()> {
         .status()
         .with_context(|| format!("failed to start native delete command: {}", command.display()))?;
     if !status.success() {
-        anyhow::bail!(
-            "native delete command failed with status {status}: {}",
-            command.display()
-        );
+        anyhow::bail!("native delete command failed with status {status}: {}", command.display());
     }
     Ok(())
 }
@@ -382,13 +373,9 @@ fn backup_before_native_command(
 ) -> Result<PathBuf> {
     let deleted_at_ms = Utc::now().timestamp_millis();
     let trash_dir = new_trash_dir(session, deleted_at_ms)?;
-    if let Err(error) = write_manifest(
-        session,
-        roots,
-        &trash_dir,
-        deleted_at_ms,
-        Some(command.display()),
-    ) {
+    if let Err(error) =
+        write_manifest(session, roots, &trash_dir, deleted_at_ms, Some(command.display()))
+    {
         let _ = fs::remove_dir_all(&trash_dir);
         return Err(error);
     }
@@ -444,13 +431,7 @@ fn move_to_trash(
 ) -> Result<TrashMove> {
     let deleted_at_ms = Utc::now().timestamp_millis();
     let trash_dir = new_trash_dir(session, deleted_at_ms)?;
-    move_to_trash_at(
-        session,
-        roots,
-        &trash_dir,
-        deleted_at_ms,
-        native_command,
-    )
+    move_to_trash_at(session, roots, &trash_dir, deleted_at_ms, native_command)
 }
 
 #[derive(Debug)]
@@ -484,16 +465,10 @@ fn write_manifest(
         source: &session.source,
         source_id: &session.source_id,
         deleted_at_ms,
-        original_paths: roots
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect(),
+        original_paths: roots.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
         native_delete_command,
     };
-    fs::write(
-        trash_dir.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
+    fs::write(trash_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
     Ok(())
 }
 
@@ -505,22 +480,13 @@ fn move_to_trash_at(
     native_command: Option<String>,
 ) -> Result<TrashMove> {
     fs::create_dir_all(trash_dir)?;
-    write_manifest(
-        session,
-        roots,
-        trash_dir,
-        deleted_at_ms,
-        native_command,
-    )?;
+    write_manifest(session, roots, trash_dir, deleted_at_ms, native_command)?;
 
     let mut moved = Vec::new();
     for (index, root) in roots.iter().enumerate() {
         let dest = trash_path_for_root(trash_dir, index, root);
         if let Err(error) = move_path(root, &dest) {
-            let rollback = TrashMove {
-                dir: trash_dir.to_path_buf(),
-                moved,
-            };
+            let rollback = TrashMove { dir: trash_dir.to_path_buf(), moved };
             let _ = rollback_trash_move(&rollback);
             return Err(error).with_context(|| {
                 format!("failed to move {} to {}", root.display(), dest.display())
@@ -528,10 +494,7 @@ fn move_to_trash_at(
         }
         moved.push((root.clone(), dest));
     }
-    Ok(TrashMove {
-        dir: trash_dir.to_path_buf(),
-        moved,
-    })
+    Ok(TrashMove { dir: trash_dir.to_path_buf(), moved })
 }
 
 fn trash_path_for_root(trash_dir: &Path, index: usize, root: &Path) -> PathBuf {
@@ -547,11 +510,7 @@ fn rollback_trash_move(trash_move: &TrashMove) -> Result<()> {
     for (original, trashed) in trash_move.moved.iter().rev() {
         if trashed.exists() {
             move_path(trashed, original).with_context(|| {
-                format!(
-                    "failed to restore {} to {}",
-                    trashed.display(),
-                    original.display()
-                )
+                format!("failed to restore {} to {}", trashed.display(), original.display())
             })?;
         }
     }
@@ -644,11 +603,7 @@ fn sanitize_component(value: &str) -> String {
             out.push('_');
         }
     }
-    if out.is_empty() {
-        "session".to_string()
-    } else {
-        out
-    }
+    if out.is_empty() { "session".to_string() } else { out }
 }
 
 #[cfg(test)]
@@ -706,10 +661,7 @@ mod tests {
 
         assert_eq!(plan.native_roots, vec![path]);
         assert_eq!(command.program, "codex");
-        assert_eq!(
-            command.args,
-            vec!["delete", "--force", "11111111-1111-1111-1111-111111111111"]
-        );
+        assert_eq!(command.args, vec!["delete", "--force", "11111111-1111-1111-1111-111111111111"]);
     }
 
     #[test]
@@ -731,11 +683,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let path = session_dir.join("events.jsonl");
         fs::write(&path, "data").unwrap();
-        let session = session(
-            "copilot-cli",
-            "s1",
-            Some(path.to_string_lossy().into_owned()),
-        );
+        let session = session("copilot-cli", "s1", Some(path.to_string_lossy().into_owned()));
 
         let plan = plan(&session, DeleteMode::Trash).unwrap();
 
@@ -749,11 +697,7 @@ mod tests {
         fs::create_dir_all(&suspicious_dir).unwrap();
         let path = suspicious_dir.join("events.jsonl");
         fs::write(&path, "data").unwrap();
-        let session = session(
-            "copilot-cli",
-            "s1",
-            Some(path.to_string_lossy().into_owned()),
-        );
+        let session = session("copilot-cli", "s1", Some(path.to_string_lossy().into_owned()));
 
         let err = plan(&session, DeleteMode::Trash).unwrap_err();
         assert!(err.to_string().contains("--index-only"));
@@ -776,27 +720,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.jsonl");
         fs::write(&source, "payload").unwrap();
-        let session = session(
-            "pi",
-            "native-id",
-            Some(source.to_string_lossy().into_owned()),
-        );
+        let session = session("pi", "native-id", Some(source.to_string_lossy().into_owned()));
         let trash = dir.path().join("trash-entry");
 
-        move_to_trash_at(
-            &session,
-            std::slice::from_ref(&source),
-            &trash,
-            123,
-            None,
-        )
-        .unwrap();
+        move_to_trash_at(&session, std::slice::from_ref(&source), &trash, 123, None).unwrap();
 
         assert!(!source.exists());
-        assert_eq!(
-            fs::read_to_string(trash.join("0-source.jsonl")).unwrap(),
-            "payload"
-        );
+        assert_eq!(fs::read_to_string(trash.join("0-source.jsonl")).unwrap(), "payload");
         let manifest = fs::read_to_string(trash.join("manifest.json")).unwrap();
         assert!(manifest.contains("native-id"));
         assert!(manifest.contains("123"));

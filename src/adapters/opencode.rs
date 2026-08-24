@@ -61,11 +61,7 @@ impl SourceAdapter for OpenCodeAdapter {
     fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
         Some(ResumeCommand {
             program: "opencode".to_string(),
-            args: vec![
-                "session".to_string(),
-                "delete".to_string(),
-                source_id.to_string(),
-            ],
+            args: vec!["session".to_string(), "delete".to_string(), source_id.to_string()],
         })
     }
 
