@@ -86,10 +86,14 @@ jobs:
             exit 1
           fi
 
-          # Fail closed if a future upstream merge removes the custom delete CLI.
+          # Fail closed if a future upstream merge removes the custom delete CLI or TUI.
           grep -q 'SessionCommands::Delete' src/session.rs
           grep -q 'mod session_delete' src/lib.rs
           test -f src/session_delete.rs
+          grep -q 'mod delete_state' src/tui/mod.rs
+          grep -q 'AppMode::ConfirmDelete' src/tui/app.rs
+          grep -q 'Del.*delete' src/tui/ui/popups.rs
+          test -f src/tui/delete_state.rs
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.upstream.outputs.already_synced != 'true'
