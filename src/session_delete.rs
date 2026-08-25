@@ -824,8 +824,29 @@ mod tests {
         let command = plan.native_command.unwrap();
 
         assert_eq!(plan.native_roots, vec![path]);
-        assert_eq!(command.program, "codex");
-        assert_eq!(command.args, vec!["delete", "--force", "11111111-1111-1111-1111-111111111111"]);
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(command.program, "cmd.exe");
+            assert_eq!(
+                command.args,
+                vec![
+                    "/D",
+                    "/C",
+                    "codex",
+                    "delete",
+                    "--force",
+                    "11111111-1111-1111-1111-111111111111"
+                ]
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(command.program, "codex");
+            assert_eq!(
+                command.args,
+                vec!["delete", "--force", "11111111-1111-1111-1111-111111111111"]
+            );
+        }
     }
 
     #[test]
