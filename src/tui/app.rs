@@ -255,7 +255,7 @@ impl App {
             draft_source_filter_selection: Vec::new(),
             draft_scope: scope.clone(),
             draft_time_filter: TimeRange::All,
-            draft_sort_order: SortOrder::Newest,
+            draft_sort_order: SortOrder::Relevance,
             should_quit: false,
             last_keystroke: Instant::now(),
             search_pending: false,
@@ -265,7 +265,7 @@ impl App {
             search_feedback: None,
             embedding_unavailable: false,
             status_message: None,
-            sort_order: SortOrder::Newest,
+            sort_order: SortOrder::Relevance,
             export_path: String::new(),
             export_cursor: 0,
             total_sessions,
@@ -391,7 +391,11 @@ impl App {
     }
 
     pub(crate) fn sort_label(&self) -> &'static str {
-        Self::sort_order_label(self.sort_order)
+        Self::sort_order_label(self.effective_sort_order())
+    }
+
+    fn effective_sort_order(&self) -> SortOrder {
+        if self.query.trim().is_empty() { SortOrder::Newest } else { self.sort_order }
     }
 
     pub(crate) fn draft_sort_label(&self) -> &'static str {
@@ -2111,11 +2115,11 @@ impl App {
         let was_filtered = !self.draft_source_filter_selection.is_empty()
             || self.draft_scope != ProjectScope::Global
             || self.draft_time_filter != TimeRange::All
-            || self.draft_sort_order != SortOrder::Newest;
+            || self.draft_sort_order != SortOrder::Relevance;
         self.draft_source_filter_selection.clear();
         self.draft_scope = ProjectScope::Global;
         self.draft_time_filter = TimeRange::All;
-        self.draft_sort_order = SortOrder::Newest;
+        self.draft_sort_order = SortOrder::Relevance;
         self.filter_focus = FilterFocus::Source;
         if was_filtered {
             self.mark_filters_dirty();
@@ -2410,7 +2414,7 @@ impl App {
         self.source_filter_selection.clear();
         self.scope = crate::project_scope::auto_scope();
         self.time_filter = self.config.sync_window.to_time_range();
-        self.sort_order = SortOrder::Newest;
+        self.sort_order = SortOrder::Relevance;
         self.draft_source_filter_selection = self.source_filter_selection.clone();
         self.draft_scope = self.scope.clone();
         self.draft_time_filter = self.time_filter;
@@ -2881,7 +2885,7 @@ impl App {
     }
 
     fn apply_sort(&self, results: &mut [SearchResult]) {
-        if self.sort_order == SortOrder::Newest {
+        if self.effective_sort_order() == SortOrder::Newest {
             results.sort_by_key(|b| {
                 std::cmp::Reverse((
                     b.session.updated_at.unwrap_or(b.session.started_at),
@@ -2969,7 +2973,7 @@ mod tests {
             draft_source_filter_selection: Vec::new(),
             draft_scope: ProjectScope::Global,
             draft_time_filter: TimeRange::All,
-            draft_sort_order: SortOrder::Newest,
+            draft_sort_order: SortOrder::Relevance,
             should_quit: false,
             last_keystroke: Instant::now(),
             search_pending: false,
@@ -2979,7 +2983,7 @@ mod tests {
             search_feedback: None,
             embedding_unavailable: false,
             status_message: None,
-            sort_order: SortOrder::Newest,
+            sort_order: SortOrder::Relevance,
             export_path: String::new(),
             export_cursor: 0,
             total_sessions: 0,
@@ -3887,12 +3891,19 @@ mod tests {
     }
 
     #[test]
-    fn app_defaults_to_newest_sort() {
+    fn app_defaults_to_relevance_sort_and_newest_when_browsing() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
-        let app = App::new(&store, vec![source("codex", "Codex")], AppConfig::default());
+        let mut app = App::new(&store, vec![source("codex", "Codex")], AppConfig::default());
 
-        assert_eq!(app.sort_order, SortOrder::Newest);
+        assert_eq!(app.sort_order, SortOrder::Relevance);
+        assert_eq!(app.effective_sort_order(), SortOrder::Newest);
+        assert_eq!(app.sort_label(), "Newest");
+        assert_eq!(app.draft_sort_label(), "Relevance");
+
+        app.query = "parser".to_string();
+        assert_eq!(app.effective_sort_order(), SortOrder::Relevance);
+        assert_eq!(app.sort_label(), "Relevance");
     }
 
     #[test]
@@ -3909,15 +3920,15 @@ mod tests {
     }
 
     #[test]
-    fn clear_filters_restores_newest_sort() {
+    fn clear_filters_restores_relevance_sort() {
         let mut app = app_with_sources();
-        app.sort_order = SortOrder::Relevance;
+        app.sort_order = SortOrder::Newest;
         app.open_filters();
 
         app.clear_filters();
 
-        assert_eq!(app.sort_order, SortOrder::Relevance);
-        assert_eq!(app.draft_sort_order, SortOrder::Newest);
+        assert_eq!(app.sort_order, SortOrder::Newest);
+        assert_eq!(app.draft_sort_order, SortOrder::Relevance);
         assert!(app.filters_dirty);
     }
 
@@ -3933,6 +3944,21 @@ mod tests {
 
         assert_eq!(results[0].session.source_id, "active-older-start");
         assert_eq!(results[1].session.source_id, "stale-newer-start");
+    }
+
+    #[test]
+    fn relevance_sort_keeps_engine_order_when_query_is_set() {
+        let mut app = app_with_sources();
+        app.query = "parser".to_string();
+        let mut results = vec![
+            search_result_with_times("stale-newer-start", 900, Some(900)),
+            search_result_with_times("active-older-start", 100, Some(1000)),
+        ];
+
+        app.apply_sort(&mut results);
+
+        assert_eq!(results[0].session.source_id, "stale-newer-start");
+        assert_eq!(results[1].session.source_id, "active-older-start");
     }
 
     #[test]
@@ -4016,13 +4042,13 @@ mod tests {
 
         app.handle_filters_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &store);
 
-        assert_eq!(app.sort_order, SortOrder::Newest);
+        assert_eq!(app.sort_order, SortOrder::Relevance);
         assert!(app.filters_dirty);
         assert!(!app.search_pending);
 
         app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
 
-        assert_eq!(app.sort_order, SortOrder::Relevance);
+        assert_eq!(app.sort_order, SortOrder::Newest);
         assert!(matches!(app.mode, AppMode::Search));
         assert!(app.search_pending);
         assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));

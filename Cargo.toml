@@ -8,12 +8,12 @@ repository = "https://github.com/samzong/Recall"
 publish = false
 
 [workspace]
-members = [".", "crates/rx", "extensions/recall-probe", "extensions/recall-reflect"]
+members = [".", "crates/rx", "extensions/recall-probe", "extensions/recall-reflect", "extensions/recall-powercontext"]
 default-members = ["."]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
