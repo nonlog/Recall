@@ -588,87 +588,95 @@ pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
     };
 
     let area = f.area();
-    let width = area.width.clamp(48, 84);
-    let height: u16 = 12;
+    let width = area.width.clamp(52, 88);
+    let mut source_counts = std::collections::BTreeMap::<String, usize>::new();
+    for session in &pending.sessions {
+        *source_counts.entry(session.source.clone()).or_default() += 1;
+    }
+    let source_rows = source_counts.len().min(4) as u16;
+    let height = (10 + source_rows).min(area.height.saturating_sub(2).max(10));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
 
     let (mode_label, mode_note, mode_color) = match pending.mode {
-        DeleteMode::Trash => {
-            ("Trash", "Move native session data to Recall trash when supported.", THEME.success)
-        }
+        DeleteMode::Trash => (
+            "Move to trash",
+            "Native data is moved/backed up when supported; stale/unsupported sources are removed from Recall only.",
+            THEME.success,
+        ),
+        DeleteMode::Permanent => (
+            "Permanent delete",
+            "Native session data is deleted without a recovery copy when supported.",
+            THEME.error,
+        ),
         DeleteMode::IndexOnly => {
-            ("Index only", "Keep native Agent data; a later sync may index it again.", THEME.info)
-        }
-        DeleteMode::Permanent => {
-            ("Permanent", "Delete native session data without a Recall recovery copy.", THEME.error)
+            ("Recall only", "Only Recall index entries are removed.", THEME.info)
         }
     };
-
-    let source_label = app.source_label_for(&pending.session.source);
-    let title = truncate_to_width(&pending.session.title, width.saturating_sub(18) as usize);
-    let source_id =
-        truncate_to_width(&pending.session.source_id, width.saturating_sub(18) as usize);
     let deleting = app.delete_rx.is_some();
-
     let block = Block::default()
-        .title(" Delete session ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if pending.mode == DeleteMode::Permanent {
-            THEME.error
+        .title(if pending.sessions.len() == 1 {
+            " Confirm delete session "
         } else {
-            THEME.accent
-        }))
+            " Confirm bulk delete "
+        })
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(mode_color))
         .style(Style::default().bg(THEME.popup_bg));
 
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Source:  ", Style::default().fg(THEME.text_muted)),
+            Span::styled(" Sessions: ", Style::default().fg(THEME.text_muted)),
             Span::styled(
-                source_label.to_string(),
-                Style::default().fg(THEME.source).add_modifier(Modifier::BOLD),
+                pending.sessions.len().to_string(),
+                Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   "),
-            Span::styled(title, Style::default().fg(THEME.text)),
         ]),
         Line::from(vec![
-            Span::styled(" Session: ", Style::default().fg(THEME.text_muted)),
-            Span::styled(source_id, Style::default().fg(THEME.text)),
-        ]),
-        Line::from(vec![
-            Span::styled(" Mode:    ", Style::default().fg(THEME.text_muted)),
+            Span::styled(" Action:   ", Style::default().fg(THEME.text_muted)),
             Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::raw("          "),
-            Span::styled(mode_note, Style::default().fg(THEME.text_muted)),
+            Span::raw("           "),
+            Span::styled(
+                truncate_to_width(mode_note, width.saturating_sub(14) as usize),
+                Style::default().fg(THEME.text_muted),
+            ),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  [T] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("trash  ", Style::default().fg(THEME.text)),
-            Span::styled("[I] ", Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("index only  ", Style::default().fg(THEME.text)),
-            Span::styled("[P] ", Style::default().fg(THEME.error).add_modifier(Modifier::BOLD)),
-            Span::styled("permanent", Style::default().fg(THEME.text)),
-        ]),
     ];
 
-    if deleting {
+    for (source, count) in source_counts.iter().take(4) {
+        let brand = crate::tui::source_brand::source_brand(source);
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                "Deleting...",
-                Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+                format!("{} {}", brand.mark, app.source_label_for(source)),
+                Style::default().fg(brand.color).add_modifier(Modifier::BOLD),
             ),
+            Span::styled(format!("  ×{count}"), Style::default().fg(THEME.text_muted)),
         ]));
+    }
+    if source_counts.len() > 4 {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more sources", source_counts.len() - 4),
+            Style::default().fg(THEME.text_muted),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    if deleting {
+        lines.push(Line::from(Span::styled(
+            "  Deleting...",
+            Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+        )));
     } else {
         lines.push(Line::from(vec![
             Span::styled(
                 "  [Y/Enter] ",
-                Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
+                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled("confirm   ", Style::default().fg(THEME.text)),
             Span::styled(
@@ -725,8 +733,12 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" preview  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Enter", Style::default().fg(THEME.accent)),
                     Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
-                    Span::styled("Del", Style::default().fg(THEME.error)),
-                    Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Space/Ins", Style::default().fg(THEME.accent)),
+                    Span::styled(" select  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Del", Style::default().fg(THEME.success)),
+                    Span::styled(" trash  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+D", Style::default().fg(THEME.error)),
+                    Span::styled(" purge  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+F", Style::default().fg(THEME.accent)),
                     Span::styled(" filter  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Ctrl+R", Style::default().fg(THEME.accent)),
@@ -756,8 +768,10 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(" sessions  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Enter", Style::default().fg(THEME.accent)),
                     Span::styled(" detail  ", Style::default().fg(THEME.text_muted)),
-                    Span::styled("Del", Style::default().fg(THEME.error)),
-                    Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Del", Style::default().fg(THEME.success)),
+                    Span::styled(" trash  ", Style::default().fg(THEME.text_muted)),
+                    Span::styled("Ctrl+D", Style::default().fg(THEME.error)),
+                    Span::styled(" purge  ", Style::default().fg(THEME.text_muted)),
                     Span::styled("Esc", Style::default().fg(THEME.accent)),
                     Span::styled(" back", Style::default().fg(THEME.text_muted)),
                 ];

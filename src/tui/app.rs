@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,9 @@ use crate::session_action;
 use crate::session_delete::DeleteMode;
 use crate::skill_audit::SkillAuditReport;
 use crate::transcript;
-use crate::tui::delete_state::{DeleteOrigin, DeleteWorkerResponse, PendingDelete};
+use crate::tui::delete_state::{
+    DeleteFailure, DeleteOrigin, DeleteSuccess, DeleteWorkerResponse, PendingDelete,
+};
 use crate::tui::layout::{
     MessagePane, SearchLayout, ViewingLayout, search_layout, vertical_scrollbar_position,
     vertical_scrollbar_row_position, viewing_layout,
@@ -130,6 +133,7 @@ pub(crate) struct App {
     pub(crate) cursor_pos: usize,
     pub(crate) results: Vec<SearchResult>,
     pub(crate) selected_index: usize,
+    pub(crate) selected_session_ids: HashSet<String>,
     pub(crate) result_scroll_offset: usize,
     pub(crate) preview_messages: Vec<Message>,
     pub(crate) preview_selected_msg: usize,
@@ -232,6 +236,7 @@ impl App {
             cursor_pos: 0,
             results: Vec::new(),
             selected_index: 0,
+            selected_session_ids: HashSet::new(),
             result_scroll_offset: 0,
             preview_messages: Vec::new(),
             preview_selected_msg: 0,
@@ -440,6 +445,7 @@ impl App {
             .map(|session| SearchResult { session, match_source: MatchSource::Fts, snippet: None })
             .collect();
         self.selected_index = 0;
+        self.selected_session_ids.clear();
         self.result_scroll_offset = 0;
         self.panel_focus = PanelFocus::SessionList;
         self.search_pending = false;
@@ -520,30 +526,58 @@ impl App {
         match rx.try_recv() {
             Ok(response) => {
                 self.pending_delete = None;
-                match response.result {
-                    Ok(result) => {
-                        self.remove_deleted_session(store, &response.session_id);
-                        if response.origin == DeleteOrigin::Viewing {
-                            self.exit_viewing_to_search();
-                        } else {
-                            self.mode = AppMode::Search;
-                        }
-                        self.status_message = Some(match result.trash_dir {
-                            Some(path) => format!("Deleted session to Recall trash: {path}"),
-                            None if result.mode == "index-only" => {
-                                "Deleted session from Recall index only".to_string()
-                            }
-                            None => "Deleted session permanently".to_string(),
-                        });
-                    }
-                    Err(message) => {
-                        self.mode = match response.origin {
-                            DeleteOrigin::Search => AppMode::Search,
-                            DeleteOrigin::Viewing => AppMode::Viewing,
-                        };
-                        self.status_message = Some(format!("Delete failed: {message}"));
-                    }
+                let deleted_ids: HashSet<&str> =
+                    response.successes.iter().map(|success| success.session_id.as_str()).collect();
+                self.remove_deleted_sessions(store, &deleted_ids);
+
+                if response.origin == DeleteOrigin::Viewing && !response.successes.is_empty() {
+                    self.exit_viewing_to_search();
+                } else {
+                    self.mode = match response.origin {
+                        DeleteOrigin::Search => AppMode::Search,
+                        DeleteOrigin::Viewing => AppMode::Viewing,
+                    };
                 }
+
+                let trash_count = response
+                    .successes
+                    .iter()
+                    .filter(|success| success.result.mode == "trash")
+                    .count();
+                let permanent_count = response
+                    .successes
+                    .iter()
+                    .filter(|success| success.result.mode == "permanent")
+                    .count();
+                let index_only_count = response
+                    .successes
+                    .iter()
+                    .filter(|success| success.result.mode == "index-only")
+                    .count();
+                let failed_count = response.failures.len();
+
+                let mut parts = Vec::new();
+                if trash_count > 0 {
+                    parts.push(format!("{trash_count} moved to trash"));
+                }
+                if permanent_count > 0 {
+                    parts.push(format!("{permanent_count} permanently deleted"));
+                }
+                if index_only_count > 0 {
+                    parts.push(format!("{index_only_count} removed from Recall only"));
+                }
+                if failed_count > 0 {
+                    let first = &response.failures[0];
+                    parts.push(format!(
+                        "{failed_count} failed ({}: {})",
+                        first.session_id, first.message
+                    ));
+                }
+                self.status_message = Some(if parts.is_empty() {
+                    "No sessions deleted".to_string()
+                } else {
+                    parts.join("; ")
+                });
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.delete_rx = Some(rx);
@@ -1175,10 +1209,25 @@ impl App {
             return;
         }
 
-        if key.code == KeyCode::Delete
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d'))
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            self.start_delete_confirmation(DeleteOrigin::Search, DeleteMode::Permanent);
+            return;
+        }
+
+        if key.code == KeyCode::Delete {
+            self.start_delete_confirmation(DeleteOrigin::Search, DeleteMode::Trash);
+            return;
+        }
+
+        if self.panel_focus == PanelFocus::SessionList
+            && (key.code == KeyCode::Insert
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char(' '))
+                || (self.query.is_empty()
+                    && key.modifiers.is_empty()
+                    && key.code == KeyCode::Char(' ')))
         {
-            self.start_delete_confirmation(DeleteOrigin::Search);
+            self.toggle_current_session_selection();
             return;
         }
 
@@ -1300,6 +1349,14 @@ impl App {
             self.start_app_open_confirmation(ResumeOrigin::Viewing);
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            self.start_delete_confirmation(DeleteOrigin::Viewing, DeleteMode::Permanent);
+            return;
+        }
+        if key.code == KeyCode::Delete {
+            self.start_delete_confirmation(DeleteOrigin::Viewing, DeleteMode::Trash);
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.back_out_of_viewing(store);
@@ -1341,9 +1398,6 @@ impl App {
             }
             KeyCode::Char('h') => {
                 self.open_handoff_target_picker();
-            }
-            KeyCode::Delete | KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.start_delete_confirmation(DeleteOrigin::Viewing);
             }
             KeyCode::Char('/') => {
                 self.viewing_search_input = Some(String::new());
@@ -1618,26 +1672,43 @@ impl App {
         }
     }
 
-    fn start_delete_confirmation(&mut self, origin: DeleteOrigin) {
+    fn toggle_current_session_selection(&mut self) {
+        let Some(session_id) =
+            self.results.get(self.selected_index).map(|result| result.session.id.clone())
+        else {
+            return;
+        };
+        if !self.selected_session_ids.insert(session_id.clone()) {
+            self.selected_session_ids.remove(&session_id);
+        }
+    }
+
+    fn delete_targets(&self, origin: DeleteOrigin) -> Vec<Session> {
+        match origin {
+            DeleteOrigin::Viewing => self.viewing_session.clone().into_iter().collect(),
+            DeleteOrigin::Search if !self.selected_session_ids.is_empty() => self
+                .results
+                .iter()
+                .filter(|result| self.selected_session_ids.contains(&result.session.id))
+                .map(|result| result.session.clone())
+                .collect(),
+            DeleteOrigin::Search => self
+                .results
+                .get(self.selected_index)
+                .map(|result| vec![result.session.clone()])
+                .unwrap_or_default(),
+        }
+    }
+
+    fn start_delete_confirmation(&mut self, origin: DeleteOrigin, mode: DeleteMode) {
         if self.delete_rx.is_some() {
             return;
         }
-        let session = match origin {
-            DeleteOrigin::Viewing => self.viewing_session.clone(),
-            DeleteOrigin::Search => {
-                self.results.get(self.selected_index).map(|result| result.session.clone())
-            }
-        };
-        let Some(session) = session else {
+        let sessions = self.delete_targets(origin);
+        if sessions.is_empty() {
             return;
-        };
-        let mode = if session.is_import || matches!(session.source.as_str(), "cursor" | "kiro-cli")
-        {
-            DeleteMode::IndexOnly
-        } else {
-            DeleteMode::Trash
-        };
-        self.pending_delete = Some(PendingDelete { session, origin, mode });
+        }
+        self.pending_delete = Some(PendingDelete { sessions, origin, mode });
         self.mode = AppMode::ConfirmDelete;
     }
 
@@ -1646,21 +1717,6 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                if let Some(pending) = self.pending_delete.as_mut() {
-                    pending.mode = DeleteMode::Trash;
-                }
-            }
-            KeyCode::Char('i') | KeyCode::Char('I') => {
-                if let Some(pending) = self.pending_delete.as_mut() {
-                    pending.mode = DeleteMode::IndexOnly;
-                }
-            }
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                if let Some(pending) = self.pending_delete.as_mut() {
-                    pending.mode = DeleteMode::Permanent;
-                }
-            }
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 self.execute_pending_delete();
             }
@@ -1683,23 +1739,41 @@ impl App {
         let Some(pending) = self.pending_delete.clone() else {
             return;
         };
-        let session_id = pending.session.id.clone();
         let origin = pending.origin;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = (|| {
-                let store = Store::open()?;
-                let plan = crate::session_delete::plan(&pending.session, pending.mode)?;
-                crate::session_delete::execute(&store, &pending.session, &plan, false)
-            })()
-            .map_err(|error: anyhow::Error| error.to_string());
-            let _ = tx.send(DeleteWorkerResponse { session_id, origin, result });
+            let mut successes = Vec::new();
+            let mut failures = Vec::new();
+            match Store::open() {
+                Ok(store) => {
+                    for session in pending.sessions {
+                        let session_id = session.id.clone();
+                        let result =
+                            crate::session_delete::plan(&session, pending.mode).and_then(|plan| {
+                                crate::session_delete::execute(&store, &session, &plan, false)
+                            });
+                        match result {
+                            Ok(result) => successes.push(DeleteSuccess { session_id, result }),
+                            Err(error) => failures
+                                .push(DeleteFailure { session_id, message: error.to_string() }),
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures.extend(pending.sessions.into_iter().map(|session| DeleteFailure {
+                        session_id: session.id,
+                        message: error.to_string(),
+                    }));
+                }
+            }
+            let _ = tx.send(DeleteWorkerResponse { origin, successes, failures });
         });
         self.delete_rx = Some(rx);
     }
 
-    fn remove_deleted_session(&mut self, store: &Store, session_id: &str) {
-        self.results.retain(|result| result.session.id != session_id);
+    fn remove_deleted_sessions(&mut self, store: &Store, session_ids: &HashSet<&str>) {
+        self.results.retain(|result| !session_ids.contains(result.session.id.as_str()));
+        self.selected_session_ids.retain(|session_id| !session_ids.contains(session_id.as_str()));
         if self.results.is_empty() {
             self.selected_index = 0;
             self.result_scroll_offset = 0;
@@ -2247,6 +2321,7 @@ impl App {
                 self.apply_sort(&mut results);
                 self.results = results;
                 self.selected_index = 0;
+                self.selected_session_ids.clear();
                 self.result_scroll_offset = 0;
                 self.panel_focus = PanelFocus::SessionList;
                 self.load_preview(store);
@@ -2944,6 +3019,7 @@ mod tests {
             cursor_pos: 0,
             results: Vec::new(),
             selected_index: 0,
+            selected_session_ids: HashSet::new(),
             result_scroll_offset: 0,
             preview_messages: Vec::new(),
             preview_selected_msg: 0,
@@ -3618,7 +3694,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_key_from_search_opens_safe_confirmation() {
+    fn delete_key_from_search_opens_trash_confirmation() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
@@ -3630,47 +3706,63 @@ mod tests {
         let pending = app.pending_delete.as_ref().unwrap();
         assert_eq!(pending.origin, DeleteOrigin::Search);
         assert_eq!(pending.mode, DeleteMode::Trash);
-        assert_eq!(pending.session.id, "session1");
+        assert_eq!(pending.sessions.len(), 1);
+        assert_eq!(pending.sessions[0].id, "session1");
         assert!(app.delete_rx.is_none());
     }
 
     #[test]
-    fn imported_and_shared_database_sessions_default_to_index_only_delete() {
+    fn ctrl_d_from_search_opens_permanent_confirmation() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.results = vec![codex_search_result()];
 
-        let mut imported = app_with_sources();
-        let mut imported_result = codex_search_result();
-        imported_result.session.is_import = true;
-        imported.results = vec![imported_result];
-        imported.handle_search_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &store);
-        assert_eq!(imported.pending_delete.as_ref().unwrap().mode, DeleteMode::IndexOnly);
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &store);
 
-        let mut cursor = app_with_sources();
-        let mut cursor_result = codex_search_result();
-        cursor_result.session.source = "cursor".to_string();
-        cursor.results = vec![cursor_result];
-        cursor.handle_search_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &store);
-        assert_eq!(cursor.pending_delete.as_ref().unwrap().mode, DeleteMode::IndexOnly);
+        let pending = app.pending_delete.as_ref().unwrap();
+        assert_eq!(pending.mode, DeleteMode::Permanent);
+        assert_eq!(pending.sessions.len(), 1);
     }
 
     #[test]
-    fn d_from_viewing_opens_delete_confirmation_and_mode_can_change() {
+    fn insert_multiselects_sessions_and_delete_targets_all_marked() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        let first = codex_search_result();
+        let mut second = codex_search_result();
+        second.session.id = "session2".to_string();
+        second.session.source_id = "source2".to_string();
+        app.results = vec![first, second];
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE), &store);
+        app.selected_index = 1;
+        app.handle_search_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE), &store);
+        assert_eq!(app.selected_session_ids.len(), 2);
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &store);
+        let pending = app.pending_delete.as_ref().unwrap();
+        assert_eq!(pending.mode, DeleteMode::Trash);
+        assert_eq!(pending.sessions.len(), 2);
+    }
+
+    #[test]
+    fn viewing_delete_and_ctrl_d_choose_fixed_modes() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
         app.viewing_session = Some(codex_search_result().session);
         app.mode = AppMode::Viewing;
 
-        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &store);
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &store);
+        assert_eq!(app.pending_delete.as_ref().unwrap().mode, DeleteMode::Trash);
+        app.handle_confirm_delete_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert!(matches!(app.mode, AppMode::ConfirmDelete));
-        assert_eq!(app.pending_delete.as_ref().unwrap().origin, DeleteOrigin::Viewing);
-        app.handle_confirm_delete_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        app.handle_viewing_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &store);
         assert_eq!(app.pending_delete.as_ref().unwrap().mode, DeleteMode::Permanent);
         app.handle_confirm_delete_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::Viewing));
-        assert!(app.pending_delete.is_none());
     }
 
     #[test]

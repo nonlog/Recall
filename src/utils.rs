@@ -138,12 +138,7 @@ const TITLE_MAX_CHARS: usize = 80;
 const TITLE_TRUNCATE_TAIL: usize = 77;
 
 pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
-    let chosen = user_contents
-        .iter()
-        .copied()
-        .find(|c| !is_noise_first_message(c))
-        .or_else(|| user_contents.first().copied())
-        .unwrap_or("");
+    let chosen = user_contents.iter().copied().find(|c| !is_noise_first_message(c)).unwrap_or("");
 
     let trimmed = chosen.trim();
     if trimmed.is_empty() {
@@ -168,6 +163,9 @@ const NOISE_FIRST_MESSAGE_PREFIXES: &[&str] = &[
     "<command-name>",
     "<command-message>",
     "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<ide_opened_file>",
     "<system-reminder>",
     "<tool_use_error>",
     "[Request interrupted",
@@ -291,6 +289,15 @@ mod tests {
     }
 
     #[test]
+    fn title_skips_local_command_stdout_noise() {
+        let msgs = [
+            "<local-command-stdout>Set model to Opus</local-command-stdout>",
+            "implement the actual feature",
+        ];
+        assert_eq!(title_from_user_messages(&msgs), "implement the actual feature");
+    }
+
+    #[test]
     fn title_skips_local_command_caveat_noise() {
         let msgs = [
             "<local-command-caveat>Caveat: ignore this wrapper</local-command-caveat>",
@@ -319,12 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn title_falls_back_to_first_when_all_are_noise() {
+    fn title_returns_untitled_when_all_messages_are_noise() {
         let msgs = [
             "<command-message>ship</command-message>",
-            "<command-message>review</command-message>",
+            "<local-command-stdout>done</local-command-stdout>",
         ];
-        assert_eq!(title_from_user_messages(&msgs), "<command-message>ship</command-message>");
+        assert_eq!(title_from_user_messages(&msgs), "Untitled");
     }
 
     #[test]

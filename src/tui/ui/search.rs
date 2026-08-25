@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::app::App;
 use crate::tui::layout::search_layout;
 use crate::tui::search_state::{FilterFocus, PanelFocus};
+use crate::tui::source_brand::source_brand;
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::theme::THEME;
 use crate::types::Role;
@@ -178,7 +179,16 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
     let title = if app.results.is_empty() {
         " Sessions (0) ".to_string()
     } else {
-        format!(" Sessions [{}/{}] ", app.selected_index + 1, app.results.len())
+        if app.selected_session_ids.is_empty() {
+            format!(" Sessions [{}/{}] ", app.selected_index + 1, app.results.len())
+        } else {
+            format!(
+                " Sessions [{}/{}] · {} selected ",
+                app.selected_index + 1,
+                app.results.len(),
+                app.selected_session_ids.len()
+            )
+        }
     };
     let block = Block::default()
         .title(title)
@@ -204,6 +214,8 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
             let s = &result.session;
             let age = crate::utils::format_age(s.started_at);
             let source_label = app.source_label_for(&s.source);
+            let brand = source_brand(&s.source);
+            let marked = app.selected_session_ids.contains(&s.id);
             let title: String = s.title.chars().take(40).collect();
             let selected = i == app.selected_index;
             let active_selected = focused && selected;
@@ -218,8 +230,16 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
 
             let line = Line::from(vec![
                 Span::styled(
-                    source_label.to_string(),
-                    if selected { selected_text_style } else { Style::default().fg(THEME.source) },
+                    if marked { "[x] " } else { "[ ] " },
+                    if marked {
+                        Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(THEME.text_muted)
+                    },
+                ),
+                Span::styled(
+                    format!("{} {}", brand.mark, source_label),
+                    if selected { selected_text_style } else { Style::default().fg(brand.color) },
                 ),
                 Span::raw(" "),
                 Span::styled(
