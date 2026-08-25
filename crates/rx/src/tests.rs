@@ -7,7 +7,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use crate::args::{
-    Command, Harness, LaunchRequest, ModelsCommand, ProvidersCommand, parse, rewrite_argv0,
+    Command, Harness, LaunchRequest, ModelsCommand, ProvidersCommand, UpdateCommand, parse,
+    rewrite_argv0,
 };
 use crate::config::{self, Paths};
 use crate::launch::{self, EnvLookup};
@@ -205,8 +206,11 @@ fn rx_help_and_version() {
 
 #[test]
 fn update_parses_yes_flag() {
-    assert_eq!(parse_line(&["rx", "update"]), Command::Update { yes: false });
-    assert_eq!(parse_line(&["rx", "update", "--yes"]), Command::Update { yes: true });
+    assert_eq!(parse_line(&["rx", "update"]), Command::Update(UpdateCommand::Run { yes: false }));
+    assert_eq!(
+        parse_line(&["rx", "update", "--yes"]),
+        Command::Update(UpdateCommand::Run { yes: true })
+    );
 }
 
 #[test]

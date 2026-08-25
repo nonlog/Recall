@@ -58,13 +58,19 @@ pub(crate) enum ModelsCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateCommand {
+    Help,
+    Run { yes: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     Help,
     Version,
     Launch(LaunchRequest),
     PickHarness { provider: Option<String> },
     Providers(ProvidersCommand),
-    Update { yes: bool },
+    Update(UpdateCommand),
 }
 
 pub(crate) fn rewrite_argv0(mut args: Vec<String>) -> Vec<String> {
@@ -108,7 +114,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command> {
             if provider.is_some() {
                 bail!("--provider is not valid with rx update");
             }
-            Ok(Command::Update { yes: parse_update_args(&rest[1..])? })
+            Ok(Command::Update(parse_update(&rest[1..])?))
         }
         Some(name) => {
             let Some(harness) = Harness::parse(name) else {
@@ -201,17 +207,18 @@ fn extract_provider(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
     Ok((provider, rest))
 }
 
+fn parse_update(args: &[String]) -> Result<UpdateCommand> {
+    match args.first().map(String::as_str) {
+        Some("-h" | "--help") if args.len() == 1 => Ok(UpdateCommand::Help),
+        _ => Ok(UpdateCommand::Run { yes: parse_update_args(args)? }),
+    }
+}
+
 fn parse_update_args(args: &[String]) -> Result<bool> {
     let mut yes = false;
     for arg in args {
         match arg.as_str() {
             "--yes" | "-y" => yes = true,
-            "-h" | "--help" => {
-                bail!(
-                    "usage: rx update [--yes]\n\n\
-                     Download and install the latest rx from GitHub releases."
-                );
-            }
             other => bail!("unexpected argument: {other}\n\nusage: rx update [--yes]"),
         }
     }
