@@ -486,7 +486,9 @@ fn auth_override(env_key: &str) -> String {
 }
 
 fn user_sets_opencode_model(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "-m" || arg.starts_with("-m="))
+    passthrough.iter().any(|arg| {
+        arg == "-m" || arg.starts_with("-m=") || arg == "--model" || arg.starts_with("--model=")
+    })
 }
 
 fn user_sets_model(passthrough: &[String]) -> bool {
