@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::args::UpdateCommand;
 use crate::config::Paths;
 use crate::launch::EnvLookup;
 
@@ -32,7 +33,24 @@ pub(crate) struct UpdateState {
     last_check: Option<String>,
 }
 
-pub(crate) fn run(yes: bool) -> Result<()> {
+pub(crate) fn help() -> &'static str {
+    concat!(
+        "usage: rx update [--yes]\n\n",
+        "Download and install the latest rx from GitHub releases.\n",
+    )
+}
+
+pub(crate) fn run(command: UpdateCommand) -> Result<()> {
+    match command {
+        UpdateCommand::Help => {
+            print!("{}", help());
+            Ok(())
+        }
+        UpdateCommand::Run { yes } => install(yes),
+    }
+}
+
+fn install(yes: bool) -> Result<()> {
     let current = crate::RELEASE_VERSION;
     let release = fetch_latest_release()?;
     if !update_pending(current, &release) {

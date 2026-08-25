@@ -40,7 +40,7 @@ pub fn run_with(raw_args: Vec<String>, paths: &Paths, env: &EnvLookup) -> Result
             Ok(())
         }
         Command::Providers(command) => providers::run(command, paths, env),
-        Command::Update { yes } => update::run(yes),
+        Command::Update(command) => update::run(command),
         Command::PickHarness { provider } => {
             let Some(harness) = pick::harness(env)? else {
                 return Ok(());
