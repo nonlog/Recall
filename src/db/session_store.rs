@@ -138,6 +138,24 @@ impl Store {
         Ok(n > 0)
     }
 
+    pub(crate) fn update_untitled_title(
+        &self,
+        source: &str,
+        source_id: &str,
+        title: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE sessions
+                SET title = ?3
+              WHERE source = ?1
+                AND source_id = ?2
+                AND title = 'Untitled'
+                AND (custom_title IS NULL OR custom_title = '')",
+            rusqlite::params![source, source_id, title],
+        )?;
+        Ok(n > 0)
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
