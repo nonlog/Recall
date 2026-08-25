@@ -388,6 +388,7 @@ fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
 }
