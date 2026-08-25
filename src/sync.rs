@@ -916,7 +916,40 @@ fn resolved_session_title(raw: &adapters::RawSession) -> String {
                 .filter(|summary| !summary.trim().is_empty())
                 .map(|summary| crate::utils::title_from_user_messages(&[summary.as_str()]))
         })
-        .unwrap_or(generated_title)
+        .unwrap_or_else(|| {
+            if generated_title == "Untitled" {
+                command_only_fallback_title(raw)
+            } else {
+                generated_title
+            }
+        })
+}
+
+fn command_only_fallback_title(raw: &adapters::RawSession) -> String {
+    let mut commands = Vec::<String>::new();
+    for message in raw.messages.iter().filter(|message| message.role == Role::User) {
+        let mut rest = message.content.as_str();
+        const OPEN: &str = "<command-name>";
+        const CLOSE: &str = "</command-name>";
+        while let Some(start) = rest.find(OPEN) {
+            rest = &rest[start + OPEN.len()..];
+            let Some(end) = rest.find(CLOSE) else {
+                break;
+            };
+            let command = rest[..end].trim();
+            if !command.is_empty() && !commands.iter().any(|existing| existing == command) {
+                commands.push(command.to_string());
+            }
+            rest = &rest[end + CLOSE.len()..];
+        }
+    }
+
+    let suffix: String = raw.source_id.chars().take(8).collect();
+    if commands.is_empty() {
+        return format!("Session · {suffix}");
+    }
+    let visible = commands.into_iter().take(2).collect::<Vec<_>>().join(" + ");
+    format!("Command-only: {visible} · {suffix}")
 }
 
 fn delete_excluded_sessions_for_source(
@@ -979,7 +1012,7 @@ mod tests {
     use crate::types::{Role, Session};
 
     use super::{
-        BackfillPlan, ExistingSessionAction, SyncJob, SyncRunOptions,
+        BackfillPlan, ExistingSessionAction, SyncJob, SyncRunOptions, command_only_fallback_title,
         decide_existing_session_action, delete_excluded_sessions_for_source,
         raw_session_metadata_changed,
     };
@@ -1041,6 +1074,38 @@ mod tests {
         let mut builder = globset::GlobSetBuilder::new();
         builder.add(globset::Glob::new(pattern).unwrap());
         builder.build().unwrap()
+    }
+
+    #[test]
+    fn command_only_fallback_is_descriptive_and_unique() {
+        let raw = RawSession::search_only(
+            "7c7d0fb4-d717-49c6-8c76-95068b588af8",
+            None,
+            0,
+            None,
+            None,
+            vec![
+                RawMessage {
+                    role: Role::User,
+                    content: "<command-name>/model</command-name>".to_string(),
+                    timestamp: None,
+                },
+                RawMessage {
+                    role: Role::User,
+                    content: "<command-name>/effort</command-name>".to_string(),
+                    timestamp: None,
+                },
+            ],
+        );
+
+        assert_eq!(command_only_fallback_title(&raw), "Command-only: /model + /effort · 7c7d0fb4");
+    }
+
+    #[test]
+    fn empty_session_fallback_uses_source_id_prefix() {
+        let raw = RawSession::search_only("abcdef12-3456-7890", None, 0, None, None, Vec::new());
+
+        assert_eq!(command_only_fallback_title(&raw), "Session · abcdef12");
     }
 
     fn session(id: &str, source: &str, source_id: &str) -> Session {
