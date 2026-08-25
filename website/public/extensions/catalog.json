@@ -8,20 +8,20 @@
           "protocol": 2,
           "targets": {
             "aarch64-apple-darwin": {
-              "sha256": "90f56a50f2b92d84a273c26d4ddccae94f5e192895f8f72380d42ab95f0df646",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-aarch64-apple-darwin.tar.gz"
+              "sha256": "525899ca3ace8115699e69d045edf9c6ad3102fdb32068d4b6666fe1a3811729",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-aarch64-apple-darwin.tar.gz"
             },
             "x86_64-apple-darwin": {
-              "sha256": "4c2f86ad625332b64816026f192ccd5893467b570afc785d2cc49d7d340e063a",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-apple-darwin.tar.gz"
+              "sha256": "55d32bee328ddd13c04c7cd0a668090eb6a1457556206ee4f5d8afe2614e2d5f",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-apple-darwin.tar.gz"
             },
             "x86_64-pc-windows-msvc": {
-              "sha256": "be919ee56b283d759709a28f6b32d6e90629d6ccb681942252dc0ef1f7feac1a",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-pc-windows-msvc.zip"
+              "sha256": "c03c8340c5420c94d1ccf5da3bc5c798d56e464547bb6c81e9c3ec6c8357c55f",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-pc-windows-msvc.zip"
             },
             "x86_64-unknown-linux-gnu": {
-              "sha256": "449d7fe44897b14c33bebc48652e894851877bff947b7cfc365d7da22df249b7",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+              "sha256": "9e9f7283ff03b0c61006fa68c999f8dcfa8762c683aefc265cf929e802c49bd1",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-powercontext-v0.1.0/recall-powercontext-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
         }
