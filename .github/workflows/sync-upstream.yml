@@ -131,14 +131,21 @@ jobs:
           git tag "$TAG"
           git push origin "refs/tags/$TAG"
 
-      - name: Trigger fork binary release
-        if: steps.upstream.outputs.already_synced != 'true'
+      - name: Ensure fork binary release
+        if: success()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.upstream.outputs.tag }}
         run: |
           set -euo pipefail
-          # Pushes made with GITHUB_TOKEN do not trigger push workflows, so
-          # explicitly dispatch the inherited release workflow for the new tag.
-          gh workflow run release.yml --ref main -f "tag=$TAG"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$TAG release already exists in $GITHUB_REPOSITORY"
+            exit 0
+          fi
+
+          # gh can otherwise resolve a fork checkout back to the upstream repository.
+          # Pin the dispatch target explicitly and make this step idempotent so a later
+          # sync can recover when the tag exists but a previous release dispatch failed.
+          echo "Dispatching release.yml for $TAG in $GITHUB_REPOSITORY"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main -f "tag=$TAG"
