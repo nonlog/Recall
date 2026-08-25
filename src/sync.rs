@@ -429,6 +429,11 @@ impl SyncJob {
     ) -> Result<()> {
         let raw_source_id = raw.source_id.clone();
 
+        if self.store.session_is_tombstoned(source_id, &raw_source_id)? {
+            self.stats.skipped += 1;
+            return Ok(());
+        }
+
         // Runs before every write and delete below, so a scoped sync can never
         // touch a session outside its scope.
         let repo_identity = self.repo_cache.resolve(raw.directory.as_deref());
@@ -572,11 +577,7 @@ impl SyncJob {
         }
 
         let session_uuid = uuid::Uuid::new_v4().to_string();
-        let title = raw
-            .custom_title
-            .clone()
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| generate_title(&raw.messages));
+        let title = resolved_session_title(&raw);
 
         let session = Session {
             id: session_uuid.clone(),
@@ -705,6 +706,11 @@ impl SyncJob {
                 );
                 reprocessed = true;
             }
+            self.store.update_generated_title(
+                source_id,
+                raw_source_id,
+                &resolved_session_title(raw),
+            )?;
         }
         if raw.custom_title.is_some() || raw.summary.is_some() || raw.duration_minutes.is_some() {
             self.store.update_session_fields(
@@ -896,6 +902,21 @@ fn generate_title(messages: &[adapters::RawMessage]) -> String {
     let user_contents: Vec<&str> =
         messages.iter().filter(|m| m.role == Role::User).map(|m| m.content.as_str()).collect();
     utils::title_from_user_messages(&user_contents)
+}
+
+fn resolved_session_title(raw: &adapters::RawSession) -> String {
+    let generated_title = generate_title(&raw.messages);
+    raw.custom_title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            (generated_title == "Untitled")
+                .then(|| raw.summary.clone())
+                .flatten()
+                .filter(|summary| !summary.trim().is_empty())
+                .map(|summary| crate::utils::title_from_user_messages(&[summary.as_str()]))
+        })
+        .unwrap_or(generated_title)
 }
 
 fn delete_excluded_sessions_for_source(

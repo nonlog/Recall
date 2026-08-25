@@ -35,6 +35,7 @@ pub(crate) struct DeletePlan {
     pub(crate) mode: DeleteMode,
     pub(crate) native_roots: Vec<PathBuf>,
     pub(crate) native_command: Option<ResumeCommand>,
+    pub(crate) suppress_reindex: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,16 +63,19 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
             mode: DeleteMode::IndexOnly,
             native_roots: Vec::new(),
             native_command: None,
+            suppress_reindex: false,
         });
     }
 
     let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
     if native_command.is_none() && native_roots.is_empty() {
-        anyhow::bail!(
-            "native deletion is not supported for source {}; use --index-only to remove only the Recall index entry",
-            session.source
-        );
+        return Ok(DeletePlan {
+            mode: DeleteMode::IndexOnly,
+            native_roots: Vec::new(),
+            native_command: None,
+            suppress_reindex: true,
+        });
     }
 
     if mode == DeleteMode::Trash
@@ -79,13 +83,15 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         && native_roots.is_empty()
         && session.source != "opencode"
     {
-        anyhow::bail!(
-            "{} supports native deletion, but Recall cannot create a safety backup for this session; retry with --permanent or --index-only",
-            session.source
-        );
+        return Ok(DeletePlan {
+            mode: DeleteMode::IndexOnly,
+            native_roots: Vec::new(),
+            native_command: None,
+            suppress_reindex: true,
+        });
     }
 
-    Ok(DeletePlan { mode, native_roots, native_command })
+    Ok(DeletePlan { mode, native_roots, native_command, suppress_reindex: false })
 }
 
 pub(crate) fn execute(
@@ -147,7 +153,16 @@ pub(crate) fn execute(
         DeleteMode::IndexOnly => {}
     }
 
-    if let Err(error) = store.delete_session_data(&session.source, &session.source_id) {
+    let delete_index_result = if plan.suppress_reindex {
+        store.delete_session_data_with_tombstone(
+            &session.source,
+            &session.source_id,
+            plan.mode.as_str(),
+        )
+    } else {
+        store.delete_session_data(&session.source, &session.source_id)
+    };
+    if let Err(error) = delete_index_result {
         if let Some(moved) = &moved_trash
             && let Err(rollback_error) = rollback_trash_move(moved)
         {
@@ -848,20 +863,67 @@ mod tests {
         fs::write(&path, "data").unwrap();
         let session = session("copilot-cli", "s1", Some(path.to_string_lossy().into_owned()));
 
-        let err = plan(&session, DeleteMode::Trash).unwrap_err();
-        assert!(err.to_string().contains("--index-only"));
+        let plan = plan(&session, DeleteMode::Trash).unwrap();
+        assert_eq!(plan.mode, DeleteMode::IndexOnly);
+        assert!(plan.native_roots.is_empty());
         assert!(path.exists());
     }
 
     #[test]
-    fn unsupported_shared_database_sources_require_index_only() {
+    fn unsupported_shared_database_sources_fall_back_to_index_only() {
         let session = session("cursor", "s1", None);
 
-        let err = plan(&session, DeleteMode::Trash).unwrap_err();
-        assert!(err.to_string().contains("--index-only"));
+        let trash_plan = plan(&session, DeleteMode::Trash).unwrap();
+        assert_eq!(trash_plan.mode, DeleteMode::IndexOnly);
+        assert!(trash_plan.suppress_reindex);
+        assert!(trash_plan.native_roots.is_empty());
+        assert!(trash_plan.native_command.is_none());
+
+        let permanent = plan(&session, DeleteMode::Permanent).unwrap();
+        assert_eq!(permanent.mode, DeleteMode::IndexOnly);
+        assert!(permanent.suppress_reindex);
+    }
+
+    #[test]
+    fn automatic_index_only_fallback_writes_tombstone() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let session = session("cursor", "cursor-native-id", None);
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, source, source_id, title, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                rusqlite::params![session.id, session.source, session.source_id, session.title],
+            )
+            .unwrap();
+
+        let plan = plan(&session, DeleteMode::Trash).unwrap();
+        let result = execute(&store, &session, &plan, false).unwrap();
+
+        assert_eq!(result.mode, "index-only");
+        assert!(store.get_session_by_id(&session.id).unwrap().is_none());
+        assert!(store.session_is_tombstoned(&session.source, &session.source_id).unwrap());
+    }
+
+    #[test]
+    fn explicit_index_only_does_not_write_tombstone() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let session = session("cursor", "cursor-native-id", None);
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, source, source_id, title, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                rusqlite::params![session.id, session.source, session.source_id, session.title],
+            )
+            .unwrap();
+
         let plan = plan(&session, DeleteMode::IndexOnly).unwrap();
-        assert!(plan.native_roots.is_empty());
-        assert!(plan.native_command.is_none());
+        execute(&store, &session, &plan, false).unwrap();
+
+        assert!(!store.session_is_tombstoned(&session.source, &session.source_id).unwrap());
     }
 
     #[test]

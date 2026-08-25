@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -43,8 +43,11 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 10 {
         migrate_v10(conn)?;
     }
-    if version < SCHEMA_VERSION {
+    if version < 11 {
         migrate_v11(conn)?;
+    }
+    if version < SCHEMA_VERSION {
+        migrate_v12(conn)?;
     }
     Ok(())
 }
@@ -364,6 +367,24 @@ fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
             return Err(err.into());
         }
     }
+    Ok(())
+}
+
+fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_deletion_tombstones (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            deleted_at INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            PRIMARY KEY(source, source_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_deletion_tombstones_source
+            ON session_deletion_tombstones(source);
+        PRAGMA user_version = 12;
+        ",
+    )?;
     Ok(())
 }
 

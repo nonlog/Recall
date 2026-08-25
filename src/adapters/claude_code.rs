@@ -22,7 +22,7 @@ pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 2;
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -77,12 +77,17 @@ impl SourceAdapter for ClaudeCodeAdapter {
         let result = scan_for_sync_impl(&claude_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
+
+    fn prune(&self, store: &Store) -> anyhow::Result<()> {
+        prune_missing_claude_sessions(store)
+    }
 }
 
 struct SessionMeta {
     cwd: Option<String>,
     started_at: Option<i64>,
     entrypoint: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Default)]
@@ -123,6 +128,18 @@ fn scan_for_sync_impl(
     )
 }
 
+fn prune_missing_claude_sessions(store: &Store) -> anyhow::Result<()> {
+    for session in store.session_paths_for_source("claude-code")? {
+        let Some(path) = session.source_file_path.as_deref() else {
+            continue;
+        };
+        if !Path::new(path).exists() {
+            store.delete_session_data("claude-code", &session.source_id)?;
+        }
+    }
+    Ok(())
+}
+
 fn load_session_index(claude_dir: &Path) -> HashMap<String, SessionMeta> {
     let sessions_dir = claude_dir.join("sessions");
     let mut index = HashMap::new();
@@ -156,6 +173,12 @@ fn load_session_index(claude_dir: &Path) -> HashMap<String, SessionMeta> {
                 cwd: v.get("cwd").and_then(|s| s.as_str()).map(|s| s.to_string()),
                 started_at: v.get("startedAt").and_then(|s| s.as_i64()),
                 entrypoint: v.get("entrypoint").and_then(|s| s.as_str()).map(|s| s.to_string()),
+                name: (v.get("nameSource").and_then(|s| s.as_str()) != Some("derived"))
+                    .then(|| v.get("name").and_then(|s| s.as_str()))
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
             };
             index.insert(session_id.to_string(), meta);
         }
@@ -332,7 +355,7 @@ fn parse_claude_session_file(
         events: parsed.events,
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         source_file_path,
-        custom_title: parsed.custom_title,
+        custom_title: parsed.custom_title.or_else(|| meta.and_then(|m| m.name.clone())),
         summary,
         duration_minutes,
         thread_role,
@@ -416,8 +439,9 @@ pub(crate) fn parse_conversation_jsonl(
             _ => continue,
         }
 
+        let is_sidechain = v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false);
         let is_machinery = v.get("isCompactSummary").and_then(|b| b.as_bool()).unwrap_or(false)
-            || v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false)
+            || is_sidechain
             || v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false);
 
         let role = if msg_type == "user" { Role::User } else { Role::Assistant };
@@ -429,6 +453,13 @@ pub(crate) fn parse_conversation_jsonl(
 
         let text = extract_content(message.get("content"));
         let timestamp = rfc3339_ms(v.get("timestamp"));
+
+        if summary.is_none() && is_sidechain && role == Role::User && !text.is_empty() {
+            let title_hint = crate::utils::title_from_user_messages(&[text.as_str()]);
+            if title_hint != "Untitled" {
+                summary = Some(title_hint);
+            }
+        }
 
         let message_seq =
             if !is_machinery && !text.is_empty() { Some(messages.len() as u32) } else { None };
@@ -926,6 +957,7 @@ mod tests {
                     cwd: Some("/tmp/from-index".to_string()),
                     started_at: None,
                     entrypoint: None,
+                    name: None,
                 },
             )]),
             project_summaries: HashMap::new(),
@@ -997,6 +1029,29 @@ mod tests {
         assert_eq!(raw.summary.as_deref(), Some("First summary"));
         assert_eq!(raw.duration_minutes, Some(2));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidechain_user_prompt_becomes_title_hint_without_indexing_sidechain_message() {
+        let root = temp_claude_root("sidechain-title");
+        let path = root.join("sidechain.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","isSidechain":true,"sessionId":"parent-session","timestamp":"2026-04-08T03:29:50.987Z","message":{"role":"user","content":"Investigate the notification synchronization regression"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_conversation_jsonl(&path, 0, true).unwrap();
+
+        assert!(parsed.messages.is_empty());
+        assert_eq!(
+            parsed.summary.as_deref(),
+            Some("Investigate the notification synchronization regression")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
