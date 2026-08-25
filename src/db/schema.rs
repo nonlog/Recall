@@ -370,7 +370,6 @@ fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "
