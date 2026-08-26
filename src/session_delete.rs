@@ -70,12 +70,10 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
     let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
     if native_command.is_none() && native_roots.is_empty() {
-        return Ok(DeletePlan {
-            mode: DeleteMode::IndexOnly,
-            native_roots: Vec::new(),
-            native_command: None,
-            suppress_reindex: true,
-        });
+        anyhow::bail!(
+            "native deletion is not supported for source {}; use --index-only explicitly to remove only the Recall index",
+            session.source
+        );
     }
 
     if mode == DeleteMode::Trash
@@ -83,12 +81,10 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         && native_roots.is_empty()
         && session.source != "opencode"
     {
-        return Ok(DeletePlan {
-            mode: DeleteMode::IndexOnly,
-            native_roots: Vec::new(),
-            native_command: None,
-            suppress_reindex: true,
-        });
+        anyhow::bail!(
+            "source {} has a native delete command but no safe backup path; use Ctrl+D/permanent delete or --index-only explicitly",
+            session.source
+        );
     }
 
     Ok(DeletePlan { mode, native_roots, native_command, suppress_reindex: false })
@@ -153,6 +149,25 @@ pub(crate) fn execute(
         DeleteMode::IndexOnly => {}
     }
 
+    if plan.mode != DeleteMode::IndexOnly {
+        for root in &plan.native_roots {
+            if root.exists() {
+                anyhow::bail!(
+                    "native deletion reported success but session path still exists: {}",
+                    root.display()
+                );
+            }
+        }
+        if session.source == "opencode"
+            && crate::adapters::opencode::native_session_exists(&session.source_id)? == Some(true)
+        {
+            anyhow::bail!(
+                "OpenCode delete command reported success but session {} still exists in the native database",
+                session.source_id
+            );
+        }
+    }
+
     let delete_index_result = if plan.suppress_reindex {
         store.delete_session_data_with_tombstone(
             &session.source,
@@ -199,6 +214,9 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
             .and_then(|path| pi_session_file(&path, &session.source_id))
             .into_iter()
             .collect(),
+        "oh-my-pi" => source_path
+            .map(|path| oh_my_pi_session_roots(&path, &session.source_id))
+            .unwrap_or_default(),
         "gemini-cli" => source_path
             .and_then(|path| gemini_session_file(&path, &session.source_id))
             .into_iter()
@@ -224,9 +242,8 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
             .into_iter()
             .collect(),
         "antigravity-cli" => source_path
-            .and_then(|path| antigravity_session_root(&path, &session.source_id))
-            .into_iter()
-            .collect(),
+            .map(|path| antigravity_session_roots(&path, &session.source_id))
+            .unwrap_or_default(),
         // OpenCode has an official deletion command and an export command, so
         // it does not need direct access to the shared SQLite database here.
         "opencode" => Vec::new(),
@@ -265,6 +282,38 @@ fn pi_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
     }
 
     (filename_id == source_id).then(|| path.to_path_buf())
+}
+
+fn oh_my_pi_session_roots(path: &Path, source_id: &str) -> Vec<PathBuf> {
+    let Some(file) = pi_session_file(path, source_id) else {
+        return Vec::new();
+    };
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let omp_root = home.join(".omp");
+    let env_root = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).filter(|root| {
+        let legacy_pi = home.join(".pi").join("agent");
+        fs::canonicalize(root).unwrap_or_else(|_| root.clone())
+            != fs::canonicalize(&legacy_pi).unwrap_or(legacy_pi)
+    });
+    let allowed = canonical_path_is_within(&file, &omp_root)
+        || env_root.as_deref().is_some_and(|root| canonical_path_is_within(&file, root));
+    if !allowed {
+        return Vec::new();
+    }
+
+    let mut roots = vec![file.clone()];
+    let artifact_dir = file.with_extension("");
+    if artifact_dir.is_dir()
+        && (canonical_path_is_within(&artifact_dir, &omp_root)
+            || env_root
+                .as_deref()
+                .is_some_and(|root| canonical_path_is_within(&artifact_dir, root)))
+    {
+        roots.push(artifact_dir);
+    }
+    roots
 }
 
 fn gemini_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
@@ -360,20 +409,54 @@ fn kimi_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
     (indexed_id == source_id).then(|| root.to_path_buf())
 }
 
-fn antigravity_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
-    if path.file_name()?.to_str()? != "transcript.jsonl" {
-        return None;
+fn antigravity_session_roots(path: &Path, source_id: &str) -> Vec<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("transcript.jsonl") {
+        return Vec::new();
     }
-    let logs_dir = path.parent()?;
-    if logs_dir.file_name()?.to_str()? != "logs" {
-        return None;
+    let Some(logs_dir) = path.parent() else {
+        return Vec::new();
+    };
+    if logs_dir.file_name().and_then(|name| name.to_str()) != Some("logs") {
+        return Vec::new();
     }
-    let generated_dir = logs_dir.parent()?;
-    if generated_dir.file_name()?.to_str()? != ".system_generated" {
-        return None;
+    let Some(generated_dir) = logs_dir.parent() else {
+        return Vec::new();
+    };
+    if generated_dir.file_name().and_then(|name| name.to_str()) != Some(".system_generated") {
+        return Vec::new();
     }
-    let root = generated_dir.parent()?;
-    (root.file_name()?.to_str()? == source_id).then(|| root.to_path_buf())
+    let Some(root) = generated_dir.parent() else {
+        return Vec::new();
+    };
+    if root.file_name().and_then(|name| name.to_str()) != Some(source_id) {
+        return Vec::new();
+    }
+    let Some(brain_dir) = root.parent() else {
+        return Vec::new();
+    };
+    if brain_dir.file_name().and_then(|name| name.to_str()) != Some("brain") {
+        return Vec::new();
+    }
+    let Some(agy_root) = brain_dir.parent() else {
+        return Vec::new();
+    };
+    if agy_root.file_name().and_then(|name| name.to_str()) != Some("antigravity-cli") {
+        return Vec::new();
+    }
+
+    let mut roots = vec![root.to_path_buf()];
+    let conversations = agy_root.join("conversations");
+    for extension in ["db", "pb"] {
+        let file = conversations.join(format!("{source_id}.{extension}"));
+        if file.is_file() {
+            roots.push(file);
+        }
+    }
+    let conversation_dir = conversations.join(source_id);
+    if conversation_dir.is_dir() {
+        roots.push(conversation_dir);
+    }
+    roots
 }
 
 fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Result<Vec<PathBuf>> {
@@ -405,6 +488,26 @@ fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Resul
     let live_meta = claude_dir.join("sessions").join(format!("{}.json", session.source_id));
     if live_meta.is_file() {
         roots.push(live_meta);
+    }
+
+    let jobs_dir = claude_dir.join("jobs");
+    if let Ok(entries) = fs::read_dir(&jobs_dir) {
+        for entry in entries.flatten() {
+            let job_dir = entry.path();
+            let state_path = job_dir.join("state.json");
+            let Ok(state) = fs::read_to_string(state_path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&state) else {
+                continue;
+            };
+            if value.get("sessionId").and_then(|value| value.as_str())
+                == Some(session.source_id.as_str())
+                && job_dir.is_dir()
+            {
+                roots.push(job_dir);
+            }
+        }
     }
 
     normalize_roots(roots)
@@ -455,12 +558,18 @@ fn normalize_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 }
 
 fn run_native_delete_command(command: &ResumeCommand) -> Result<()> {
-    let status = Command::new(&command.program)
+    let output = Command::new(&command.program)
         .args(&command.args)
-        .status()
+        .output()
         .with_context(|| format!("failed to start native delete command: {}", command.display()))?;
-    if !status.success() {
-        anyhow::bail!("native delete command failed with status {status}: {}", command.display());
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "native delete command failed with status {}: {}{}",
+            output.status,
+            command.display(),
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        );
     }
     Ok(())
 }
@@ -492,8 +601,12 @@ fn backup_before_native_command(
 }
 
 fn backup_opencode_export(session: &Session, trash_dir: &Path) -> Result<()> {
-    let output = Command::new("opencode")
-        .args(["export", session.source_id.as_str()])
+    let command = crate::adapters::opencode::opencode_cli_command(vec![
+        "export".to_string(),
+        session.source_id.clone(),
+    ]);
+    let output = Command::new(&command.program)
+        .args(&command.args)
         .output()
         .context("failed to start `opencode export` for safety backup")?;
     if !output.status.success() {
@@ -857,8 +970,16 @@ mod tests {
         let command = plan.native_command.unwrap();
 
         assert!(plan.native_roots.is_empty());
-        assert_eq!(command.program, "opencode");
-        assert_eq!(command.args, vec!["session", "delete", "ses_123"]);
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(command.program, "cmd.exe");
+            assert_eq!(command.args, vec!["/D", "/C", "opencode", "session", "delete", "ses_123"]);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(command.program, "opencode");
+            assert_eq!(command.args, vec!["session", "delete", "ses_123"]);
+        }
     }
 
     #[test]
@@ -884,29 +1005,56 @@ mod tests {
         fs::write(&path, "data").unwrap();
         let session = session("copilot-cli", "s1", Some(path.to_string_lossy().into_owned()));
 
-        let plan = plan(&session, DeleteMode::Trash).unwrap();
-        assert_eq!(plan.mode, DeleteMode::IndexOnly);
-        assert!(plan.native_roots.is_empty());
+        let error = plan(&session, DeleteMode::Trash).unwrap_err();
+        assert!(error.to_string().contains("native deletion is not supported"));
         assert!(path.exists());
     }
 
     #[test]
-    fn unsupported_shared_database_sources_fall_back_to_index_only() {
-        let session = session("cursor", "s1", None);
+    fn successful_native_command_cannot_hide_a_still_existing_session_path() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-session.jsonl");
+        fs::write(&path, "still here").unwrap();
+        let session = session("codex", "11111111-1111-1111-1111-111111111111", None);
+        store.insert_session(&session).unwrap();
 
-        let trash_plan = plan(&session, DeleteMode::Trash).unwrap();
-        assert_eq!(trash_plan.mode, DeleteMode::IndexOnly);
-        assert!(trash_plan.suppress_reindex);
-        assert!(trash_plan.native_roots.is_empty());
-        assert!(trash_plan.native_command.is_none());
+        #[cfg(target_os = "windows")]
+        let command = ResumeCommand {
+            program: "cmd.exe".to_string(),
+            args: vec!["/D".to_string(), "/C".to_string(), "exit".to_string(), "0".to_string()],
+        };
+        #[cfg(not(target_os = "windows"))]
+        let command = ResumeCommand {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+        };
+        let delete_plan = DeletePlan {
+            mode: DeleteMode::Permanent,
+            native_roots: vec![path.clone()],
+            native_command: Some(command),
+            suppress_reindex: false,
+        };
 
-        let permanent = plan(&session, DeleteMode::Permanent).unwrap();
-        assert_eq!(permanent.mode, DeleteMode::IndexOnly);
-        assert!(permanent.suppress_reindex);
+        let error = execute(&store, &session, &delete_plan, false).unwrap_err();
+        assert!(error.to_string().contains("session path still exists"));
+        assert!(path.exists());
+        assert!(store.get_session_by_id(&session.id).unwrap().is_some());
     }
 
     #[test]
-    fn automatic_index_only_fallback_writes_tombstone() {
+    fn unsupported_shared_database_sources_require_explicit_index_only() {
+        let session = session("cursor", "s1", None);
+
+        let trash = plan(&session, DeleteMode::Trash).unwrap_err();
+        assert!(trash.to_string().contains("use --index-only explicitly"));
+        let permanent = plan(&session, DeleteMode::Permanent).unwrap_err();
+        assert!(permanent.to_string().contains("use --index-only explicitly"));
+    }
+
+    #[test]
+    fn unsupported_native_delete_does_not_touch_index() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let session = session("cursor", "cursor-native-id", None);
@@ -919,12 +1067,33 @@ mod tests {
             )
             .unwrap();
 
-        let plan = plan(&session, DeleteMode::Trash).unwrap();
-        let result = execute(&store, &session, &plan, false).unwrap();
+        assert!(plan(&session, DeleteMode::Trash).is_err());
+        assert!(store.get_session_by_id(&session.id).unwrap().is_some());
+        assert!(!store.session_is_tombstoned(&session.source, &session.source_id).unwrap());
+    }
 
-        assert_eq!(result.mode, "index-only");
-        assert!(store.get_session_by_id(&session.id).unwrap().is_none());
-        assert!(store.session_is_tombstoned(&session.source, &session.source_id).unwrap());
+    #[test]
+    fn antigravity_delete_includes_brain_and_canonical_conversation_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let agy = dir.path().join("antigravity-cli");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let brain = agy.join("brain").join(id);
+        let logs = brain.join(".system_generated").join("logs");
+        let conversations = agy.join("conversations");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&conversations).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        let db = conversations.join(format!("{id}.db"));
+        let pb = conversations.join(format!("{id}.pb"));
+        fs::write(&transcript, "{}\n").unwrap();
+        fs::write(&db, "db").unwrap();
+        fs::write(&pb, "pb").unwrap();
+
+        let mut roots = antigravity_session_roots(&transcript, id);
+        roots.sort();
+        let mut expected = vec![brain, db, pb];
+        expected.sort();
+        assert_eq!(roots, expected);
     }
 
     #[test]
