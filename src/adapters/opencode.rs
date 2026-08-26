@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
 use serde_json::Value;
@@ -87,6 +87,13 @@ impl SourceAdapter for OpenCodeAdapter {
 
         Ok(Some(scan_for_sync_conn(&conn, store, since_ts, self.id(), include_events)?))
     }
+
+    fn prune(&self, store: &Store) -> anyhow::Result<()> {
+        let Some(conn) = open_opencode_db()? else {
+            return Ok(());
+        };
+        prune_missing_sessions_conn(&conn, store)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -120,6 +127,21 @@ pub(crate) fn native_session_exists(source_id: &str) -> anyhow::Result<Option<bo
         .optional()?
         .is_some();
     Ok(Some(exists))
+}
+
+fn prune_missing_sessions_conn(conn: &Connection, store: &Store) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("SELECT id FROM session")?;
+    let native_ids =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<HashSet<_>, _>>()?;
+    let imported_ids = store.imported_source_ids("opencode")?;
+
+    for indexed in store.session_paths_for_source("opencode")? {
+        if imported_ids.contains(&indexed.source_id) || native_ids.contains(&indexed.source_id) {
+            continue;
+        }
+        store.delete_session_data("opencode", &indexed.source_id)?;
+    }
+    Ok(())
 }
 
 fn open_opencode_db() -> anyhow::Result<Option<Connection>> {
@@ -711,6 +733,30 @@ mod tests {
     fn setup_store() -> Store {
         schema::register_sqlite_vec();
         Store::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn prune_removes_stale_native_sessions_but_keeps_imports() {
+        let (_path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["native", "Native", "/tmp/project", 100_i64, 100_i64],
+        )
+        .unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_session("r-native", "native", Some(100), 1)).unwrap();
+        store.insert_session(&make_session("r-stale", "stale", Some(100), 1)).unwrap();
+        let mut imported = make_session("r-imported", "imported", Some(100), 1);
+        imported.is_import = true;
+        store.insert_session(&imported).unwrap();
+
+        prune_missing_sessions_conn(&conn, &store).unwrap();
+
+        let remaining = store.session_meta_map("opencode").unwrap();
+        assert!(remaining.contains_key("native"));
+        assert!(remaining.contains_key("imported"));
+        assert!(!remaining.contains_key("stale"));
     }
 
     fn setup_opencode_db() -> (PathBuf, Connection) {
