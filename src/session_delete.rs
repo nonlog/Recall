@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -601,25 +601,41 @@ fn backup_before_native_command(
 }
 
 fn backup_opencode_export(session: &Session, trash_dir: &Path) -> Result<()> {
-    let command = crate::adapters::opencode::opencode_cli_command(vec![
+    let command = crate::adapters::opencode::opencode_maintenance_command(vec![
         "export".to_string(),
         session.source_id.clone(),
     ]);
+    let export_path = trash_dir.join("session-export.json");
+    let export_file = fs::File::create(&export_path)
+        .with_context(|| format!("failed to create {}", export_path.display()))?;
     let output = Command::new(&command.program)
         .args(&command.args)
+        .stdin(Stdio::null())
+        // OpenCode session exports can be large. Writing directly to the
+        // backup file avoids its stdout pipe path, which has had truncation
+        // issues upstream and can leave the TUI waiting indefinitely.
+        .stdout(Stdio::from(export_file))
+        .stderr(Stdio::piped())
         .output()
         .context("failed to start `opencode export` for safety backup")?;
     if !output.status.success() {
+        let _ = fs::remove_file(&export_path);
         anyhow::bail!(
             "`opencode export` failed with status {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    if output.stdout.is_empty() {
+    if fs::metadata(&export_path).map(|metadata| metadata.len()).unwrap_or_default() == 0 {
+        let _ = fs::remove_file(&export_path);
         anyhow::bail!("`opencode export` returned an empty safety backup");
     }
-    fs::write(trash_dir.join("session-export.json"), output.stdout)?;
+    let export = fs::File::open(&export_path)
+        .with_context(|| format!("failed to reopen {}", export_path.display()))?;
+    if let Err(error) = serde_json::from_reader::<_, serde_json::Value>(export) {
+        let _ = fs::remove_file(&export_path);
+        return Err(error).context("`opencode export` returned an invalid JSON safety backup");
+    }
     Ok(())
 }
 
@@ -973,12 +989,15 @@ mod tests {
         #[cfg(target_os = "windows")]
         {
             assert_eq!(command.program, "cmd.exe");
-            assert_eq!(command.args, vec!["/D", "/C", "opencode", "session", "delete", "ses_123"]);
+            assert_eq!(
+                command.args,
+                vec!["/D", "/C", "opencode", "--pure", "session", "delete", "ses_123"]
+            );
         }
         #[cfg(not(target_os = "windows"))]
         {
             assert_eq!(command.program, "opencode");
-            assert_eq!(command.args, vec!["session", "delete", "ses_123"]);
+            assert_eq!(command.args, vec!["--pure", "session", "delete", "ses_123"]);
         }
     }
 
