@@ -56,7 +56,7 @@ impl SourceAdapter for OpenCodeAdapter {
     }
 
     fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(opencode_cli_command(vec![
+        Some(opencode_maintenance_command(vec![
             "session".to_string(),
             "delete".to_string(),
             source_id.to_string(),
@@ -99,6 +99,12 @@ pub(crate) fn opencode_cli_command(args: Vec<String>) -> ResumeCommand {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn opencode_cli_command(args: Vec<String>) -> ResumeCommand {
     ResumeCommand { program: "opencode".to_string(), args }
+}
+
+pub(crate) fn opencode_maintenance_command(command_args: Vec<String>) -> ResumeCommand {
+    let mut args = vec!["--pure".to_string()];
+    args.extend(command_args);
+    opencode_cli_command(args)
 }
 
 pub(crate) fn native_session_exists(source_id: &str) -> anyhow::Result<Option<bool>> {
