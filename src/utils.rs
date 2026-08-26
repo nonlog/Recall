@@ -138,7 +138,11 @@ const TITLE_MAX_CHARS: usize = 80;
 const TITLE_TRUNCATE_TAIL: usize = 77;
 
 pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
-    let chosen = user_contents.iter().copied().find(|c| !is_noise_first_message(c)).unwrap_or("");
+    let chosen = user_contents
+        .iter()
+        .map(|content| meaningful_title_content(content))
+        .find(|content| !is_noise_first_message(content))
+        .unwrap_or_default();
 
     let trimmed = chosen.trim();
     if trimmed.is_empty() {
@@ -150,6 +154,20 @@ pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn meaningful_title_content(content: &str) -> String {
+    // VS Code/Codex integrations wrap the actual request in a large IDE-state
+    // envelope. The native Codex `threads.title` often stores that entire
+    // payload verbatim, so presenting its first 80 chars looks like a title but
+    // is actually just machinery. Prefer the explicit user request section.
+    if let Some((_, request)) = content.rsplit_once("## My request:") {
+        let request = request.trim();
+        if !request.is_empty() {
+            return request.to_string();
+        }
+    }
+    content.to_string()
 }
 
 /// Openers written by the agent harness rather than by the user: slash-command
@@ -345,5 +363,11 @@ mod tests {
     fn title_detects_noise_with_leading_whitespace() {
         let msgs = ["   <command-message>ship</command-message>", "real content"];
         assert_eq!(title_from_user_messages(&msgs), "real content");
+    }
+
+    #[test]
+    fn title_extracts_codex_ide_request_instead_of_scaffolding() {
+        let message = "# Context from my IDE setup:\n\n## Active file: src/main.cpp\n\n## Open tabs:\n- src/main.cpp\n\n## My request:\n指导我一步一步驱动这个打印机";
+        assert_eq!(title_from_user_messages(&[message]), "指导我一步一步驱动这个打印机");
     }
 }

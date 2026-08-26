@@ -42,7 +42,7 @@ recall session delete --id <session-id> --permanent # no Recall trash backup
 recall session delete --id <session-id> --index-only # leave source-agent data untouched
 ```
 
-Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, Antigravity, Gemini, Grok, Copilot, Cline, DeepSeek Harness, and Kimi Code use their indexed per-session file or directory. Cursor and Kiro currently require `--index-only`; Recall deliberately does not write their shared SQLite databases directly.
+Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, Oh My Pi, Antigravity, Gemini, Grok, Copilot, Cline, DeepSeek Harness, and Kimi Code use their indexed per-session file or directory. Recall verifies known native paths are gone before it removes the index entry. Cursor and Kiro currently require an explicit `--index-only`; normal Delete/Purge fails instead of pretending the native session was deleted.
 
 The default trash is stored under Recall's data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
 
@@ -62,6 +62,7 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | OpenCode        |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Codex           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Pi              |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Oh My Pi        |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Antigravity |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
 | Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kiro            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |

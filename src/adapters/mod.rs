@@ -12,6 +12,7 @@ pub(crate) mod grok;
 pub(crate) mod json_util;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
+pub(crate) mod oh_my_pi;
 pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
@@ -186,6 +187,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
         Box::new(pi::PiAdapter),
+        Box::new(oh_my_pi::OhMyPiAdapter),
         Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(grok::GrokAdapter),

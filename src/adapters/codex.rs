@@ -24,7 +24,7 @@ pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
 const EVENT_PARSER_VERSION: u32 = 1;
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default)]
 struct CodexThreadMetadata {

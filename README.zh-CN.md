@@ -41,7 +41,7 @@ recall session delete --id <session-id> --permanent  # 不保留 Recall 回收�
 recall session delete --id <session-id> --index-only # 保留原 Agent 数据，只删 Recall 索引
 ```
 
-Codex 与 OpenCode 使用各自官方删除命令，从而保持它们自己的会话元数据一致。Claude Code、Pi、Antigravity、Gemini、Grok、Copilot、Cline、DeepSeek Harness 与 Kimi Code 根据已索引的独立会话文件或目录进行删除。Cursor 与 Kiro 当前只允许 `--index-only`；Recall 不会直接写入它们的共享 SQLite 数据库。
+Codex 与 OpenCode 使用各自官方删除命令，从而保持它们自己的会话元数据一致。Claude Code、Pi、Oh My Pi、Antigravity、Gemini、Grok、Copilot、Cline、DeepSeek Harness 与 Kimi Code 根据已索引的独立会话文件或目录进行删除。删除完成后，Recall 还会验证已知原生路径确实消失，之后才移除索引。Cursor 与 Kiro 当前必须显式使用 `--index-only`；普通 Delete/Purge 会直接报不支持，而不是假装原始会话已被删除。
 
 默认回收备份保存在 Recall 的数据目录下。对于带官方原生删除命令的来源，Recall 会先创建安全备份再调用原生命令；对于文件型来源，则把原始会话数据移动到回收目录。导入的会话始终只删除 Recall 索引。
 
@@ -61,6 +61,7 @@ recall skill install # 自动检测 agent 并安装 skills
 | OpenCode        |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Codex           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Pi              |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
+| Oh My Pi        |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Antigravity     |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |      |
 | Gemini          |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Kiro            |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  —   |      |

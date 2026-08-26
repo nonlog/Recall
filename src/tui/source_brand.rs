@@ -12,6 +12,7 @@ pub(crate) fn source_brand(source: &str) -> SourceBrand {
         "codex" => brand("◎", 16, 163, 127),
         "opencode" => brand("◇", 245, 166, 35),
         "pi" => brand("π", 190, 120, 255),
+        "oh-my-pi" => brand("⌥", 255, 139, 61),
         "antigravity-cli" => brand("△", 139, 92, 246),
         "gemini-cli" => brand("✦", 66, 133, 244),
         "grok" => brand("✕", 210, 210, 210),
