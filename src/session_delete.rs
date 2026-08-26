@@ -116,18 +116,28 @@ pub(crate) fn execute(
     let mut moved_trash = None;
     let mut trash_dir = None;
     let mut native_deleted_irreversibly = false;
+    let opencode_already_missing = session.source == "opencode"
+        && crate::adapters::opencode::native_session_exists(&session.source_id)? == Some(false);
 
     match plan.mode {
         DeleteMode::Trash => {
             if let Some(command) = &plan.native_command {
-                let backup_dir =
-                    backup_before_native_command(session, &plan.native_roots, command)?;
-                if let Err(error) = run_native_delete_command(command) {
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    return Err(error);
+                if !opencode_already_missing {
+                    let backup_dir =
+                        backup_before_native_command(session, &plan.native_roots, command)?;
+                    if let Err(error) = run_native_delete_command(command) {
+                        let native_now_missing = session.source == "opencode"
+                            && crate::adapters::opencode::native_session_exists(
+                                &session.source_id,
+                            )? == Some(false);
+                        if !native_now_missing {
+                            let _ = fs::remove_dir_all(&backup_dir);
+                            return Err(error);
+                        }
+                    }
+                    native_deleted_irreversibly = true;
+                    trash_dir = Some(backup_dir);
                 }
-                native_deleted_irreversibly = true;
-                trash_dir = Some(backup_dir);
             } else {
                 let moved = move_to_trash(session, &plan.native_roots, None)?;
                 trash_dir = Some(moved.dir.clone());
@@ -136,7 +146,15 @@ pub(crate) fn execute(
         }
         DeleteMode::Permanent => {
             if let Some(command) = &plan.native_command {
-                run_native_delete_command(command)?;
+                if !opencode_already_missing && let Err(error) = run_native_delete_command(command)
+                {
+                    let native_now_missing = session.source == "opencode"
+                        && crate::adapters::opencode::native_session_exists(&session.source_id)?
+                            == Some(false);
+                    if !native_now_missing {
+                        return Err(error);
+                    }
+                }
             } else {
                 for root in &plan.native_roots {
                     remove_path(root).with_context(|| {
