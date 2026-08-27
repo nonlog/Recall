@@ -1,6 +1,35 @@
 # Changelog
 
 
+## [0.5.4](https://github.com/samzong/Recall/compare/v0.5.3...v0.5.4) (2026-08-27)
+
+
+### Features
+
+* **rx:** add max-permission launch defaults ([#175](https://github.com/samzong/Recall/issues/175))
+* **rx:** add shell completions ([#177](https://github.com/samzong/Recall/issues/177))
+* **mcp:** serve a read-only session index over stdio ([#178](https://github.com/samzong/Recall/issues/178))
+* **recall:** add wrapped usage stats card ([#179](https://github.com/samzong/Recall/issues/179))
+* **rx:** add 'none' provider to skip provider injection ([#180](https://github.com/samzong/Recall/issues/180))
+
+
+### Fixes
+
+* **rx:** include provider name on catalog fetch errors ([#169](https://github.com/samzong/Recall/issues/169))
+* **rx:** exit successfully on update help
+* **rx:** honor OpenCode long-form model flags
+* **rx:** reject non-object Pi models.json roots ([#171](https://github.com/samzong/Recall/issues/171))
+* **rx:** ignore option detectors after -- ([#172](https://github.com/samzong/Recall/issues/172))
+* **rx:** persist update checks and serialize state writes ([#173](https://github.com/samzong/Recall/issues/173))
+* **rx:** preserve non-UTF-8 arguments and executable paths ([#174](https://github.com/samzong/Recall/issues/174))
+* **mcp:** preserve existing host registration ([#182](https://github.com/samzong/Recall/issues/182))
+
+
+### Documentation
+
+* **rx:** refresh architecture diagram ([#176](https://github.com/samzong/Recall/issues/176))
+
+
 ## [0.5.3](https://github.com/samzong/Recall/compare/v0.5.2...v0.5.3) (2026-08-24)
 
 
