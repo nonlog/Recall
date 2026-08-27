@@ -11,6 +11,8 @@ pub(crate) mod extension;
 pub(crate) mod handoff;
 pub(crate) mod import;
 pub(crate) mod info;
+pub(crate) mod mcp;
+pub(crate) mod mcp_host;
 pub(crate) mod project_scope;
 pub(crate) mod query;
 pub(crate) mod repo_identity;
