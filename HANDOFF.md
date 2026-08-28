@@ -3,7 +3,7 @@
 Last updated: 2026-08-28
 Workspace: `D:\Workspace\Recall`
 Repository: `https://github.com/nonlog/Recall`
-Current baseline: `main` includes Codex title hotfix commit `d25cb32994f60bd4907032b13c6aa840d336bc0d`; next fork release `v0.5.3.8`
+Current baseline: `main` includes Codex title hotfix `v0.5.3.8`; canonical workspace is `D:\Workspace\Recall`
 
 ## Purpose of this fork
 
@@ -83,7 +83,17 @@ Validation before release:
 - Clean WSL/Linux `make check`: passed, including dependency audit, format, all-target workspace Clippy, and Linux workspace tests (core: 466 passed, 0 failed).
 - Live indexed-data validation restored native names such as `Oh-My-Posh`, `Agentdock 部署与配置`, `Scoop packages manage`, and `NileSoft Shell Config Help`; a truly unnamed exec thread shortened from its full instruction to `M1 CONTROLLER SUB-BATCH A`.
 
-Next: publish `v0.5.3.8`, update `www/recall`, upgrade the LOG Scoop installation, perform an installed-binary sync/TUI smoke test, then record the final release/install state here.
+Final release/install status:
+
+- Release `v0.5.3.8` is published from tag commit `7b72fe079068ffb0ef78e640383e8499a1edb179`.
+- Release workflow #11 completed successfully: `make check`, Windows x86_64, Linux x86_64, macOS x86_64, macOS aarch64, and the final release publication all passed.
+- Windows release asset: `recall-windows-x86_64.zip`, SHA256 `33cb8ec905a9e639f52ee1bff7cc01433e8e10982458e10f4fbfb71dddc1cb49`.
+- `nonlog/scoop-www` commit `f35920f5b1db0da749bdcb3c1c62651ffaad7560` updates `www/recall` to `0.5.3.8`; author and committer are `Codex <codex@openai.com>`.
+- LOG Scoop installation is `0.5.3.8`; `D:\Programs\Scoop\apps\recall\current` is a junction to `D:\Programs\Scoop\apps\recall\0.5.3.8`. Internal `recall --version` remains `recall 0.5.3`, as expected for fork patch releases.
+- Formal installed-binary title refresh used `D:\Programs\Scoop\apps\recall\current\recall.exe`. After installed `sync --source codex --project all`, the previously problematic rows remained `Oh-My-Posh`, `Agentdock 部署与配置`, `Scoop packages manage`, `NileSoft Shell Config Help`, and `M1 CONTROLLER SUB-BATCH A`; no real session deletion was performed.
+- Comparing Recall titles against the latest native names in Codex `session_index.jsonl` found zero native-title mismatches for names present in the indexed Recall set.
+- The installed sync continued beyond the metadata-refresh stage because later sync work was still active; after title verification, only that explicitly started sync process was stopped. No user TUI/background Recall process was killed.
+- `fix/codex-session-index-titles` was removed locally and remotely after the fast-forward merge. No Codex title hotfix work remains from this cycle.
 
 ## Important implementation rules
 
