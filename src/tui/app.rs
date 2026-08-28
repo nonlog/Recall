@@ -8,7 +8,7 @@ use ratatui::layout::{Position, Rect};
 use crate::adapters::ResumeCommand;
 use crate::config::AppConfig;
 use crate::db::search::{RepoFilter, SearchFilters, TimeRange};
-use crate::db::store::{ProjectDirectory, Store};
+use crate::db::store::{ProjectDirectory, SessionListSort, Store};
 use crate::handoff;
 use crate::project_scope::ProjectScope;
 use crate::session_action;
@@ -24,6 +24,7 @@ use crate::tui::layout::{
 };
 use crate::tui::search_state::{
     FilterFocus, PanelFocus, ProjectPickerRow, SearchMouseTarget, SortOrder, SourcePickerRow,
+    TopologyFilter,
 };
 use crate::tui::search_worker::{SearchPhase, SearchRequest, SearchResponse, SearchWorker};
 use crate::tui::share_state::{
@@ -156,11 +157,13 @@ pub(crate) struct App {
     pub(crate) all_sources: Vec<(String, String)>,
     pub(crate) config: AppConfig,
     pub(crate) source_filter_selection: Vec<String>,
+    pub(crate) topology_filter: TopologyFilter,
     pub(crate) time_filter: TimeRange,
     pub(crate) filter_focus: FilterFocus,
     pub(crate) filters_dirty: bool,
     pub(crate) draft_source_filter_selection: Vec<String>,
     pub(crate) draft_scope: ProjectScope,
+    pub(crate) draft_topology_filter: TopologyFilter,
     pub(crate) draft_time_filter: TimeRange,
     pub(crate) draft_sort_order: SortOrder,
     pub(crate) should_quit: bool,
@@ -254,11 +257,13 @@ impl App {
             all_sources,
             config,
             source_filter_selection: Vec::new(),
+            topology_filter: TopologyFilter::Primary,
             time_filter: TimeRange::All,
             filter_focus: FilterFocus::Source,
             filters_dirty: false,
             draft_source_filter_selection: Vec::new(),
             draft_scope: scope.clone(),
+            draft_topology_filter: TopologyFilter::Primary,
             draft_time_filter: TimeRange::All,
             draft_sort_order: SortOrder::Relevance,
             should_quit: false,
@@ -369,6 +374,14 @@ impl App {
         }
     }
 
+    pub(crate) fn topology_filter_label(&self) -> &'static str {
+        self.topology_filter.label()
+    }
+
+    pub(crate) fn draft_topology_filter_label(&self) -> &'static str {
+        self.draft_topology_filter.label()
+    }
+
     pub(crate) fn time_filter_label(&self) -> &'static str {
         Self::time_range_label(self.time_filter)
     }
@@ -433,11 +446,14 @@ impl App {
     pub(crate) fn load_recent(&mut self, store: &Store) {
         let source_ids = self.source_filter_ids();
         let recent = store
-            .list_recent_sessions_for_search_scope(
+            .list_indexed_sessions(
                 source_ids.as_deref(),
                 self.time_filter,
                 &self.scope,
-                200,
+                self.topology_filter.thread_role_filter(),
+                Some(200),
+                0,
+                SessionListSort::Updated,
             )
             .unwrap_or_default();
         self.results = recent
@@ -1858,7 +1874,7 @@ impl App {
             FilterFocus::Project => {
                 self.open_project_picker(store);
             }
-            FilterFocus::Time | FilterFocus::Sort => {}
+            FilterFocus::Topology | FilterFocus::Time | FilterFocus::Sort => {}
         }
     }
 
@@ -1867,6 +1883,7 @@ impl App {
         if self.filters_dirty {
             self.source_filter_selection = self.draft_source_filter_selection.clone();
             self.scope = self.draft_scope.clone();
+            self.topology_filter = self.draft_topology_filter;
             self.time_filter = self.draft_time_filter;
             self.sort_order = self.draft_sort_order;
             self.filters_dirty = false;
@@ -1881,10 +1898,27 @@ impl App {
 
     fn adjust_filter_value(&mut self, forward: bool) {
         match self.filter_focus {
+            FilterFocus::Topology => self.cycle_topology_filter(forward),
             FilterFocus::Time => self.cycle_time_filter(forward),
             FilterFocus::Sort => self.cycle_sort_order(),
             FilterFocus::Source | FilterFocus::Project => {}
         }
+    }
+
+    fn set_topology_filter(&mut self, topology_filter: TopologyFilter) {
+        if self.draft_topology_filter != topology_filter {
+            self.draft_topology_filter = topology_filter;
+            self.mark_filters_dirty();
+        }
+    }
+
+    fn cycle_topology_filter(&mut self, forward: bool) {
+        let next = if forward {
+            self.draft_topology_filter.next()
+        } else {
+            self.draft_topology_filter.previous()
+        };
+        self.set_topology_filter(next);
     }
 
     fn set_time_filter(&mut self, time_filter: TimeRange) {
@@ -1967,6 +2001,7 @@ impl App {
         self.filters_editing_project = false;
         self.draft_source_filter_selection = self.source_filter_selection.clone();
         self.draft_scope = self.scope.clone();
+        self.draft_topology_filter = self.topology_filter;
         self.draft_time_filter = self.time_filter;
         self.draft_sort_order = self.sort_order;
         self.filters_dirty = false;
@@ -2188,10 +2223,12 @@ impl App {
     fn clear_filters(&mut self) {
         let was_filtered = !self.draft_source_filter_selection.is_empty()
             || self.draft_scope != ProjectScope::Global
+            || self.draft_topology_filter != TopologyFilter::Primary
             || self.draft_time_filter != TimeRange::All
             || self.draft_sort_order != SortOrder::Relevance;
         self.draft_source_filter_selection.clear();
         self.draft_scope = ProjectScope::Global;
+        self.draft_topology_filter = TopologyFilter::Primary;
         self.draft_time_filter = TimeRange::All;
         self.draft_sort_order = SortOrder::Relevance;
         self.filter_focus = FilterFocus::Source;
@@ -2366,7 +2403,7 @@ impl App {
             sources: self.source_filter_ids(),
             time_range: self.time_filter,
             scope: self.scope.clone(),
-            thread_role: None,
+            thread_role: self.topology_filter.thread_role_filter(),
         }
     }
 
@@ -2488,10 +2525,12 @@ impl App {
     fn reset_search_defaults(&mut self) {
         self.source_filter_selection.clear();
         self.scope = crate::project_scope::auto_scope();
+        self.topology_filter = TopologyFilter::Primary;
         self.time_filter = self.config.sync_window.to_time_range();
         self.sort_order = SortOrder::Relevance;
         self.draft_source_filter_selection = self.source_filter_selection.clone();
         self.draft_scope = self.scope.clone();
+        self.draft_topology_filter = self.topology_filter;
         self.draft_time_filter = self.time_filter;
         self.draft_sort_order = self.sort_order;
         self.filters_dirty = false;
@@ -3041,6 +3080,7 @@ mod tests {
             ],
             config: AppConfig::default(),
             source_filter_selection: Vec::new(),
+            topology_filter: TopologyFilter::Primary,
             project_directories: Vec::new(),
             scope: ProjectScope::Global,
             time_filter: TimeRange::All,
@@ -3048,6 +3088,7 @@ mod tests {
             filters_dirty: false,
             draft_source_filter_selection: Vec::new(),
             draft_scope: ProjectScope::Global,
+            draft_topology_filter: TopologyFilter::Primary,
             draft_time_filter: TimeRange::All,
             draft_sort_order: SortOrder::Relevance,
             should_quit: false,
@@ -4121,6 +4162,32 @@ mod tests {
         assert!(matches!(app.mode, AppMode::Search));
         assert!(app.search_pending);
         assert_eq!(app.search_feedback.as_deref(), Some("Filters queued..."));
+    }
+
+    #[test]
+    fn filter_topology_defaults_to_primary_and_cycles_without_dropping_unknowns() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = app_with_sources();
+        app.mode = AppMode::Filters;
+        app.filter_focus = FilterFocus::Topology;
+
+        assert_eq!(app.topology_filter, TopologyFilter::Primary);
+        assert_eq!(
+            app.search_filters().thread_role,
+            Some(crate::db::search::ThreadRoleFilter::TopLevel)
+        );
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &store);
+        assert_eq!(app.topology_filter, TopologyFilter::Primary);
+        assert_eq!(app.draft_topology_filter, TopologyFilter::Subagents);
+
+        app.handle_filters_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &store);
+        assert_eq!(app.topology_filter, TopologyFilter::Subagents);
+        assert_eq!(
+            app.search_filters().thread_role,
+            Some(crate::db::search::ThreadRoleFilter::Subagent)
+        );
     }
 
     #[test]

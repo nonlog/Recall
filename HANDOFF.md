@@ -27,20 +27,34 @@ This fork is intentionally customized for the local multi-agent workflow rather 
 
 ## Current task
 
-Implement these two TUI changes:
+Implementation is complete locally and awaiting full validation for these two TUI changes:
 
 1. Codex topology filter / subagent visibility
-   - Default view should hide Codex subagent sessions and show normal primary sessions.
-   - Add a clear TUI mode/filter with `Primary`, `Subagents`, and `All` states.
-   - Preserve existing project/source/time filters and bulk selection behavior.
-   - Prefer topology metadata (`ThreadRole::Primary` / `ThreadRole::Subagent`) rather than title heuristics.
+   - Added TUI `Primary`, `Subagents`, and `All` topology modes.
+   - Default is `Primary`; internally it uses a `TopLevel` SQL predicate that excludes `subagent` while retaining `NULL`/unclassified roles so Claude/Pi/other sources do not disappear.
+   - `Subagents` shows only persisted `thread_role = 'subagent'`; `All` applies no role restriction.
+   - Added `R:[Primary|Subagents|All]` to the search header and a `Thread Role` row to the Filters popup.
+   - Empty-query recent results now use the same SQL topology filter as text/semantic search rather than the old reachable-subagent collapsing heuristic.
 
 2. Agent/harness brand icons
-   - Keep the existing brand colors.
-   - Add a compact brand icon/glyph for each supported source where a stable terminal/Nerd Font glyph exists.
-   - Provide a readable Unicode/lettermark fallback where no reliable glyph exists.
-   - Do not attempt inline SVG rendering in the Ratatui cell grid.
-   - The UI must remain usable when Nerd Font glyphs are unavailable.
+   - Existing brand colors are retained.
+   - Added stable Nerd Font glyphs where a dependable glyph exists (OpenCode/code, OMP/terminal, Antigravity/rocket, Gemini/Google, Copilot, Cline/terminal, Kimi/moon).
+   - Sources without a dependable cross-version brand glyph keep recognizable Unicode marks (Claude, Codex, Pi, Grok, Kiro, Cursor, DeepSeek).
+   - `RECALL_ICON_STYLE=plain` (also `unicode`, `ascii`, `off`, or `0`) forces fallback marks if the terminal font lacks Nerd Font glyphs.
+   - SVG is intentionally not used because Ratatui renders terminal cells rather than inline vector images.
+
+Validation status (2026-08-28):
+
+- `cargo fmt --all -- --check`: passed.
+- Targeted topology/source-brand/TUI/database tests: all passed.
+- `cargo clippy -p recall --lib --features bench -- -D warnings`: passed, confirming production Recall code is warning-free on Windows.
+- Windows all-target Clippy is blocked only by pre-existing platform-specific test warnings in `src/extension.rs` and `crates/rx/src/update.rs`.
+- Windows `cargo test --workspace`: 454 passed; the same 3 pre-existing Windows-only tests fail (Cursor temp directory inference, Kimi temp-file PermissionDenied, Pi unavailable-cwd fallback). No new tests fail.
+- Real debug TUI smoke test from `D:\Workspace\general`: header shows `R:[Primary]`; the visible list contains top-level CDX/Claude sessions and no Codex `↳` subagents; brand marks and colors render correctly in the terminal cell grid.
+- Real indexed-data count through the new SQL filter: 288 total sessions = 186 top-level + 102 subagents; all 102 currently classified subagents are Codex sessions.
+- Full Linux `make check` is still required in GitHub CI before merge.
+
+Next: commit feature changes, push PR, wait for CI, merge, publish the next fork patch release, update `www/recall`, and upgrade the log machine when no installed Recall process is holding the executable.
 
 ## Important implementation rules
 

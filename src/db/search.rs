@@ -46,6 +46,7 @@ pub(crate) enum ThreadRoleFilter {
     Primary,
     Subagent,
     Unknown,
+    TopLevel,
 }
 
 impl ThreadRoleFilter {
@@ -54,6 +55,9 @@ impl ThreadRoleFilter {
             ThreadRoleFilter::Primary => " AND s.thread_role = 'primary'",
             ThreadRoleFilter::Subagent => " AND s.thread_role = 'subagent'",
             ThreadRoleFilter::Unknown => " AND s.thread_role IS NULL",
+            ThreadRoleFilter::TopLevel => {
+                " AND (s.thread_role IS NULL OR s.thread_role <> 'subagent')"
+            }
         }
     }
 
@@ -62,6 +66,7 @@ impl ThreadRoleFilter {
             ThreadRoleFilter::Primary => "primary",
             ThreadRoleFilter::Subagent => "subagent",
             ThreadRoleFilter::Unknown => "unknown",
+            ThreadRoleFilter::TopLevel => "top-level",
         }
     }
 }

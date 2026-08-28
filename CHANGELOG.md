@@ -8,7 +8,8 @@
 - **tui:** add multi-select and one-confirmation bulk Trash/permanent deletion.
 - **adapters:** add Oh My Pi (`OMP`) as a distinct indexed source.
 - **titles:** prefer native Codex, Claude Code, Pi, and OMP session titles where available and provide deterministic fallbacks.
-- **tui:** add per-agent/harness brand colors.
+- **tui:** add per-agent/harness brand colors and terminal-safe Nerd Font/Unicode brand glyphs with fallback support.
+- **tui:** default to top-level sessions and add `Primary` / `Subagents` / `All` topology filtering so Codex worker threads no longer flood the main list.
 
 ### Fixes
 
@@ -21,11 +22,6 @@
 - Local canonical workspace moved from `D:\Workspace\general\Recall-tui` to `D:\Workspace\Recall`.
 - Added `HANDOFF.md` as the durable continuation document for long-running fork work.
 - Automatic upstream release syncing is disabled; upstream integration is now manual so fork-specific behavior cannot be overwritten silently.
-
-### In progress
-
-- Default-hide Codex subagents and add `Primary` / `Subagents` / `All` topology filtering in the TUI.
-- Add terminal-safe Agent/Harness brand glyphs with readable fallbacks while preserving brand colors.
 
 
 ## [0.5.3](https://github.com/samzong/Recall/compare/v0.5.2...v0.5.3) (2026-08-24)
