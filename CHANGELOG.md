@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [0.5.5](https://github.com/samzong/Recall/compare/v0.5.4...v0.5.5) (2026-08-28)
+
+
+### Features
+
+* **adapters:** open Copilot desktop sessions via ghapp ([#183](https://github.com/samzong/Recall/issues/183))
+* **rx:** add Kimi Code launch path ([#185](https://github.com/samzong/Recall/issues/185))
+* **rx:** launch harnesses from picker letter shortcuts ([#186](https://github.com/samzong/Recall/issues/186))
+
+
+### Fixes
+
+* **rx:** stabilize dsh installation ([#184](https://github.com/samzong/Recall/issues/184))
+
+
 ## [0.5.4](https://github.com/samzong/Recall/compare/v0.5.3...v0.5.4) (2026-08-27)
 
 
