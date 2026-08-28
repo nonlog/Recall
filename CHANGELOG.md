@@ -1,6 +1,19 @@
 # Changelog
 
 
+## [0.5.7](https://github.com/samzong/Recall/compare/v0.5.6...v0.5.7) (2026-08-28)
+
+
+### Fixes
+
+* **rx:** scope hosted harness env and harden dsh profile install ([#188](https://github.com/samzong/Recall/issues/188))
+
+
+### Documentation
+
+* **rx:** add launcher design contract and agent rules ([#189](https://github.com/samzong/Recall/issues/189))
+
+
 ## [0.5.6](https://github.com/samzong/Recall/compare/v0.5.5...v0.5.6) (2026-08-28)
 
 
