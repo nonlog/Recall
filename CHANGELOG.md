@@ -2,6 +2,10 @@
 
 ## Unreleased — nonlog fork
 
+No unreleased fork-specific changes currently.
+
+## v0.5.3.7 — nonlog fork (2026-08-28)
+
 ### Features
 
 - **session:** add native-aware session deletion with Trash, permanent, dry-run, and index-only modes.

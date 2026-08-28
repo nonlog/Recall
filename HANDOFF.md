@@ -3,7 +3,7 @@
 Last updated: 2026-08-28
 Workspace: `D:\Workspace\Recall`
 Repository: `https://github.com/nonlog/Recall`
-Current baseline: `main` at fork release `v0.5.3.6`
+Feature baseline: `main` merge commit `616fc008a050015ca39c7da7de35bcd74ef8da50`; current fork release `v0.5.3.7`
 
 ## Purpose of this fork
 
@@ -27,7 +27,7 @@ This fork is intentionally customized for the local multi-agent workflow rather 
 
 ## Current task
 
-Implementation is complete locally and awaiting full validation for these two TUI changes:
+Release closeout for these two TUI changes is complete in fork release `v0.5.3.7`:
 
 1. Codex topology filter / subagent visibility
    - Added TUI `Primary`, `Subagents`, and `All` topology modes.
@@ -52,9 +52,15 @@ Validation status (2026-08-28):
 - Windows `cargo test --workspace`: 454 passed; the same 3 pre-existing Windows-only tests fail (Cursor temp directory inference, Kimi temp-file PermissionDenied, Pi unavailable-cwd fallback). No new tests fail.
 - Real debug TUI smoke test from `D:\Workspace\general`: header shows `R:[Primary]`; the visible list contains top-level CDX/Claude sessions and no Codex `↳` subagents; brand marks and colors render correctly in the terminal cell grid.
 - Real indexed-data count through the new SQL filter: 288 total sessions = 186 top-level + 102 subagents; all 102 currently classified subagents are Codex sessions.
-- Full Linux `make check` is still required in GitHub CI before merge.
+- GitHub PR #9 CI completed successfully; the authoritative Linux `make check` passed before merge.
+- PR #9 merged to `main` as `616fc008a050015ca39c7da7de35bcd74ef8da50`.
+- Release `v0.5.3.7` is published. The release workflow completed successfully for `make check`, Windows x86_64, Linux x86_64, macOS x86_64, and macOS aarch64.
+- `www/recall` was updated to `0.5.3.7` in `nonlog/scoop-www` commit `9487f1760053a8adf716d000f70f5e5a0a633cd5`; the Windows ZIP SHA256 is `2857e4081e01ed28e976efacf592c295be8e173f2c00248079385effcf4e3c70`.
+- LOG Scoop installation is now `0.5.3.7`; `D:\Programs\Scoop\apps\recall\current` is a junction to `D:\Programs\Scoop\apps\recall\0.5.3.7`. The embedded Cargo version still reports `recall 0.5.3`, which is expected.
+- Formal smoke test used the installed release binary from `D:\Programs\Scoop\apps\recall\current\recall.exe`, not `target\debug`. With the current enabled TUI sources (`CC`, `CDX`), `Primary` showed 155 sessions and no visible `↳` workers, `Subagents` showed 104 Codex workers including `↳ librarian`, `↳ explorer`, and `↳ worker`, and `All` restored the mixed 259-session set (= 4 CC + 255 CDX). No real session deletion was performed.
+- Installed TUI source colors rendered correctly. `RECALL_ICON_STYLE=plain` launched and rendered the Unicode fallback marks correctly. The live TUI settings currently enable only CC/CDX, whose marks are Unicode by design; Nerd-specific source glyph mappings remain covered by the already-passing targeted renderer/source-brand tests.
 
-Next: commit feature changes, push PR, wait for CI, merge, publish the next fork patch release, update `www/recall`, and upgrade the log machine when no installed Recall process is holding the executable.
+Release closeout is complete. There is no remaining TUI topology/icon work from this cycle.
 
 ## Important implementation rules
 
@@ -74,7 +80,7 @@ Next: commit feature changes, push PR, wait for CI, merge, publish the next fork
 
 ## Release/install workflow
 
-Fork releases use tags such as `v0.5.3.6`; the internal Cargo version may remain at the upstream base version. Windows is distributed through the `www` Scoop bucket as `www/recall`.
+Fork releases use tags such as `v0.5.3.7`; the internal Cargo version may remain at the upstream base version. Windows is distributed through the `www` Scoop bucket as `www/recall`.
 
 Typical final validation and deployment sequence:
 
