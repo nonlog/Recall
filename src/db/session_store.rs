@@ -576,6 +576,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn list_recent_sessions_for_search_scope(
         &self,
         sources: Option<&[String]>,
@@ -613,6 +614,7 @@ impl Store {
         Ok(sessions)
     }
 
+    #[cfg(test)]
     fn retain_visible_subagents(&self, sessions: &mut Vec<Session>) -> Result<()> {
         if sessions.is_empty() {
             return Ok(());
@@ -1181,6 +1183,10 @@ mod topology_tests {
         assert_eq!(ids(ThreadRoleFilter::Primary), vec!["primary".to_string()]);
         assert_eq!(ids(ThreadRoleFilter::Subagent), vec!["subagent".to_string()]);
         assert_eq!(ids(ThreadRoleFilter::Unknown), vec!["unknown".to_string()]);
+        assert_eq!(
+            ids(ThreadRoleFilter::TopLevel),
+            vec!["primary".to_string(), "unknown".to_string()]
+        );
     }
 
     #[test]
