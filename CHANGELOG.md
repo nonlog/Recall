@@ -4,6 +4,13 @@
 
 No unreleased fork-specific changes currently.
 
+## v0.5.3.8 — nonlog fork (2026-08-28)
+
+### Fixes
+
+- **codex:** prefer native thread names from Codex's append-only `session_index.jsonl` when `state_5.sqlite` has no `threads.name`; the latest rename wins and unchanged indexed sessions refresh automatically.
+- **codex:** when no native thread name exists, reduce state-derived first-prompt fallbacks to a concise first-line/sentence headline instead of displaying the full instruction block.
+
 ## v0.5.3.7 — nonlog fork (2026-08-28)
 
 ### Features

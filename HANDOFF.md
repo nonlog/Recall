@@ -3,7 +3,7 @@
 Last updated: 2026-08-28
 Workspace: `D:\Workspace\Recall`
 Repository: `https://github.com/nonlog/Recall`
-Feature baseline: `main` merge commit `616fc008a050015ca39c7da7de35bcd74ef8da50`; current fork release `v0.5.3.7`
+Current baseline: `main` includes Codex title hotfix commit `d25cb32994f60bd4907032b13c6aa840d336bc0d`; next fork release `v0.5.3.8`
 
 ## Purpose of this fork
 
@@ -61,6 +61,29 @@ Validation status (2026-08-28):
 - Installed TUI source colors rendered correctly. `RECALL_ICON_STYLE=plain` launched and rendered the Unicode fallback marks correctly. The live TUI settings currently enable only CC/CDX, whose marks are Unicode by design; Nerd-specific source glyph mappings remain covered by the already-passing targeted renderer/source-brand tests.
 
 Release closeout is complete. There is no remaining TUI topology/icon work from this cycle.
+
+## Codex native-title hotfix (v0.5.3.8)
+
+A follow-up real-world TUI check found that some Codex rows could still display the full first prompt even though Codex itself exposed a better thread name.
+
+Root cause and fix:
+
+- `state_5.sqlite.threads.name` is not authoritative for every Codex thread; for some CLI/app-server sessions it remains `NULL` while Codex persists the native name in the append-only `~/.codex/session_index.jsonl`.
+- Recall now reads both metadata sources read-only and lets the latest `session_index.jsonl` rename win.
+- `METADATA_PARSER_VERSION` was advanced so unchanged rollout files refresh title metadata without requiring an mtime change.
+- Threads that genuinely have no native name now use a concise first-line/sentence headline from the state prompt rather than the full instruction block.
+- PR #10 contains the fix; its Codex-authored source commit is `d25cb32994f60bd4907032b13c6aa840d336bc0d`. GitHub CI passed, and `main` was fast-forwarded to the same commit so no non-Codex merge commit was introduced.
+
+Validation before release:
+
+- New and existing Codex title/refresh tests: passed.
+- Windows `cargo fmt --all -- --check`: passed.
+- Windows `cargo clippy -p recall --lib --features bench -- -D warnings`: passed.
+- Windows `cargo test --workspace`: 457 passed; only the same 3 pre-existing Windows-only failures remain (Cursor temp directory inference, Kimi temp-file PermissionDenied, Pi unavailable-cwd fallback).
+- Clean WSL/Linux `make check`: passed, including dependency audit, format, all-target workspace Clippy, and Linux workspace tests (core: 466 passed, 0 failed).
+- Live indexed-data validation restored native names such as `Oh-My-Posh`, `Agentdock 部署与配置`, `Scoop packages manage`, and `NileSoft Shell Config Help`; a truly unnamed exec thread shortened from its full instruction to `M1 CONTROLLER SUB-BATCH A`.
+
+Next: publish `v0.5.3.8`, update `www/recall`, upgrade the LOG Scoop installation, perform an installed-binary sync/TUI smoke test, then record the final release/install state here.
 
 ## Important implementation rules
 
