@@ -16,6 +16,10 @@ at the root, the independent `rx` launcher under `crates/rx`, plus official
 extension crates under `extensions/`. Nothing is
 published to crates.io — these are application binaries, not library crates.
 
+## Handoff discipline
+
+This fork keeps a tracked `HANDOFF.md` because implementation sessions can be long-running. Update it after major implementation/validation milestones and before ending a long context window so another agent can continue without reconstructing state from chat history. Keep it factual and current; do not store secrets in it.
+
 ## Commands
 
 ```bash

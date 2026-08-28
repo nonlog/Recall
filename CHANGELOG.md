@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — nonlog fork
+
+### Features
+
+- **session:** add native-aware session deletion with Trash, permanent, dry-run, and index-only modes.
+- **tui:** add multi-select and one-confirmation bulk Trash/permanent deletion.
+- **adapters:** add Oh My Pi (`OMP`) as a distinct indexed source.
+- **titles:** prefer native Codex, Claude Code, Pi, and OMP session titles where available and provide deterministic fallbacks.
+- **tui:** add per-agent/harness brand colors.
+
+### Fixes
+
+- **delete:** verify native deletion instead of treating Recall index removal as success.
+- **opencode:** run maintenance commands with `--pure`, validate Trash exports, and prune stale Recall rows missing from the native OpenCode database.
+- **codex:** use the native Codex deletion path and restore native thread titles/subagent topology metadata.
+
+### Development
+
+- Local canonical workspace moved from `D:\Workspace\general\Recall-tui` to `D:\Workspace\Recall`.
+- Added `HANDOFF.md` as the durable continuation document for long-running fork work.
+- Automatic upstream release syncing is disabled; upstream integration is now manual so fork-specific behavior cannot be overwritten silently.
+
+### In progress
+
+- Default-hide Codex subagents and add `Primary` / `Subagents` / `All` topology filtering in the TUI.
+- Add terminal-safe Agent/Harness brand glyphs with readable fallbacks while preserving brand colors.
+
 
 ## [0.5.3](https://github.com/samzong/Recall/compare/v0.5.2...v0.5.3) (2026-08-24)
 
