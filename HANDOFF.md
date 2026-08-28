@@ -94,6 +94,7 @@ Final release/install status:
 - Comparing Recall titles against the latest native names in Codex `session_index.jsonl` found zero native-title mismatches for names present in the indexed Recall set.
 - The installed sync continued beyond the metadata-refresh stage because later sync work was still active; after title verification, only that explicitly started sync process was stopped. No user TUI/background Recall process was killed.
 - `fix/codex-session-index-titles` was removed locally and remotely after the fast-forward merge. No Codex title hotfix work remains from this cycle.
+- The non-gating PR `CodSpeed` job built and ran every benchmark successfully, but result upload failed with `401 Unauthorized`. This fork workflow already grants `id-token: write` and uses CodSpeed OIDC; the remaining issue is external CodSpeed repository authorization/integration for `nonlog/Recall`, not a Recall benchmark/code/release failure. Release CI does not depend on CodSpeed and `v0.5.3.8` was published successfully.
 
 ## Important implementation rules
 
