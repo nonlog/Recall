@@ -1,6 +1,39 @@
 # Changelog
 
 
+## [0.5.8](https://github.com/samzong/Recall/compare/v0.5.7...v0.5.8) (2026-09-01)
+
+
+### Features
+
+* **mcp:** add file_history tool with per-file patch events ([#192](https://github.com/samzong/Recall/issues/192))
+* **adapters:** index Cursor Agent CLI store.db sessions ([#195](https://github.com/samzong/Recall/issues/195))
+* **adapters:** index Qwen Code project chat JSONL sessions ([#196](https://github.com/samzong/Recall/issues/196))
+* **adapters:** index Kilo Code CLI kilo.db sessions ([#197](https://github.com/samzong/Recall/issues/197))
+* **adapters:** index Crush project crush.db sessions ([#198](https://github.com/samzong/Recall/issues/198))
+* **adapters:** index MiMo Code mimocode.db sessions ([#199](https://github.com/samzong/Recall/issues/199))
+* **adapters:** index ZCode cli/db.sqlite sessions ([#200](https://github.com/samzong/Recall/issues/200))
+* **adapters:** index OMP session JSONL ([#201](https://github.com/samzong/Recall/issues/201))
+* **adapters:** scan Cline across editor hosts and add Roo ([#203](https://github.com/samzong/Recall/issues/203))
+* **adapters:** index Kiro CLI v2/v3 session files ([#204](https://github.com/samzong/Recall/issues/204))
+* **adapters:** index VS Code Chat sessions and CLI usage ([#205](https://github.com/samzong/Recall/issues/205))
+* **adapters:** index Goose sessions.db ([#206](https://github.com/samzong/Recall/issues/206))
+* **adapters:** index Cline CLI sessions on the cline source ([#207](https://github.com/samzong/Recall/issues/207))
+
+
+### Fixes
+
+* **rx:** support dsh reasoning effort controls ([#191](https://github.com/samzong/Recall/issues/191))
+
+
+### Documentation
+
+* **readme:** refresh project visuals ([#193](https://github.com/samzong/Recall/issues/193))
+* **rx:** add hosting guide for embedders ([#194](https://github.com/samzong/Recall/issues/194))
+* **adapters:** add ZCode to the support table ([#202](https://github.com/samzong/Recall/issues/202))
+* **adapters:** add Goose to the architecture diagram ([#208](https://github.com/samzong/Recall/issues/208))
+
+
 ## [0.5.7](https://github.com/samzong/Recall/compare/v0.5.6...v0.5.7) (2026-08-28)
 
 
