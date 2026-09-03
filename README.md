@@ -10,6 +10,10 @@
 
 Jump between Claude Code, Codex, and whatever comes next; Recall pulls those scattered local sessions into one searchable index, tracks usage when token metadata is available, and drops you back into the original CLI.
 
+## Architecture
+
+![Recall architecture](docs/recall-architecture.svg)
+
 ## Install
 
 ```bash
@@ -42,9 +46,9 @@ recall session delete --id <session-id> --permanent # no Recall trash backup
 recall session delete --id <session-id> --index-only # leave source-agent data untouched
 ```
 
-Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, Oh My Pi, Antigravity, Gemini, Grok, Copilot, Cline, DeepSeek Harness, and Kimi Code use their indexed per-session file or directory. Recall verifies known native paths are gone before it removes the index entry. Cursor and Kiro currently require an explicit `--index-only`; normal Delete/Purge fails instead of pretending the native session was deleted.
+Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, OMP, Antigravity, Gemini, Grok, Copilot CLI, Cline, DeepSeek Harness, and Kimi Code use validated per-session files or directories. Shared-database sources without a stable native delete API require `--index-only`; Recall deliberately does not guess writes into their databases.
 
-The default trash is stored under Recall's data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
+On Windows, the default trash is the `trash` directory beside the installed `recall.exe`; the Scoop package persists that directory across upgrades. `RECALL_TRASH_DIR` can override the location. On other platforms Recall falls back to its data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
 
 With Skill use **Recall** is the best way.
 
@@ -62,16 +66,24 @@ One index across every AI coding CLI. Sync once, search everywhere, resume right
 | OpenCode        |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Codex           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Pi              |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
-| Oh My Pi        |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| OMP             |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Antigravity |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
 | Gemini          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kiro            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
-| Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |      |
+| Copilot     |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Copilot Chat |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |      |
 | Cursor          |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
 | Cline           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
+| Roo             |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |       |
 | DeepSeek Harness |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   —    |   ✅   |
-| Grok            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |        |
+| Grok            |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 | Kimi Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Qwen Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Kilo Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Crush           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| MiMo Code       |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| ZCode           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
+| Goose           |     ✅    |     ✅     |        ✅        |        ✅       |        ✅       |   ✅   |   ✅   |
 
 ## Acknowledgements
 

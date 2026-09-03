@@ -140,9 +140,10 @@ const TITLE_TRUNCATE_TAIL: usize = 77;
 pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
     let chosen = user_contents
         .iter()
-        .map(|content| meaningful_title_content(content))
-        .find(|content| !is_noise_first_message(content))
-        .unwrap_or_default();
+        .copied()
+        .find(|c| !is_noise_first_message(c))
+        .or_else(|| user_contents.first().copied())
+        .unwrap_or("");
 
     let trimmed = chosen.trim();
     if trimmed.is_empty() {
@@ -156,20 +157,6 @@ pub(crate) fn title_from_user_messages(user_contents: &[&str]) -> String {
     }
 }
 
-fn meaningful_title_content(content: &str) -> String {
-    // VS Code/Codex integrations wrap the actual request in a large IDE-state
-    // envelope. The native Codex `threads.title` often stores that entire
-    // payload verbatim, so presenting its first 80 chars looks like a title but
-    // is actually just machinery. Prefer the explicit user request section.
-    if let Some((_, request)) = content.rsplit_once("## My request:") {
-        let request = request.trim();
-        if !request.is_empty() {
-            return request.to_string();
-        }
-    }
-    content.to_string()
-}
-
 /// Openers written by the agent harness rather than by the user: slash-command
 /// envelopes, skill preambles, resumed-session banners, tool errors, and
 /// interruption markers.
@@ -181,9 +168,6 @@ const NOISE_FIRST_MESSAGE_PREFIXES: &[&str] = &[
     "<command-name>",
     "<command-message>",
     "<local-command-caveat>",
-    "<local-command-stdout>",
-    "<local-command-stderr>",
-    "<ide_opened_file>",
     "<system-reminder>",
     "<tool_use_error>",
     "[Request interrupted",
@@ -307,15 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn title_skips_local_command_stdout_noise() {
-        let msgs = [
-            "<local-command-stdout>Set model to Opus</local-command-stdout>",
-            "implement the actual feature",
-        ];
-        assert_eq!(title_from_user_messages(&msgs), "implement the actual feature");
-    }
-
-    #[test]
     fn title_skips_local_command_caveat_noise() {
         let msgs = [
             "<local-command-caveat>Caveat: ignore this wrapper</local-command-caveat>",
@@ -344,12 +319,12 @@ mod tests {
     }
 
     #[test]
-    fn title_returns_untitled_when_all_messages_are_noise() {
+    fn title_falls_back_to_first_when_all_are_noise() {
         let msgs = [
             "<command-message>ship</command-message>",
-            "<local-command-stdout>done</local-command-stdout>",
+            "<command-message>review</command-message>",
         ];
-        assert_eq!(title_from_user_messages(&msgs), "Untitled");
+        assert_eq!(title_from_user_messages(&msgs), "<command-message>ship</command-message>");
     }
 
     #[test]
@@ -363,11 +338,5 @@ mod tests {
     fn title_detects_noise_with_leading_whitespace() {
         let msgs = ["   <command-message>ship</command-message>", "real content"];
         assert_eq!(title_from_user_messages(&msgs), "real content");
-    }
-
-    #[test]
-    fn title_extracts_codex_ide_request_instead_of_scaffolding() {
-        let message = "# Context from my IDE setup:\n\n## Active file: src/main.cpp\n\n## Open tabs:\n- src/main.cpp\n\n## My request:\n指导我一步一步驱动这个打印机";
-        assert_eq!(title_from_user_messages(&[message]), "指导我一步一步驱动这个打印机");
     }
 }

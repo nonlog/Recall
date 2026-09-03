@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,16 +9,31 @@ use serde_yaml::{Mapping, Value};
 use crate::catalog;
 use crate::config::Paths;
 use crate::launch::{EnvLookup, openai_base};
-use crate::provider::{Provider, Setup};
+use crate::provider::{ModelProtocol, Provider, ReasoningControl, Setup};
 
 pub(crate) const PROFILE: &str = "dsh-tui";
 pub(crate) const CLI_PACKAGE: &str = "@deepseek-ai/dsh";
 pub(crate) const PLUGIN_PACKAGE: &str = "@deepseek-harness-tui/dsh-tui";
+pub(crate) const PLUGIN_SPEC: &str = "@deepseek-harness-tui/dsh-tui@latest";
 const OFFICIAL_DEEPSEEK: &str = "https://api.deepseek.com";
 const OFFICIAL_DEEPSEEK_ROUTE: &str = "deepseek-official";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DshModel {
+    id: String,
+    reasoning: Option<ReasoningControl>,
+}
+
+struct RouteContext<'a> {
+    provider_id: &'a str,
+    provider: &'a Provider,
+    base_url: &'a str,
+    protocol: ModelProtocol,
+    env: &'a EnvLookup,
+}
+
 pub(crate) fn npm_install_cmd() -> String {
-    format!("npm install -g {CLI_PACKAGE} {PLUGIN_PACKAGE}")
+    format!("npm install -g --legacy-peer-deps {CLI_PACKAGE} {PLUGIN_PACKAGE}")
 }
 
 pub(crate) fn install_hint() -> String {
@@ -25,7 +41,7 @@ pub(crate) fn install_hint() -> String {
 }
 
 pub(crate) fn profile_hint() -> String {
-    format!("dsh plugin --profile {PROFILE} add {PLUGIN_PACKAGE}")
+    format!("dsh plugin --profile {PROFILE} add -w --ignore-scripts {PLUGIN_SPEC}")
 }
 
 pub(crate) fn home(env: &EnvLookup) -> Option<PathBuf> {
@@ -44,28 +60,43 @@ pub(crate) fn profile_ready(env: &EnvLookup) -> bool {
     let Some(root) = home(env) else {
         return false;
     };
-    let path = root.join("profiles").join(PROFILE).join("package.json");
-    fs::read_to_string(path).is_ok_and(|body| body.contains(PLUGIN_PACKAGE))
+    let profile = root.join("profiles").join(PROFILE);
+    let Ok(body) = fs::read_to_string(profile.join("package.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    let dependency = manifest["dependencies"].get(PLUGIN_PACKAGE).is_some();
+    let bundle = manifest["dsh"]["profile"]["bundles"]
+        .as_array()
+        .is_some_and(|bundles| bundles.iter().any(|bundle| bundle == PLUGIN_PACKAGE));
+    let package = profile.join("node_modules").join(PLUGIN_PACKAGE).join("package.json");
+    let installed = fs::read_to_string(package)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .is_some_and(|manifest| manifest["name"] == PLUGIN_PACKAGE);
+    dependency && bundle && installed
 }
 
 pub(crate) fn official_deepseek(provider_id: &str) -> bool {
     provider_id == "deepseek"
 }
 
-pub(crate) fn args(passthrough: &[String], patch: Option<&Path>) -> Vec<String> {
+pub(crate) fn args(passthrough: &[OsString], patch: Option<&Path>) -> Vec<OsString> {
     if passthrough.first().is_some_and(|arg| arg == "plugin") {
         return passthrough.to_vec();
     }
     let mut args = Vec::new();
     if passthrough.first().is_some_and(|arg| arg == "web") {
-        args.push("web".to_string());
+        args.push(OsString::from("web"));
         push_patch(&mut args, patch);
         args.extend(passthrough.iter().skip(1).cloned());
         return args;
     }
     if !has_profile(passthrough) {
-        args.push("--profile".to_string());
-        args.push(PROFILE.to_string());
+        args.push(OsString::from("--profile"));
+        args.push(OsString::from(PROFILE));
     }
     push_patch(&mut args, patch);
     args.extend(passthrough.iter().cloned());
@@ -90,38 +121,37 @@ pub(crate) fn prepare(
     env: &EnvLookup,
 ) -> Result<PathBuf> {
     let model = model.filter(|value| !value.is_empty());
+    let protocol = crate::provider::dsh_protocol(provider_id, base_url);
+    let context = RouteContext { provider_id, provider, base_url, protocol, env };
     let models = if official_deepseek(provider_id) {
         Vec::new()
     } else {
-        load_models(provider_id, provider, base_url, key, model, paths, env)?
+        load_models(&context, key, model, paths)?
     };
     let dir = paths.dir.join("dsh");
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let settings_path = dir.join("settings.yaml");
-    write_settings_overlay(&settings_path, provider_id, provider, base_url, model, &models, env)?;
+    write_settings_overlay(&settings_path, &context, model, &models)?;
     let patch_path = dir.join("launch.cordis.yml");
     write_launch_patch(&patch_path, &settings_path, official_deepseek(provider_id))?;
     Ok(patch_path)
 }
 
 fn load_models(
-    provider_id: &str,
-    provider: &Provider,
-    base_url: &str,
+    context: &RouteContext<'_>,
     key: &str,
     model: Option<&str>,
     paths: &Paths,
-    env: &EnvLookup,
-) -> Result<Vec<String>> {
-    let allow_fetch = env.is_real() || provider.setup == Setup::Generated;
+) -> Result<Vec<DshModel>> {
+    let allow_fetch = context.env.is_real() || context.provider.setup == Setup::Generated;
     let mut models = Vec::new();
-    match catalog::load_pi_models(paths, provider_id, base_url, key, allow_fetch) {
+    match catalog::load_pi_models(paths, context.provider_id, context.base_url, key, allow_fetch) {
         Ok(values) => {
             for value in values {
                 push_model_id(&mut models, &value);
             }
         }
-        Err(error) if provider.setup != Setup::Generated => {
+        Err(error) if context.provider.setup != Setup::Generated => {
             eprintln!("[rx] model catalog skipped: {error:#}");
         }
         Err(error) => return Err(error),
@@ -131,10 +161,24 @@ fn load_models(
     }
     if models.is_empty() {
         bail!(
-            "dsh could not load models for '{provider_id}'; run: rx providers models update {provider_id}"
+            "dsh could not load models for '{}'; run: rx providers models update {}",
+            context.provider_id,
+            context.provider_id
         );
     }
-    Ok(models)
+    Ok(models
+        .into_iter()
+        .map(|id| DshModel {
+            reasoning: crate::provider::reasoning_control(
+                context.provider_id,
+                context.base_url,
+                &id,
+                context.protocol,
+            )
+            .cloned(),
+            id,
+        })
+        .collect())
 }
 
 fn push_model_id(models: &mut Vec<String>, value: &serde_json::Value) {
@@ -149,17 +193,19 @@ fn push_model_id(models: &mut Vec<String>, value: &serde_json::Value) {
 
 fn write_settings_overlay(
     path: &Path,
-    provider_id: &str,
-    provider: &Provider,
-    base_url: &str,
+    context: &RouteContext<'_>,
     model: Option<&str>,
-    models: &[String],
-    env: &EnvLookup,
+    models: &[DshModel],
 ) -> Result<()> {
-    let mut document = load_user_settings(env)?;
+    let mut document = load_user_settings(context.env)?;
     let root = as_mapping(&mut document)?;
-    root.insert("llm-pi-ai".into(), llm_pi_ai_section(provider_id, provider, base_url, models));
-    root.insert("agent-default-model".into(), default_model_section(provider_id, model));
+    root.insert("llm-pi-ai".into(), llm_pi_ai_section(context, models));
+    root.insert("agent-default-model".into(), default_model_section(context.provider_id, model));
+    if crate::launch::yolo_enabled(context.env) {
+        let mut permission = Mapping::new();
+        permission.insert("defaultPreset".into(), Value::String("danger-full-access".into()));
+        root.insert("permission".into(), Value::Mapping(permission));
+    }
     write_yaml_atomic(path, &document)
 }
 
@@ -178,32 +224,47 @@ fn load_user_settings(env: &EnvLookup) -> Result<Value> {
     }
 }
 
-fn llm_pi_ai_section(
-    provider_id: &str,
-    provider: &Provider,
-    base_url: &str,
-    models: &[String],
-) -> Value {
+fn llm_pi_ai_section(context: &RouteContext<'_>, models: &[DshModel]) -> Value {
     let mut providers = Mapping::new();
-    if !official_deepseek(provider_id) && !models.is_empty() {
+    if !official_deepseek(context.provider_id) && !models.is_empty() {
         let mut route = Mapping::new();
-        route.insert("apiKeyEnv".into(), Value::String(provider.env.clone()));
-        route.insert("api".into(), Value::String("openai-completions".into()));
-        route.insert("baseURL".into(), Value::String(openai_base(base_url)));
+        route.insert("apiKeyEnv".into(), Value::String(context.provider.env.clone()));
+        route.insert("api".into(), Value::String(context.protocol.as_str().to_string()));
+        route.insert("baseURL".into(), Value::String(openai_base(context.base_url)));
         let entries = models
             .iter()
-            .map(|id| {
+            .map(|model| {
                 let mut entry = Mapping::new();
-                entry.insert("id".into(), Value::String(id.clone()));
+                entry.insert("id".into(), Value::String(model.id.clone()));
+                if let Some(reasoning) = &model.reasoning {
+                    entry.insert("reasoningEfforts".into(), reasoning_efforts(reasoning));
+                }
                 Value::Mapping(entry)
             })
             .collect();
         route.insert("models".into(), Value::Sequence(entries));
-        providers.insert(Value::String(provider_id.to_string()), Value::Mapping(route));
+        providers.insert(Value::String(context.provider_id.to_string()), Value::Mapping(route));
     }
     let mut section = Mapping::new();
     section.insert("providers".into(), Value::Mapping(providers));
     Value::Mapping(section)
+}
+
+fn reasoning_efforts(control: &ReasoningControl) -> Value {
+    match control {
+        ReasoningControl::Fixed => Value::Bool(false),
+        ReasoningControl::Effort { levels } => Value::Mapping(
+            levels
+                .iter()
+                .map(|(level, wire)| {
+                    (
+                        Value::String(level.as_str().to_string()),
+                        wire.as_ref().map_or(Value::Null, |wire| Value::String(wire.clone())),
+                    )
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn default_model_section(provider_id: &str, model: Option<&str>) -> Value {
@@ -256,21 +317,21 @@ fn write_bytes_atomic(path: &Path, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn push_patch(args: &mut Vec<String>, patch: Option<&Path>) {
+fn push_patch(args: &mut Vec<OsString>, patch: Option<&Path>) {
     if let Some(path) = patch {
-        args.push("--patch".to_string());
-        args.push(path.display().to_string());
+        args.push(OsString::from("--patch"));
+        args.push(path.as_os_str().to_os_string());
     }
 }
 
-fn has_profile(args: &[String]) -> bool {
+fn has_profile(args: &[OsString]) -> bool {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" || arg == "web" || arg == "plugin" {
             return false;
         }
-        if arg == "--profile" || arg.starts_with("--profile=") {
+        if arg == "--profile" || crate::args::os_prefix(arg, "--profile=") {
             return true;
         }
         if arg == "--patch" {
@@ -313,29 +374,33 @@ mod tests {
     fn install_hint_uses_official_npm_then_profile() {
         assert_eq!(
             install_hint(),
-            format!("npm install -g {CLI_PACKAGE} {PLUGIN_PACKAGE}\n  {}", profile_hint())
+            format!(
+                "npm install -g --legacy-peer-deps {CLI_PACKAGE} {PLUGIN_PACKAGE}\n  {}",
+                profile_hint()
+            )
         );
+    }
+
+    fn os(argv: &[&str]) -> Vec<OsString> {
+        argv.iter().map(|arg| OsString::from(*arg)).collect()
     }
 
     #[test]
     fn default_args_boot_tui_profile() {
-        assert_eq!(args(&[], None), vec!["--profile", PROFILE]);
-        assert_eq!(args(&["--resume".to_string()], None), vec!["--profile", PROFILE, "--resume"]);
+        assert_eq!(args(&[], None), os(&["--profile", PROFILE]));
+        assert_eq!(args(&os(&["--resume"]), None), os(&["--profile", PROFILE, "--resume"]));
     }
 
     #[test]
     fn keeps_explicit_profile_and_web() {
         assert_eq!(
-            args(&["--profile".to_string(), "headless".to_string(), "job".to_string()], None),
-            vec!["--profile", "headless", "job"]
+            args(&os(&["--profile", "headless", "job"]), None),
+            os(&["--profile", "headless", "job"])
         );
+        assert_eq!(args(&os(&["web", "--port", "8080"]), None), os(&["web", "--port", "8080"]));
         assert_eq!(
-            args(&["web".to_string(), "--port".to_string(), "8080".to_string()], None),
-            vec!["web", "--port", "8080"]
-        );
-        assert_eq!(
-            args(&["plugin".to_string(), "--profile".to_string(), PROFILE.to_string()], None),
-            vec!["plugin", "--profile", PROFILE]
+            args(&os(&["plugin", "--profile", PROFILE]), None),
+            os(&["plugin", "--profile", PROFILE])
         );
     }
 
@@ -343,12 +408,97 @@ mod tests {
     fn patch_follows_web_subcommand() {
         let patch = PathBuf::from("/tmp/rx.cordis.yml");
         assert_eq!(
-            args(&["web".to_string()], Some(&patch)),
-            vec!["web", "--patch", "/tmp/rx.cordis.yml"]
+            args(&os(&["web"]), Some(&patch)),
+            os(&["web", "--patch", "/tmp/rx.cordis.yml"])
         );
         assert_eq!(
             args(&[], Some(&patch)),
-            vec!["--profile", PROFILE, "--patch", "/tmp/rx.cordis.yml"]
+            os(&["--profile", PROFILE, "--patch", "/tmp/rx.cordis.yml"])
+        );
+    }
+
+    #[test]
+    fn profile_readiness_requires_activated_installed_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profiles").join(PROFILE);
+        let package = profile.join("node_modules").join(PLUGIN_PACKAGE);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), format!(r#"{{"name":"{PLUGIN_PACKAGE}"}}"#))
+            .unwrap();
+        fs::write(
+            profile.join("package.json"),
+            format!(
+                r#"{{"dependencies":{{"{PLUGIN_PACKAGE}":"^0.9.3"}},"dsh":{{"profile":{{"bundles":["@deepseek-ai/dsh-base"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let env = EnvLookup::isolated(std::collections::HashMap::from([(
+            "DSH_HOME".to_string(),
+            root.path().display().to_string(),
+        )]));
+        assert!(!profile_ready(&env));
+        fs::write(
+            profile.join("package.json"),
+            format!(
+                r#"{{"dependencies":{{"{PLUGIN_PACKAGE}":"^0.9.3"}},"dsh":{{"profile":{{"bundles":["@deepseek-ai/dsh-base","{PLUGIN_PACKAGE}"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(profile_ready(&env));
+    }
+
+    #[test]
+    fn tokener_reasoning_capabilities_project_to_dsh_models() {
+        let provider = crate::provider::find("tokener").unwrap();
+        let protocol = crate::provider::dsh_protocol("tokener", &provider.endpoint);
+        let env = EnvLookup::isolated(std::collections::HashMap::new());
+        let context = RouteContext {
+            provider_id: "tokener",
+            provider,
+            base_url: &provider.endpoint,
+            protocol,
+            env: &env,
+        };
+        assert_eq!(protocol, ModelProtocol::OpenAiResponses);
+        let models = ["gpt-5.6-sol", "glm-5.2", "kimi-k3"]
+            .into_iter()
+            .map(|id| DshModel {
+                id: id.to_string(),
+                reasoning: crate::provider::reasoning_control(
+                    "tokener",
+                    &provider.endpoint,
+                    id,
+                    protocol,
+                )
+                .cloned(),
+            })
+            .collect::<Vec<_>>();
+        let section = llm_pi_ai_section(&context, &models);
+        assert_eq!(section["providers"]["tokener"]["api"], "openai-responses");
+        let entries = section["providers"]["tokener"]["models"].as_sequence().unwrap();
+        assert_eq!(entries[0]["reasoningEfforts"]["off"], "none");
+        assert_eq!(entries[0]["reasoningEfforts"]["low"], "low");
+        assert_eq!(entries[0]["reasoningEfforts"]["medium"], "medium");
+        assert_eq!(entries[0]["reasoningEfforts"]["high"], "high");
+        assert_eq!(entries[0]["reasoningEfforts"]["xhigh"], "xhigh");
+        assert_eq!(entries[0]["reasoningEfforts"]["max"], "max");
+        assert_eq!(entries[1]["reasoningEfforts"]["off"], "none");
+        assert_eq!(entries[1]["reasoningEfforts"]["low"], "low");
+        assert_eq!(entries[1]["reasoningEfforts"]["medium"], "medium");
+        assert!(entries[1]["reasoningEfforts"].get("high").is_none());
+        assert!(entries[2].get("reasoningEfforts").is_none());
+        assert_eq!(
+            crate::provider::dsh_protocol("tokener", "https://proxy.example.com/v1"),
+            ModelProtocol::OpenAiCompletions
+        );
+        assert!(
+            crate::provider::reasoning_control(
+                "tokener",
+                "https://proxy.example.com/v1",
+                "gpt-5.6-sol",
+                ModelProtocol::OpenAiResponses,
+            )
+            .is_none()
         );
     }
 }

@@ -121,41 +121,6 @@ impl Store {
         Ok(n > 0)
     }
 
-    pub(crate) fn update_generated_title(
-        &self,
-        source: &str,
-        source_id: &str,
-        title: &str,
-    ) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE sessions
-                SET title = ?3
-              WHERE source = ?1
-                AND source_id = ?2
-                AND (custom_title IS NULL OR custom_title = '')",
-            rusqlite::params![source, source_id, title],
-        )?;
-        Ok(n > 0)
-    }
-
-    pub(crate) fn update_untitled_title(
-        &self,
-        source: &str,
-        source_id: &str,
-        title: &str,
-    ) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE sessions
-                SET title = ?3
-              WHERE source = ?1
-                AND source_id = ?2
-                AND title = 'Untitled'
-                AND (custom_title IS NULL OR custom_title = '')",
-            rusqlite::params![source, source_id, title],
-        )?;
-        Ok(n > 0)
-    }
-
     #[cfg(test)]
     pub(crate) fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
@@ -433,38 +398,6 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn delete_session_data_with_tombstone(
-        &self,
-        source: &str,
-        source_id: &str,
-        mode: &str,
-    ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO session_deletion_tombstones (source, source_id, deleted_at, mode)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(source, source_id) DO UPDATE SET
-                 deleted_at = excluded.deleted_at,
-                 mode = excluded.mode",
-            rusqlite::params![source, source_id, chrono::Utc::now().timestamp_millis(), mode],
-        )?;
-        delete_session_data_tx(&tx, source, source_id)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn session_is_tombstoned(&self, source: &str, source_id: &str) -> Result<bool> {
-        let exists: i64 = self.conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM session_deletion_tombstones
-                WHERE source = ?1 AND source_id = ?2
-            )",
-            rusqlite::params![source, source_id],
-            |row| row.get(0),
-        )?;
-        Ok(exists != 0)
-    }
-
     pub(crate) fn list_sessions_by_ids(&self, session_ids: &[String]) -> Result<Vec<Session>> {
         if session_ids.is_empty() {
             return Ok(Vec::new());
@@ -576,7 +509,6 @@ impl Store {
         )
     }
 
-    #[cfg(test)]
     pub(crate) fn list_recent_sessions_for_search_scope(
         &self,
         sources: Option<&[String]>,
@@ -614,7 +546,6 @@ impl Store {
         Ok(sessions)
     }
 
-    #[cfg(test)]
     fn retain_visible_subagents(&self, sessions: &mut Vec<Session>) -> Result<()> {
         if sessions.is_empty() {
             return Ok(());
@@ -1183,10 +1114,6 @@ mod topology_tests {
         assert_eq!(ids(ThreadRoleFilter::Primary), vec!["primary".to_string()]);
         assert_eq!(ids(ThreadRoleFilter::Subagent), vec!["subagent".to_string()]);
         assert_eq!(ids(ThreadRoleFilter::Unknown), vec!["unknown".to_string()]);
-        assert_eq!(
-            ids(ThreadRoleFilter::TopLevel),
-            vec!["primary".to_string(), "unknown".to_string()]
-        );
     }
 
     #[test]

@@ -307,7 +307,9 @@ If the source does not support resume, exit non-zero with an actionable error.
 ### `recall session open`
 
 Open a selected session in its source app when an adapter supports app-open.
-Today this is expected to be useful for Codex desktop threads.
+Today this is expected to be useful for Codex desktop threads
+(`codex://threads/<id>`) and GitHub Copilot desktop sessions
+(`ghapp://sessions/<id>`).
 
 ```bash
 recall session open --id <id>
@@ -405,7 +407,6 @@ Per-adapter coverage:
 | Codex | primary / subagent | spawn + fork | `session_meta.thread_source` / `source`, `parent_thread_id` / `thread_spawn`, `forked_from_id` |
 | Claude Code | primary / subagent | spawn | `subagents/<agent>.jsonl` path + transcript `sessionId` parent |
 | Pi | primary | fork | session-header `parentSession` |
-| Oh My Pi | primary | fork | Pi-compatible session-header `parentSession` |
 | Others (OpenCode, Cursor, Copilot, Gemini, Grok, Antigravity, Cline, Kiro) | `null` | none | not yet classified |
 
 Grok retains its current skip-and-prune behavior; enabling classified Grok

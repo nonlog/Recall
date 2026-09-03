@@ -2,9 +2,9 @@
 
 This file provides guidance to AI coding agents (Claude Code, Codex, OpenCode,
 etc.) when working with code in this repository. Module-level rules live in
-nested AGENTS.md files: `src/adapters/`, `src/db/`, `src/tui/`, `extensions/`,
-and `website/` — read the one for the directory you are changing. Provider
-admission for `crates/rx/` is in `crates/rx/PROVIDERS.md`.
+nested AGENTS.md files: `crates/rx/`, `src/adapters/`, `src/db/`, `src/tui/`,
+`extensions/`, and `website/` — read the one for the directory you are
+changing. Provider admission is in `crates/rx/PROVIDERS.md`.
 
 ## Overview
 
@@ -15,10 +15,6 @@ sharing, and resume. The repo is a Cargo workspace: the core application crate
 at the root, the independent `rx` launcher under `crates/rx`, plus official
 extension crates under `extensions/`. Nothing is
 published to crates.io — these are application binaries, not library crates.
-
-## Handoff discipline
-
-This fork keeps a tracked `HANDOFF.md` because implementation sessions can be long-running. Update it after major implementation/validation milestones and before ending a long context window so another agent can continue without reconstructing state from chat history. Keep it factual and current; do not store secrets in it.
 
 ## Commands
 
@@ -78,9 +74,9 @@ Data flow: source adapters → sync → SQLite → search → CLI/TUI.
 - `src/cli.rs` — clap subcommands dispatching to the modules above; unknown
   subcommands fall through to extension dispatch.
 - `crates/rx/` — independent `rx` binary (workspace member, not an extension).
-  Gateway launcher for Claude Code, Codex, OpenCode, and Pi. Does not depend on
-  the `recall` crate or read `recall.db`. Install also creates `rxc` / `rxx` /
-  `rxo` / `rxp` / `rxd` symlinks. Bundled providers are generated from
+  Gateway launcher for native agent harnesses. Does not depend on the `recall`
+  crate or read `recall.db`. Install also creates harness aliases.
+  Bundled providers are generated from
   `crates/rx/data/provider-admission.json` into `crates/rx/data/providers.json`;
   both files are committed. See `crates/rx/PROVIDERS.md`.
 - `src/extension.rs` — extension host: `recall <name>` runs the managed

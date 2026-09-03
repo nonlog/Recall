@@ -65,6 +65,13 @@ enum Commands {
         #[arg(long, value_parser = crate::query::parse_time_range_arg, help = "Filter by time range")]
         time: Option<String>,
     },
+    #[command(about = "Print a shareable usage stats card")]
+    Wrapped {
+        #[arg(long, value_enum, default_value_t = crate::wrapped::WrappedPeriod::Week)]
+        period: crate::wrapped::WrappedPeriod,
+        #[arg(long, value_enum, default_value_t = crate::wrapped::WrappedFormat::Text)]
+        format: crate::wrapped::WrappedFormat,
+    },
     #[command(about = "Export session records as JSON Lines")]
     Export {
         #[arg(long, help = "Filter by source id or label")]
@@ -116,6 +123,13 @@ enum Commands {
         #[arg(help = "Target shell")]
         shell: Shell,
     },
+    #[command(about = "Serve a read-only MCP server over stdio")]
+    Mcp {
+        #[arg(long, help = "Read this Recall database instead of the default index")]
+        db: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<McpCommands>,
+    },
     #[command(hide = true, name = "__background-worker")]
     BackgroundWorker {
         #[arg(long)]
@@ -146,6 +160,32 @@ enum ShareCommands {
         project_name: Option<String>,
         #[arg(long, help = "Local directory used for generated share pages")]
         publish_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    #[command(about = "Register the Recall MCP server with local agent hosts")]
+    Install {
+        #[arg(
+            long = "agent",
+            help = "Target host: claude or codex. Repeat for multiple hosts. Use '*' for all."
+        )]
+        agents: Vec<String>,
+        #[arg(long, help = "Print host commands without running them")]
+        dry_run: bool,
+        #[arg(long, help = "Recall binary to register instead of PATH `recall`")]
+        bin: Option<PathBuf>,
+    },
+    #[command(about = "Unregister the Recall MCP server from local agent hosts")]
+    Uninstall {
+        #[arg(
+            long = "agent",
+            help = "Target host: claude or codex. Repeat for multiple hosts. Use '*' for all."
+        )]
+        agents: Vec<String>,
+        #[arg(long, help = "Print host commands without running them")]
+        dry_run: bool,
     },
 }
 
@@ -225,6 +265,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Usage { json, source, time }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref())?
         }
+        Some(Commands::Wrapped { period, format }) => crate::wrapped::run_cli(period, format)?,
         Some(Commands::Export { source, time, project, repo, thread_role, limit, include }) => {
             crate::export::run_cli(
                 source.as_deref(),
@@ -259,6 +300,17 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "recall", &mut std::io::stdout());
         }
+        Some(Commands::Mcp { db: Some(_), command: Some(_) }) => {
+            anyhow::bail!("--db is only valid when serving (`recall mcp`)");
+        }
+        Some(Commands::Mcp { db, command: None }) => crate::mcp::run(db)?,
+        Some(Commands::Mcp {
+            command: Some(McpCommands::Install { agents, dry_run, bin }),
+            ..
+        }) => crate::mcp_host::install(&agents, dry_run, bin)?,
+        Some(Commands::Mcp {
+            command: Some(McpCommands::Uninstall { agents, dry_run }), ..
+        }) => crate::mcp_host::uninstall(&agents, dry_run)?,
         Some(Commands::External(args)) => {
             let status = crate::extension::run_external(args)?;
             if !status.success() {
@@ -353,8 +405,8 @@ fn recall_skill_bundle() -> kitup::SkillBundle {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ExtensionCommands, ShareCommands, Shell, SkillCommands, generate,
-        insert_installed_help,
+        Cli, Commands, ExtensionCommands, McpCommands, ShareCommands, Shell, SkillCommands,
+        generate, insert_installed_help,
     };
     use crate::adapters::{
         adapter_supports_usage_dashboard, all_adapters, source_supports_event_backfill,
@@ -406,6 +458,31 @@ mod tests {
         for value in ["today", "7d", "week", "30d", "month", "all", "WEEK"] {
             assert!(Cli::try_parse_from(["recall", "usage", "--time", value]).is_ok());
         }
+    }
+
+    #[test]
+    fn wrapped_accepts_period_and_format() {
+        let cli = Cli::try_parse_from(["recall", "wrapped"]).unwrap();
+        match cli.command {
+            Some(Commands::Wrapped { period, format }) => {
+                assert_eq!(period, crate::wrapped::WrappedPeriod::Week);
+                assert_eq!(format, crate::wrapped::WrappedFormat::Text);
+            }
+            _ => panic!("expected wrapped command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["recall", "wrapped", "--period", "year", "--format", "json"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Wrapped { period, format }) => {
+                assert_eq!(period, crate::wrapped::WrappedPeriod::Year);
+                assert_eq!(format, crate::wrapped::WrappedFormat::Json);
+            }
+            _ => panic!("expected wrapped command"),
+        }
+
+        assert!(Cli::try_parse_from(["recall", "wrapped", "--period", "today"]).is_err());
     }
 
     #[test]
@@ -488,6 +565,7 @@ mod tests {
         assert!(compact_help.contains("sync Scan configured AI coding session sources"));
         assert!(compact_help.contains("search Search indexed coding sessions"));
         assert!(compact_help.contains("usage Show token usage reports"));
+        assert!(compact_help.contains("wrapped Print a shareable usage stats card"));
         assert!(compact_help.contains("export Export session records as JSON Lines"));
         assert!(compact_help.contains("import Import session records from JSON Lines"));
         assert!(compact_help.contains("share Share session pages"));
@@ -495,6 +573,99 @@ mod tests {
         assert!(compact_help.contains("extension Manage Recall extensions"));
         assert!(compact_help.contains("session Operate on indexed sessions"));
         assert!(compact_help.contains("completions Generate shell completion script"));
+        assert!(compact_help.contains("mcp Serve a read-only MCP server over stdio"));
+    }
+
+    #[test]
+    fn mcp_parses_optional_db_path() {
+        let cli = Cli::try_parse_from(["recall", "mcp"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp { db, command }) => {
+                assert!(db.is_none());
+                assert!(command.is_none());
+            }
+            _ => panic!("expected mcp command"),
+        }
+
+        let cli = Cli::try_parse_from(["recall", "mcp", "--db", "/tmp/recall-fixture.db"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp { db, command }) => {
+                assert_eq!(db.unwrap().to_string_lossy(), "/tmp/recall-fixture.db");
+                assert!(command.is_none());
+            }
+            _ => panic!("expected mcp command"),
+        }
+    }
+
+    #[test]
+    fn mcp_install_parses_host_flags() {
+        let cli = Cli::try_parse_from(["recall", "mcp", "install"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp {
+                db,
+                command: Some(McpCommands::Install { agents, dry_run, bin }),
+            }) => {
+                assert!(db.is_none());
+                assert!(agents.is_empty());
+                assert!(!dry_run);
+                assert!(bin.is_none());
+            }
+            _ => panic!("expected mcp install command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "recall",
+            "mcp",
+            "install",
+            "--agent",
+            "claude",
+            "--agent",
+            "codex",
+            "--dry-run",
+            "--bin",
+            "/tmp/recall",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Mcp {
+                command: Some(McpCommands::Install { agents, dry_run, bin }),
+                ..
+            }) => {
+                assert_eq!(agents, ["claude", "codex"]);
+                assert!(dry_run);
+                assert_eq!(bin.unwrap().to_string_lossy(), "/tmp/recall");
+            }
+            _ => panic!("expected mcp install command"),
+        }
+    }
+
+    #[test]
+    fn mcp_uninstall_parses() {
+        let cli = Cli::try_parse_from(["recall", "mcp", "uninstall", "--agent", "claude"]).unwrap();
+        match cli.command {
+            Some(Commands::Mcp {
+                command: Some(McpCommands::Uninstall { agents, dry_run }),
+                ..
+            }) => {
+                assert_eq!(agents, ["claude"]);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected mcp uninstall command"),
+        }
+    }
+
+    #[test]
+    fn mcp_install_rejects_db_flag() {
+        assert!(Cli::try_parse_from(["recall", "mcp", "install", "--db", "/tmp/x.db"]).is_err());
+    }
+
+    #[test]
+    fn mcp_help_lists_install_and_uninstall() {
+        let mut command = Cli::command();
+        let help = command.find_subcommand_mut("mcp").unwrap().render_long_help().to_string();
+        assert!(help.contains("install"));
+        assert!(help.contains("uninstall"));
+        assert!(help.contains("--db"));
     }
 
     #[test]
@@ -521,11 +692,12 @@ mod tests {
         let script = String::from_utf8(output).unwrap();
         assert!(script.contains("#compdef recall"));
         assert!(script.contains("search"));
+        assert!(script.contains("wrapped"));
     }
 
     #[test]
     fn public_subcommand_help_describes_arguments_and_options() {
-        for subcommand in ["search", "usage", "export", "import"] {
+        for subcommand in ["search", "usage", "wrapped", "export", "import"] {
             let mut command = Cli::command();
             let command = command.find_subcommand_mut(subcommand).unwrap();
             let help = command.render_long_help().to_string();
@@ -633,7 +805,7 @@ mod tests {
     fn dashboard_sync_skips_sources_without_usage_or_events() {
         for adapter in all_adapters() {
             let id = adapter.id();
-            if matches!(id, "cline" | "antigravity-cli" | "kiro-cli") {
+            if matches!(id, "cline" | "roo" | "antigravity-cli" | "kiro-cli" | "copilot-chat") {
                 assert!(
                     !adapter_supports_usage_dashboard(adapter.as_ref(), true),
                     "{id} should be skipped during dashboard sync"

@@ -10,10 +10,25 @@ models.dev model on an admitted provider shares one `limit.context`, that value
 is stored as `default_context` and used if live `GET /v1/models` omits a window.
 OpenAI roots that already end in `/vN` (Z.AI `/paas/v4`) are left as-is.
 
+Protocol-scoped model controls live in the admission file's
+`model_capabilities` map and are copied into the bundled snapshot. The key is
+provider ID, normalized endpoint, model ID, and protocol. Live `GET /v1/models`
+only filters which models are currently available. A matching bundled entry
+may declare reasoning as `fixed` or list the selectable effort IDs and their
+wire values. Missing data stays unknown and is not inferred from a model name.
+Overriding a bundled provider's endpoint disables its bundled model
+capabilities and falls back to `openai-completions`. A bundled provider may set
+`dsh_protocol` for its verified agent path. Tokener uses `openai-responses`
+because its Chat Completions tool path does not support selectable effort,
+while Responses accepts `reasoning.effort`. Capabilities remain separate per
+protocol.
+
 Users manage providers with `rx providers list`, `login [provider]`,
 `logout [provider]`, `use [provider]`, and `models update [provider]`. Passing a
 provider ID skips the picker; `use` persistently selects the default provider. The one-launch form
-`rx --provider <provider> <harness>` overrides it. Custom providers are configured
+`rx --provider <provider> <harness>` overrides it. `none` skips injection for one
+launch (`rx --provider none <harness>`) or persistently (`rx providers use none`)
+and overrides the implicit OpenRouter default. Custom providers are configured
 with `default_provider` plus `[provider.<id>]` entries in `~/.recall/rx.toml`.
 Stored API keys live in `~/.recall/rx.keys`; `auth = "env"` reads the provider's
 configured environment variable instead.
@@ -37,6 +52,10 @@ Passing only the `models.dev` `@ai-sdk/openai-compatible` classification is not
 enough. After the probe prints `ADMIT`, add the models.dev ID (or a managed
 entry) to `crates/rx/data/provider-admission.json`, run
 `crates/rx/scripts/update-rx-providers`, and commit both data files.
+Reasoning capability entries additionally require a request-level probe for
+each declared wire value on the exact protocol. A fixed entry requires
+evidence that the protocol has no selectable control; another protocol's
+support does not qualify.
 
 ```sh
 RX_PROVIDER_URL=https://api.example.com/v1 \

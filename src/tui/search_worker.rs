@@ -2,7 +2,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::db::search::{SearchEngine, SearchFilters};
-use crate::db::store::{SessionListSort, Store};
+use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
 use crate::types::{MatchSource, SearchResult};
 
@@ -162,14 +162,11 @@ fn run_request(
 }
 
 fn recent_sessions(store: &Store, request: &SearchRequest) -> anyhow::Result<Vec<SearchResult>> {
-    let recent = store.list_indexed_sessions(
+    let recent = store.list_recent_sessions_for_search_scope(
         request.filters.sources.as_deref(),
         request.filters.time_range,
         &request.filters.scope,
-        request.filters.thread_role,
-        Some(SEARCH_LIMIT),
-        0,
-        SessionListSort::Updated,
+        SEARCH_LIMIT,
     )?;
     Ok(recent
         .into_iter()

@@ -1,10 +1,13 @@
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde_json::{Value, json};
 
+use crate::args;
 use crate::catalog;
 use crate::config::Paths;
 use crate::launch::{EnvLookup, openai_base};
@@ -87,29 +90,37 @@ pub(crate) fn env_set(env_key: &str, key: &str) -> Vec<(String, String)> {
     env_set
 }
 
-pub(crate) fn args(provider_id: &str, model: Option<&str>, passthrough: &[String]) -> Vec<String> {
+pub(crate) fn args(
+    provider_id: &str,
+    model: Option<&str>,
+    passthrough: &[OsString],
+) -> Vec<OsString> {
     let mut args = Vec::new();
     if !user_sets_models_flag(passthrough) {
-        args.push("--models".to_string());
-        args.push(format!("{provider_id}/*"));
+        args.push(OsString::from("--models"));
+        args.push(OsString::from(format!("{provider_id}/*")));
     }
     if let Some(model) = model.filter(|_| !user_sets_model(passthrough)) {
-        args.push("--model".to_string());
-        args.push(opencode::prefixed_model(provider_id, model));
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(opencode::prefixed_model(provider_id, model)));
     } else if !user_sets_provider(passthrough) {
-        args.push("--provider".to_string());
-        args.push(provider_id.to_string());
+        args.push(OsString::from("--provider"));
+        args.push(OsString::from(provider_id));
     }
     args.extend(passthrough.iter().cloned());
     args
 }
 
-fn user_sets_models_flag(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "--models" || arg.starts_with("--models="))
+fn user_sets_models_flag(passthrough: &[OsString]) -> bool {
+    args::before_double_dash(passthrough)
+        .iter()
+        .any(|arg| arg == "--models" || args::os_prefix(arg, "--models="))
 }
 
-fn user_sets_provider(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "--provider" || arg.starts_with("--provider="))
+fn user_sets_provider(passthrough: &[OsString]) -> bool {
+    args::before_double_dash(passthrough)
+        .iter()
+        .any(|arg| arg == "--provider" || args::os_prefix(arg, "--provider="))
 }
 
 fn generated_provider(
@@ -138,6 +149,7 @@ fn generated_provider(
 }
 
 pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Value) -> Result<()> {
+    let _lock = exclusive_sidecar(models_path)?;
     let mut document = if models_path.is_file() {
         let body = fs::read_to_string(models_path)
             .with_context(|| format!("failed to read {}", models_path.display()))?;
@@ -147,13 +159,35 @@ pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Va
     } else {
         json!({ "providers": {} })
     };
-    let Some(providers) = document.get_mut("providers").and_then(Value::as_object_mut) else {
-        document["providers"] = json!({});
-        document["providers"][provider_id] = provider;
-        return write_json_atomic(models_path, &document);
+    let Some(root) = document.as_object_mut() else {
+        bail!(
+            "{} root is not a JSON object; fix or remove the file and retry",
+            models_path.display()
+        );
     };
-    providers.insert(provider_id.to_string(), provider);
+    if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
+        providers.insert(provider_id.to_string(), provider);
+    } else {
+        root.insert("providers".to_string(), json!({ provider_id: provider }));
+    }
     write_json_atomic(models_path, &document)
+}
+
+fn exclusive_sidecar(path: &Path) -> Result<fs::File> {
+    let parent = path.parent().context("json file has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".rx.lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock)
 }
 
 fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
@@ -173,6 +207,8 @@ fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
     Ok(())
 }
 
-fn user_sets_model(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|arg| arg == "-m" || arg == "--model" || arg.starts_with("--model="))
+fn user_sets_model(passthrough: &[OsString]) -> bool {
+    args::before_double_dash(passthrough)
+        .iter()
+        .any(|arg| arg == "-m" || arg == "--model" || args::os_prefix(arg, "--model="))
 }

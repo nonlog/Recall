@@ -303,6 +303,54 @@ mod tests {
     }
 
     #[test]
+    fn settings_popup_lists_complete_shortcut_reference() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let mut app = App::new(&store, crate::adapters::source_labels(), AppConfig::default());
+        app.mode = AppMode::Settings;
+
+        let rendered = render_to_text(&app, 180, 24);
+
+        for expected in [
+            "Shortcuts",
+            "Ctrl+C quit",
+            "Tab/Ctrl+F filters",
+            "Ctrl+R resume",
+            "Ctrl+O app",
+            "Ctrl+S settings",
+            "Ins/Ctrl+Space/Space select",
+            "Del trash",
+            "Ctrl+D purge",
+            "a subagents",
+            "d/w/m/l time",
+            "Ctrl+A all",
+            "Y/Enter confirm",
+            "O open",
+            "Enter apply/save",
+            "Export/Find",
+        ] {
+            assert!(rendered.contains(expected), "missing shortcut {expected}:\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn search_footer_keeps_upstream_shortcut_hints_only() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let app =
+            App::new(&store, vec![("codex".to_string(), "CDX".to_string())], AppConfig::default());
+
+        let rendered = render_to_text(&app, 160, 18);
+
+        assert!(rendered.contains("Ctrl+F"));
+        assert!(rendered.contains("Ctrl+R"));
+        assert!(rendered.contains("Ctrl+O"));
+        assert!(rendered.contains("Ctrl+S"));
+        assert!(!rendered.contains(" trash  "));
+        assert!(!rendered.contains(" purge  "));
+    }
+
+    #[test]
     fn render_filter_bar_always_shows_active_project_scope() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();

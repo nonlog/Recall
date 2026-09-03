@@ -35,7 +35,6 @@ pub(crate) struct DeletePlan {
     pub(crate) mode: DeleteMode,
     pub(crate) native_roots: Vec<PathBuf>,
     pub(crate) native_command: Option<ResumeCommand>,
-    pub(crate) suppress_reindex: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,7 +62,6 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
             mode: DeleteMode::IndexOnly,
             native_roots: Vec::new(),
             native_command: None,
-            suppress_reindex: false,
         });
     }
 
@@ -87,7 +85,7 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         );
     }
 
-    Ok(DeletePlan { mode, native_roots, native_command, suppress_reindex: false })
+    Ok(DeletePlan { mode, native_roots, native_command })
 }
 
 pub(crate) fn execute(
@@ -186,15 +184,7 @@ pub(crate) fn execute(
         }
     }
 
-    let delete_index_result = if plan.suppress_reindex {
-        store.delete_session_data_with_tombstone(
-            &session.source,
-            &session.source_id,
-            plan.mode.as_str(),
-        )
-    } else {
-        store.delete_session_data(&session.source, &session.source_id)
-    };
+    let delete_index_result = store.delete_session_data(&session.source, &session.source_id);
     if let Err(error) = delete_index_result {
         if let Some(moved) = &moved_trash
             && let Err(rollback_error) = rollback_trash_move(moved)
@@ -232,9 +222,9 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
             .and_then(|path| pi_session_file(&path, &session.source_id))
             .into_iter()
             .collect(),
-        "oh-my-pi" => source_path
-            .map(|path| oh_my_pi_session_roots(&path, &session.source_id))
-            .unwrap_or_default(),
+        "omp" => {
+            source_path.map(|path| omp_session_roots(&path, &session.source_id)).unwrap_or_default()
+        }
         "gemini-cli" => source_path
             .and_then(|path| gemini_session_file(&path, &session.source_id))
             .into_iter()
@@ -247,7 +237,7 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
         "copilot-cli" => {
             source_path.and_then(|path| copilot_session_root(&path)).into_iter().collect()
         }
-        "cline" => source_path
+        "cline" | "roo" => source_path
             .and_then(|path| cline_session_root(&path, &session.source_id))
             .into_iter()
             .collect(),
@@ -302,33 +292,24 @@ fn pi_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
     (filename_id == source_id).then(|| path.to_path_buf())
 }
 
-fn oh_my_pi_session_roots(path: &Path, source_id: &str) -> Vec<PathBuf> {
-    let Some(file) = pi_session_file(path, source_id) else {
-        return Vec::new();
-    };
+fn omp_session_roots(path: &Path, source_id: &str) -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    let omp_root = home.join(".omp");
-    let env_root = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).filter(|root| {
-        let legacy_pi = home.join(".pi").join("agent");
-        fs::canonicalize(root).unwrap_or_else(|_| root.clone())
-            != fs::canonicalize(&legacy_pi).unwrap_or(legacy_pi)
-    });
-    let allowed = canonical_path_is_within(&file, &omp_root)
-        || env_root.as_deref().is_some_and(|root| canonical_path_is_within(&file, root));
-    if !allowed {
+    omp_session_roots_under(path, source_id, &home.join(".omp"))
+}
+
+fn omp_session_roots_under(path: &Path, source_id: &str, omp_root: &Path) -> Vec<PathBuf> {
+    let Some(file) = pi_session_file(path, source_id) else {
+        return Vec::new();
+    };
+    if !canonical_path_is_within(&file, omp_root) {
         return Vec::new();
     }
 
     let mut roots = vec![file.clone()];
     let artifact_dir = file.with_extension("");
-    if artifact_dir.is_dir()
-        && (canonical_path_is_within(&artifact_dir, &omp_root)
-            || env_root
-                .as_deref()
-                .is_some_and(|root| canonical_path_is_within(&artifact_dir, root)))
-    {
+    if artifact_dir.is_dir() && canonical_path_is_within(&artifact_dir, omp_root) {
         roots.push(artifact_dir);
     }
     roots
@@ -686,10 +667,25 @@ struct TrashMove {
     moved: Vec<(PathBuf, PathBuf)>,
 }
 
-fn new_trash_dir(session: &Session, deleted_at_ms: i64) -> Result<PathBuf> {
+fn trash_root() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("RECALL_TRASH_DIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        return Ok(parent.join("trash"));
+    }
+
     let data_dir =
         dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
-    let trash_dir = data_dir.join("recall").join("trash").join(format!(
+    Ok(data_dir.join("recall").join("trash"))
+}
+
+fn new_trash_dir(session: &Session, deleted_at_ms: i64) -> Result<PathBuf> {
+    let trash_dir = trash_root()?.join(format!(
         "{}-{}-{}",
         deleted_at_ms,
         sanitize_component(&session.source),
@@ -916,6 +912,51 @@ mod tests {
     }
 
     #[test]
+    fn omp_delete_uses_upstream_session_file_and_artifact_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let omp_root = root.path().join(".omp");
+        let sessions = omp_root.join("agent").join("sessions").join("project");
+        fs::create_dir_all(&sessions).unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        let path = sessions.join(format!("2026-09-03T00-00-00Z_{id}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session","id":"{id}"}}
+"#
+            ),
+        )
+        .unwrap();
+        let artifact = path.with_extension("");
+        fs::create_dir_all(&artifact).unwrap();
+
+        let mut roots = omp_session_roots_under(&path, id, &omp_root);
+        roots.sort();
+        let mut expected = vec![path, artifact];
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    #[test]
+    fn omp_delete_rejects_session_files_outside_omp_root() {
+        let root = tempfile::tempdir().unwrap();
+        let omp_root = root.path().join(".omp");
+        fs::create_dir_all(&omp_root).unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        let outside = root.path().join(format!("2026-09-03T00-00-00Z_{id}.jsonl"));
+        fs::write(
+            &outside,
+            format!(
+                r#"{{"type":"session","id":"{id}"}}
+"#
+            ),
+        )
+        .unwrap();
+
+        assert!(omp_session_roots_under(&outside, id, &omp_root).is_empty());
+    }
+
+    #[test]
     fn gemini_session_path_requires_chats_tree_and_matching_id() {
         let dir = tempfile::tempdir().unwrap();
         let gemini_tmp = dir.path().join("tmp");
@@ -1071,7 +1112,6 @@ mod tests {
             mode: DeleteMode::Permanent,
             native_roots: vec![path.clone()],
             native_command: Some(command),
-            suppress_reindex: false,
         };
 
         let error = execute(&store, &session, &delete_plan, false).unwrap_err();
@@ -1106,7 +1146,6 @@ mod tests {
 
         assert!(plan(&session, DeleteMode::Trash).is_err());
         assert!(store.get_session_by_id(&session.id).unwrap().is_some());
-        assert!(!store.session_is_tombstoned(&session.source, &session.source_id).unwrap());
     }
 
     #[test]
@@ -1131,26 +1170,6 @@ mod tests {
         let mut expected = vec![brain, db, pb];
         expected.sort();
         assert_eq!(roots, expected);
-    }
-
-    #[test]
-    fn explicit_index_only_does_not_write_tombstone() {
-        crate::db::schema::register_sqlite_vec();
-        let store = Store::open_in_memory().unwrap();
-        let session = session("cursor", "cursor-native-id", None);
-        store
-            .conn
-            .execute(
-                "INSERT INTO sessions (id, source, source_id, title, started_at)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                rusqlite::params![session.id, session.source, session.source_id, session.title],
-            )
-            .unwrap();
-
-        let plan = plan(&session, DeleteMode::IndexOnly).unwrap();
-        execute(&store, &session, &plan, false).unwrap();
-
-        assert!(!store.session_is_tombstoned(&session.source, &session.source_id).unwrap());
     }
 
     #[test]

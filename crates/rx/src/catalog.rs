@@ -135,6 +135,37 @@ pub(crate) fn load_pi_models(
     read_json_array(artifact_path(paths, provider_id, "pi.json"))
 }
 
+pub(crate) fn load_listed_models(
+    paths: &Paths,
+    provider_id: &str,
+    base_url: &str,
+    key: &str,
+    allow_fetch: bool,
+) -> Result<Vec<ListedModel>> {
+    ensure(paths, provider_id, base_url, key, allow_fetch)?;
+    let path = artifact_path(paths, provider_id, "json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let body =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let document: Value = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(document
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            Some(ListedModel {
+                id: model.get("slug")?.as_str()?.to_string(),
+                name: model.get("display_name").and_then(Value::as_str).map(str::to_string),
+                context_length: model.get("context_window").and_then(Value::as_i64),
+            })
+        })
+        .collect())
+}
+
 pub(crate) fn load_claude_seed(
     paths: &Paths,
     provider_id: &str,
@@ -179,7 +210,10 @@ fn ensure(
 
 fn refresh(paths: &Paths, provider_id: &str, key: &str, endpoint: &str) -> Result<usize> {
     let url = format!("{endpoint}/models");
-    let body = fetch_get(&url, &[("Authorization", format!("Bearer {key}"))])?;
+    let body = match fetch_get(&url, &[("Authorization", format!("Bearer {key}"))]) {
+        Ok(body) => body,
+        Err(error) => bail!("{provider_id}: {error:#}"),
+    };
     let models = fill_missing_context(provider_id, &parse_openai_models(&body)?);
     if models.is_empty() {
         bail!("{} returned no models from {endpoint}", provider_id);

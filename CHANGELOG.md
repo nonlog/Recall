@@ -1,38 +1,112 @@
 # Changelog
 
-## Unreleased — nonlog fork
+## [0.5.8.1] (2026-09-03)
 
-No unreleased fork-specific changes currently.
+### nonlog fork
 
-## v0.5.3.8 — nonlog fork (2026-08-28)
+* Rebase the fork onto upstream Recall v0.5.8, including all upstream MCP, `rx`, and adapter additions.
+* Keep the fork's safe Trash/permanent/index-only session deletion and bulk TUI deletion.
+* Keep per-source TUI brand colors/icons while using the upstream `omp` adapter and source id.
+* Move Windows Trash beside the installed binary; Scoop persists `trash` across upgrades.
+* Restore the upstream bottom shortcut bar and show the complete shortcut reference in Ctrl+S Settings.
 
-### Fixes
 
-- **codex:** prefer native thread names from Codex's append-only `session_index.jsonl` when `state_5.sqlite` has no `threads.name`; the latest rename wins and unchanged indexed sessions refresh automatically.
-- **codex:** when no native thread name exists, reduce state-derived first-prompt fallbacks to a concise first-line/sentence headline instead of displaying the full instruction block.
+## [0.5.8](https://github.com/samzong/Recall/compare/v0.5.7...v0.5.8) (2026-09-01)
 
-## v0.5.3.7 — nonlog fork (2026-08-28)
 
 ### Features
 
-- **session:** add native-aware session deletion with Trash, permanent, dry-run, and index-only modes.
-- **tui:** add multi-select and one-confirmation bulk Trash/permanent deletion.
-- **adapters:** add Oh My Pi (`OMP`) as a distinct indexed source.
-- **titles:** prefer native Codex, Claude Code, Pi, and OMP session titles where available and provide deterministic fallbacks.
-- **tui:** add per-agent/harness brand colors and terminal-safe Nerd Font/Unicode brand glyphs with fallback support.
-- **tui:** default to top-level sessions and add `Primary` / `Subagents` / `All` topology filtering so Codex worker threads no longer flood the main list.
+* **mcp:** add file_history tool with per-file patch events ([#192](https://github.com/samzong/Recall/issues/192))
+* **adapters:** index Cursor Agent CLI store.db sessions ([#195](https://github.com/samzong/Recall/issues/195))
+* **adapters:** index Qwen Code project chat JSONL sessions ([#196](https://github.com/samzong/Recall/issues/196))
+* **adapters:** index Kilo Code CLI kilo.db sessions ([#197](https://github.com/samzong/Recall/issues/197))
+* **adapters:** index Crush project crush.db sessions ([#198](https://github.com/samzong/Recall/issues/198))
+* **adapters:** index MiMo Code mimocode.db sessions ([#199](https://github.com/samzong/Recall/issues/199))
+* **adapters:** index ZCode cli/db.sqlite sessions ([#200](https://github.com/samzong/Recall/issues/200))
+* **adapters:** index OMP session JSONL ([#201](https://github.com/samzong/Recall/issues/201))
+* **adapters:** scan Cline across editor hosts and add Roo ([#203](https://github.com/samzong/Recall/issues/203))
+* **adapters:** index Kiro CLI v2/v3 session files ([#204](https://github.com/samzong/Recall/issues/204))
+* **adapters:** index VS Code Chat sessions and CLI usage ([#205](https://github.com/samzong/Recall/issues/205))
+* **adapters:** index Goose sessions.db ([#206](https://github.com/samzong/Recall/issues/206))
+* **adapters:** index Cline CLI sessions on the cline source ([#207](https://github.com/samzong/Recall/issues/207))
+
 
 ### Fixes
 
-- **delete:** verify native deletion instead of treating Recall index removal as success.
-- **opencode:** run maintenance commands with `--pure`, validate Trash exports, and prune stale Recall rows missing from the native OpenCode database.
-- **codex:** use the native Codex deletion path and restore native thread titles/subagent topology metadata.
+* **rx:** support dsh reasoning effort controls ([#191](https://github.com/samzong/Recall/issues/191))
 
-### Development
 
-- Local canonical workspace moved from `D:\Workspace\general\Recall-tui` to `D:\Workspace\Recall`.
-- Added `HANDOFF.md` as the durable continuation document for long-running fork work.
-- Automatic upstream release syncing is disabled; upstream integration is now manual so fork-specific behavior cannot be overwritten silently.
+### Documentation
+
+* **readme:** refresh project visuals ([#193](https://github.com/samzong/Recall/issues/193))
+* **rx:** add hosting guide for embedders ([#194](https://github.com/samzong/Recall/issues/194))
+* **adapters:** add ZCode to the support table ([#202](https://github.com/samzong/Recall/issues/202))
+* **adapters:** add Goose to the architecture diagram ([#208](https://github.com/samzong/Recall/issues/208))
+
+
+## [0.5.7](https://github.com/samzong/Recall/compare/v0.5.6...v0.5.7) (2026-08-28)
+
+
+### Fixes
+
+* **rx:** scope hosted harness env and harden dsh profile install ([#188](https://github.com/samzong/Recall/issues/188))
+
+
+### Documentation
+
+* **rx:** add launcher design contract and agent rules ([#189](https://github.com/samzong/Recall/issues/189))
+
+
+## [0.5.6](https://github.com/samzong/Recall/compare/v0.5.5...v0.5.6) (2026-08-28)
+
+
+### Features
+
+* **rx:** add hosted gateway launch path ([#187](https://github.com/samzong/Recall/issues/187))
+
+
+## [0.5.5](https://github.com/samzong/Recall/compare/v0.5.4...v0.5.5) (2026-08-28)
+
+
+### Features
+
+* **adapters:** open Copilot desktop sessions via ghapp ([#183](https://github.com/samzong/Recall/issues/183))
+* **rx:** add Kimi Code launch path ([#185](https://github.com/samzong/Recall/issues/185))
+* **rx:** launch harnesses from picker letter shortcuts ([#186](https://github.com/samzong/Recall/issues/186))
+
+
+### Fixes
+
+* **rx:** stabilize dsh installation ([#184](https://github.com/samzong/Recall/issues/184))
+
+
+## [0.5.4](https://github.com/samzong/Recall/compare/v0.5.3...v0.5.4) (2026-08-27)
+
+
+### Features
+
+* **rx:** add max-permission launch defaults ([#175](https://github.com/samzong/Recall/issues/175))
+* **rx:** add shell completions ([#177](https://github.com/samzong/Recall/issues/177))
+* **mcp:** serve a read-only session index over stdio ([#178](https://github.com/samzong/Recall/issues/178))
+* **recall:** add wrapped usage stats card ([#179](https://github.com/samzong/Recall/issues/179))
+* **rx:** add 'none' provider to skip provider injection ([#180](https://github.com/samzong/Recall/issues/180))
+
+
+### Fixes
+
+* **rx:** include provider name on catalog fetch errors ([#169](https://github.com/samzong/Recall/issues/169))
+* **rx:** exit successfully on update help
+* **rx:** honor OpenCode long-form model flags
+* **rx:** reject non-object Pi models.json roots ([#171](https://github.com/samzong/Recall/issues/171))
+* **rx:** ignore option detectors after -- ([#172](https://github.com/samzong/Recall/issues/172))
+* **rx:** persist update checks and serialize state writes ([#173](https://github.com/samzong/Recall/issues/173))
+* **rx:** preserve non-UTF-8 arguments and executable paths ([#174](https://github.com/samzong/Recall/issues/174))
+* **mcp:** preserve existing host registration ([#182](https://github.com/samzong/Recall/issues/182))
+
+
+### Documentation
+
+* **rx:** refresh architecture diagram ([#176](https://github.com/samzong/Recall/issues/176))
 
 
 ## [0.5.3](https://github.com/samzong/Recall/compare/v0.5.2...v0.5.3) (2026-08-24)

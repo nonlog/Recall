@@ -153,8 +153,6 @@ pub(super) fn render_viewing(f: &mut Frame, app: &App) {
         Span::styled(" share  ", Style::default().fg(THEME.text_muted)),
         Span::styled("h", Style::default().fg(THEME.accent)),
         Span::styled(" handoff  ", Style::default().fg(THEME.text_muted)),
-        Span::styled("d", Style::default().fg(THEME.error)),
-        Span::styled(" delete  ", Style::default().fg(THEME.text_muted)),
     ];
     if !app.viewing_children.is_empty() {
         help_spans.push(Span::styled("a", Style::default().fg(THEME.accent)));

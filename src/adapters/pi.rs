@@ -19,7 +19,7 @@ use crate::types::{ParentLink, ParentRelation, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct PiAdapter;
 
-const METADATA_PARSER_VERSION: u32 = 2;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
@@ -77,14 +77,13 @@ impl SourceAdapter for PiAdapter {
     }
 }
 
-pub(crate) struct ParsedPiSession {
-    pub(crate) session_id: Option<String>,
-    pub(crate) cwd: Option<String>,
-    pub(crate) started_at: Option<i64>,
-    pub(crate) title: Option<String>,
-    pub(crate) messages: Vec<RawMessage>,
-    pub(crate) usage_events: Vec<RawUsageEvent>,
-    pub(crate) parent_session: Option<String>,
+struct ParsedPiSession {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    started_at: Option<i64>,
+    messages: Vec<RawMessage>,
+    usage_events: Vec<RawUsageEvent>,
+    parent_session: Option<String>,
 }
 
 fn resolve_pi_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
@@ -307,7 +306,7 @@ fn parse_pi_session_file(
         events: Vec::new(),
         event_parser_version: None,
         source_file_path,
-        custom_title: parsed.title,
+        custom_title: None,
         summary: None,
         duration_minutes: None,
         thread_role: Some(ThreadRole::Primary),
@@ -316,10 +315,7 @@ fn parse_pi_session_file(
     }))
 }
 
-pub(crate) fn parse_pi_session(
-    path: &Path,
-    fallback_timestamp: i64,
-) -> anyhow::Result<ParsedPiSession> {
+fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<ParsedPiSession> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let source_path = path.to_string_lossy().to_string();
@@ -327,7 +323,6 @@ pub(crate) fn parse_pi_session(
     let mut session_id = None;
     let mut cwd = None;
     let mut started_at = None;
-    let mut title = None;
     let mut current_provider: Option<String> = None;
     let mut current_model: Option<String> = None;
     let mut inherited_usage_cutoff = None;
@@ -354,13 +349,6 @@ pub(crate) fn parse_pi_session(
                     .map(str::to_string)
                     .or(cwd);
                 started_at = header_timestamp.or(started_at);
-                if let Some(value) = entry.get("title") {
-                    title = value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string);
-                }
                 if let Some(parent) = entry
                     .get("parentSession")
                     .and_then(|value| value.as_str())
@@ -369,25 +357,6 @@ pub(crate) fn parse_pi_session(
                 {
                     inherited_usage_cutoff = header_timestamp;
                     parent_session = Some(parent.to_string());
-                }
-            }
-            "session_info" => {
-                if entry.get("name").is_some() {
-                    title = entry
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string);
-                }
-            }
-            "title" | "title_change" => {
-                if let Some(value) = entry.get("title") {
-                    title = value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string);
                 }
             }
             "model_change" => {
@@ -448,15 +417,7 @@ pub(crate) fn parse_pi_session(
         }
     }
 
-    Ok(ParsedPiSession {
-        session_id,
-        cwd,
-        started_at,
-        title,
-        messages,
-        usage_events,
-        parent_session,
-    })
+    Ok(ParsedPiSession { session_id, cwd, started_at, messages, usage_events, parent_session })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -813,13 +774,6 @@ mod tests {
                     "cwd": "/tmp/pi-project"
                 }),
                 serde_json::json!({
-                    "type": "session_info",
-                    "id": "info1",
-                    "parentId": null,
-                    "timestamp": "1970-01-01T00:00:01.500Z",
-                    "name": "Pi native session title"
-                }),
-                serde_json::json!({
                     "type": "message",
                     "id": "user1",
                     "parentId": null,
@@ -886,7 +840,6 @@ mod tests {
         assert_eq!(raw.started_at, 1_000);
         assert_eq!(raw.updated_at, Some(mtime));
         assert_eq!(raw.source_file_path.as_deref(), path.to_str());
-        assert_eq!(raw.custom_title.as_deref(), Some("Pi native session title"));
         assert_eq!(raw.messages.len(), 3);
         assert_eq!(raw.messages[0].role, Role::User);
         assert_eq!(raw.messages[0].content, "hello pi");

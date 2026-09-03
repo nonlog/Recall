@@ -3,21 +3,29 @@ pub(crate) mod claude_code;
 pub(crate) mod cline;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod copilot_chat;
+pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
 pub(crate) mod events;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
+pub(crate) mod goose;
 pub(crate) mod grok;
 pub(crate) mod json_util;
+pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
-pub(crate) mod oh_my_pi;
+pub(crate) mod mimo_code;
+pub(crate) mod omp;
 pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod pi;
+pub(crate) mod qwen;
+pub(crate) mod roo;
 pub(crate) mod sync_state;
 pub(crate) mod usage;
+pub(crate) mod zcode;
 
 use crate::db::store::Store;
 use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
@@ -187,16 +195,24 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(opencode::OpenCodeAdapter),
         Box::new(codex::CodexAdapter),
         Box::new(pi::PiAdapter),
-        Box::new(oh_my_pi::OhMyPiAdapter),
+        Box::new(omp::OmpAdapter),
         Box::new(antigravity::AntigravityAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(grok::GrokAdapter),
         Box::new(kiro::KiroAdapter),
         Box::new(copilot::CopilotAdapter),
+        Box::new(copilot_chat::CopilotChatAdapter),
         Box::new(cursor::CursorAdapter),
         Box::new(cline::ClineAdapter),
+        Box::new(roo::RooAdapter),
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
         Box::new(kimi_code::KimiCodeAdapter),
+        Box::new(qwen::QwenAdapter),
+        Box::new(kilo::KiloCodeAdapter),
+        Box::new(crush::CrushAdapter),
+        Box::new(mimo_code::MimoCodeAdapter),
+        Box::new(zcode::ZcodeAdapter),
+        Box::new(goose::GooseAdapter),
     ]
 }
 
@@ -217,7 +233,19 @@ pub(crate) fn source_labels() -> Vec<(String, String)> {
 }
 
 pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
-    matches!(source_id, "codex" | "claude-code" | "cursor" | "copilot-cli" | "opencode")
+    matches!(
+        source_id,
+        "codex"
+            | "claude-code"
+            | "cursor"
+            | "copilot-cli"
+            | "opencode"
+            | "kilo-code"
+            | "crush"
+            | "mimo-code"
+            | "zcode"
+            | "goose"
+    )
 }
 
 pub(crate) fn adapter_supports_usage_dashboard(

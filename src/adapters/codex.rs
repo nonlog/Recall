@@ -1,9 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
@@ -18,23 +16,12 @@ use crate::adapters::{
 };
 use crate::db::store::Store;
 use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
-use crate::utils;
 
 pub(crate) struct CodexAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 4;
-const EVENT_PARSER_VERSION: u32 = 1;
-const METADATA_PARSER_VERSION: u32 = 3;
-
-#[derive(Debug, Clone, Default)]
-struct CodexThreadMetadata {
-    name: Option<String>,
-    title: Option<String>,
-    first_user_message: Option<String>,
-    agent_role: Option<String>,
-    thread_source: Option<String>,
-    parent_thread_id: Option<String>,
-}
+const EVENT_PARSER_VERSION: u32 = 2;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for CodexAdapter {
     fn id(&self) -> &str {
@@ -45,11 +32,14 @@ impl SourceAdapter for CodexAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(codex_cli_command(vec!["resume".to_string(), source_id.to_string()]))
+        Some(ResumeCommand {
+            program: "codex".to_string(),
+            args: vec!["resume".to_string(), source_id.to_string()],
+        })
     }
 
     fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(codex_cli_command(vec![
+        Some(codex_delete_command(vec![
             "delete".to_string(),
             "--force".to_string(),
             source_id.to_string(),
@@ -68,7 +58,6 @@ impl SourceAdapter for CodexAdapter {
         let Some(codex_dir) = resolve_codex_dir()? else {
             return Ok(vec![]);
         };
-        let thread_metadata = load_codex_thread_metadata(&codex_dir);
         let sessions_dir = codex_dir.join("sessions");
         let archived_dir = codex_dir.join("archived_sessions");
 
@@ -77,8 +66,7 @@ impl SourceAdapter for CodexAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(mut raw) = parse_codex_session_for_entry(entry, mtime_ms, true)? {
-                apply_codex_thread_title(&mut raw, &thread_metadata);
+            if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms, true)? {
                 sessions.push(raw);
             }
         }
@@ -104,14 +92,14 @@ fn codex_thread_url(source_id: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn codex_cli_command(args: Vec<String>) -> ResumeCommand {
+fn codex_delete_command(args: Vec<String>) -> ResumeCommand {
     let mut wrapped = vec!["/D".to_string(), "/C".to_string(), "codex".to_string()];
     wrapped.extend(args);
     ResumeCommand { program: "cmd.exe".to_string(), args: wrapped }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn codex_cli_command(args: Vec<String>) -> ResumeCommand {
+fn codex_delete_command(args: Vec<String>) -> ResumeCommand {
     ResumeCommand { program: "codex".to_string(), args }
 }
 
@@ -143,11 +131,10 @@ fn scan_for_sync_impl(
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    let thread_metadata = load_codex_thread_metadata(codex_dir);
     let sessions_dir = codex_dir.join("sessions");
     let archived_dir = codex_dir.join("archived_sessions");
     let entries = collect_codex_entries(&[&sessions_dir, &archived_dir]);
-    let mut result = file_scan::run_file_scan_with_options(
+    file_scan::run_file_scan_with_options(
         store,
         "codex",
         since_ts,
@@ -158,274 +145,16 @@ fn scan_for_sync_impl(
         },
         entries,
         |entry, mtime_ms| {
-            let Some(mut session) = parse_codex_session_for_entry(entry, mtime_ms, include_events)?
+            let Some(session) = parse_codex_session_for_entry(entry, mtime_ms, include_events)?
             else {
                 return Ok(None);
             };
-            apply_codex_thread_title(&mut session, &thread_metadata);
             if !include_events && session.messages.is_empty() && session.usage_events.is_empty() {
                 return Ok(None);
             }
             Ok(Some(session))
         },
-    )?;
-
-    // Codex stores native names independently from rollout JSONL mtimes in both
-    // state_5.sqlite and the append-only session_index.jsonl. Refresh already-indexed sessions so a
-    // rename is visible even when the transcript itself did not change. This
-    // also gives assistant-only subagent rollouts deterministic titles.
-    refresh_codex_titles_in_store(store, &thread_metadata)?;
-    for session in &mut result.sessions {
-        apply_codex_thread_title(session, &thread_metadata);
-    }
-
-    Ok(result)
-}
-
-fn load_codex_thread_metadata(codex_dir: &Path) -> HashMap<String, CodexThreadMetadata> {
-    let db_path = codex_dir.join("state_5.sqlite");
-    let mut metadata = HashMap::new();
-
-    if db_path.is_file() {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        match Connection::open_with_flags(&db_path, flags) {
-            Ok(conn) => match read_codex_thread_metadata(&conn) {
-                Ok(state_metadata) => metadata = state_metadata,
-                Err(error) => debug!(
-                    "failed to read Codex thread metadata from {}: {error}",
-                    db_path.display()
-                ),
-            },
-            Err(error) => debug!(
-                "failed to open Codex state database {} read-only: {error}",
-                db_path.display()
-            ),
-        }
-    }
-
-    merge_codex_session_index_names(codex_dir, &mut metadata);
-    metadata
-}
-
-fn merge_codex_session_index_names(
-    codex_dir: &Path,
-    metadata: &mut HashMap<String, CodexThreadMetadata>,
-) {
-    let index_path = codex_dir.join("session_index.jsonl");
-    let Ok(file) = fs::File::open(&index_path) else {
-        return;
-    };
-
-    for row in jsonl_indexed(BufReader::new(file).lines()) {
-        let (_, value) = match row {
-            Ok(row) => row,
-            Err(error) => {
-                debug!("failed to read Codex session index {}: {error}", index_path.display());
-                break;
-            }
-        };
-        let Some(source_id) = value.get("id").and_then(Value::as_str).map(str::trim) else {
-            continue;
-        };
-        let Some(name) = value.get("thread_name").and_then(Value::as_str).map(str::trim) else {
-            continue;
-        };
-        if source_id.is_empty() || name.is_empty() {
-            continue;
-        }
-
-        // session_index.jsonl is append-only. The last entry for a thread is
-        // the name returned by Codex app-server even when state_5.sqlite.name
-        // is still NULL, so let later records win.
-        metadata.entry(source_id.to_string()).or_default().name = Some(name.to_string());
-    }
-}
-
-fn read_codex_thread_metadata(
-    conn: &Connection,
-) -> anyhow::Result<HashMap<String, CodexThreadMetadata>> {
-    let mut columns = HashSet::new();
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for row in rows {
-            columns.insert(row?);
-        }
-    }
-    if !columns.contains("id") {
-        return Ok(HashMap::new());
-    }
-
-    let column_or_null = |name: &str| {
-        if columns.contains(name) { name.to_string() } else { "NULL".to_string() }
-    };
-    let sql = format!(
-        "SELECT id, {}, {}, {}, {}, {} FROM threads",
-        column_or_null("name"),
-        column_or_null("title"),
-        column_or_null("first_user_message"),
-        column_or_null("agent_role"),
-        column_or_null("thread_source"),
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
-
-    let mut metadata = HashMap::new();
-    for row in rows {
-        let (source_id, name, title, first_user_message, agent_role, thread_source) = row?;
-        metadata.insert(
-            source_id,
-            CodexThreadMetadata {
-                name: trimmed(name),
-                title: trimmed(title),
-                first_user_message: trimmed(first_user_message),
-                agent_role: trimmed(agent_role),
-                thread_source: trimmed(thread_source),
-                parent_thread_id: None,
-            },
-        );
-    }
-
-    if table_exists(conn, "thread_spawn_edges")? {
-        let mut stmt =
-            conn.prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")?;
-        let rows =
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (parent, child) = row?;
-            if let Some(entry) = metadata.get_mut(&child) {
-                entry.parent_thread_id = trimmed(Some(parent));
-            }
-        }
-    }
-
-    Ok(metadata)
-}
-
-fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
-    let exists = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get::<_, i64>(0),
-    )?;
-    Ok(exists != 0)
-}
-
-fn trimmed(value: Option<String>) -> Option<String> {
-    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
-}
-
-fn state_text_title(metadata: &CodexThreadMetadata) -> Option<String> {
-    [metadata.title.as_deref(), metadata.first_user_message.as_deref()]
-        .into_iter()
-        .flatten()
-        .find_map(|text| {
-            let normalized = normalize_codex_state_title_text(text);
-            let headline = normalized
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map(str::trim)
-                .unwrap_or(normalized);
-            let headline = [". ", "。", "! ", "！", "? ", "？", "; ", "；"]
-                .into_iter()
-                .filter_map(|separator| headline.split_once(separator).map(|(head, _)| head.trim()))
-                .find(|head| head.chars().count() >= 8)
-                .unwrap_or(headline);
-            let generated = utils::title_from_user_messages(&[headline]);
-            (generated != "Untitled").then_some(generated)
-        })
-}
-
-fn normalize_codex_state_title_text(text: &str) -> &str {
-    let text = text.trim();
-    if let Some(rest) = text.strip_prefix("codex://threads/")
-        && let Some((_, continuation)) = rest.split_once('\n')
-        && let Some(prompt) = continuation.trim_start().strip_prefix("Continue this session:")
-    {
-        let prompt = prompt.trim();
-        if !prompt.is_empty() {
-            return prompt;
-        }
-    }
-    text
-}
-
-fn codex_thread_display_title(
-    source_id: &str,
-    metadata: &CodexThreadMetadata,
-    catalog: &HashMap<String, CodexThreadMetadata>,
-) -> Option<String> {
-    if let Some(name) = metadata.name.as_ref() {
-        return Some(name.clone());
-    }
-
-    if let Some(title) = state_text_title(metadata) {
-        return Some(title);
-    }
-
-    let is_subagent = metadata.thread_source.as_deref() == Some("subagent")
-        || metadata.agent_role.is_some()
-        || metadata.parent_thread_id.is_some();
-    if !is_subagent {
-        return None;
-    }
-
-    let role = metadata.agent_role.as_deref().unwrap_or("subagent");
-    let parent_title = metadata
-        .parent_thread_id
-        .as_ref()
-        .and_then(|parent_id| catalog.get(parent_id))
-        .and_then(|parent| parent.name.clone().or_else(|| state_text_title(parent)));
-    let suffix: String = source_id.chars().take(8).collect();
-    Some(match parent_title {
-        Some(parent_title) => format!("↳ {role} · {parent_title} · {suffix}"),
-        None => format!("↳ {role} · {suffix}"),
-    })
-}
-
-fn apply_codex_thread_title(
-    session: &mut RawSession,
-    catalog: &HashMap<String, CodexThreadMetadata>,
-) {
-    if let Some(metadata) = catalog.get(&session.source_id)
-        && let Some(title) = codex_thread_display_title(&session.source_id, metadata, catalog)
-    {
-        session.custom_title = Some(title);
-    }
-}
-
-fn refresh_codex_titles_in_store(
-    store: &Store,
-    catalog: &HashMap<String, CodexThreadMetadata>,
-) -> anyhow::Result<()> {
-    for session in store.session_paths_for_source("codex")? {
-        if let Some(metadata) = catalog.get(&session.source_id)
-            && let Some(title) = codex_thread_display_title(&session.source_id, metadata, catalog)
-        {
-            store.update_session_fields(
-                "codex",
-                &session.source_id,
-                Some(&title),
-                None,
-                None,
-                None,
-            )?;
-            continue;
-        }
-
-        let suffix: String = session.source_id.chars().take(8).collect();
-        store.update_untitled_title("codex", &session.source_id, &format!("Session · {suffix}"))?;
-    }
-    Ok(())
+    )
 }
 
 fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
@@ -834,6 +563,29 @@ fn collect_codex_response_item_event(
 
     if payload_type.ends_with("_call") {
         let name = codex_call_name(payload_type, payload);
+        let status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        if let Some(Value::String(text)) = codex_call_args(payload) {
+            let patch_targets = events::patch_file_targets(text);
+            if !patch_targets.is_empty() {
+                for target in patch_targets {
+                    let mut event = events::file_write_event(
+                        events::EventContext {
+                            event_seq: events_out.len() as u32,
+                            timestamp,
+                            source_path: Some(source_path.to_string()),
+                            source_event_id: Some(source_event_id.clone()),
+                            message_seq: None,
+                            parser_version: EVENT_PARSER_VERSION,
+                        },
+                        name.clone(),
+                        target,
+                    );
+                    event.status = status.clone();
+                    events_out.push(event);
+                }
+                return;
+            }
+        }
         let mut event = match codex_call_args(payload) {
             Some(Value::String(text)) => events::tool_call_event_from_text(
                 events::EventContext {
@@ -860,7 +612,7 @@ fn collect_codex_response_item_event(
                 args,
             ),
         };
-        event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
+        event.status = status;
         events_out.push(event);
     }
 }
@@ -1236,145 +988,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_cli_commands_use_windows_command_resolution() {
-        let command = CodexAdapter.delete_command("019e6d8d-588b-7fd2-a326-c525469ed120").unwrap();
-
-        #[cfg(target_os = "windows")]
-        {
-            assert_eq!(command.program, "cmd.exe");
-            assert_eq!(
-                command.args,
-                vec![
-                    "/D",
-                    "/C",
-                    "codex",
-                    "delete",
-                    "--force",
-                    "019e6d8d-588b-7fd2-a326-c525469ed120"
-                ]
-            );
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            assert_eq!(command.program, "codex");
-            assert_eq!(
-                command.args,
-                vec!["delete", "--force", "019e6d8d-588b-7fd2-a326-c525469ed120"]
-            );
-        }
-    }
-
-    #[test]
-    fn codex_session_index_name_fills_missing_state_name_and_latest_entry_wins() {
-        let root = temp_codex_root("session-index-name");
-        let source_id = "019fbc20-b842-7ba0-907f-7b7ce528f5af";
-        write_codex_state_db(&root, &[(source_id, None)]);
-        write_codex_session_index(
-            &root,
-            &[(source_id, "Initial generated name"), (source_id, "Agentdock 部署与配置")],
-        );
-
-        let metadata = load_codex_thread_metadata(&root);
-        assert_eq!(
-            metadata.get(source_id).and_then(|item| item.name.as_deref()),
-            Some("Agentdock 部署与配置")
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn codex_state_title_uses_prompt_headline_instead_of_full_instruction() {
-        let metadata = CodexThreadMetadata {
-            title: Some(
-                "M1 CONTROLLER SUB-BATCH A. Work only in current pixel-aod-coui-port dirty tree. NO skill lookup, NO memory."
-                    .to_string(),
-            ),
-            ..CodexThreadMetadata::default()
-        };
-
-        assert_eq!(state_text_title(&metadata).as_deref(), Some("M1 CONTROLLER SUB-BATCH A"));
-    }
-
-    #[test]
-    fn codex_thread_name_is_preferred_over_generated_state_title() {
-        let source_id = "019e6d8d-588b-7fd2-a326-c525469ed120";
-        let metadata = CodexThreadMetadata {
-            name: Some("自定义会话标题".to_string()),
-            title: Some("这是很长的第一条用户消息".to_string()),
-            ..CodexThreadMetadata::default()
-        };
-        let catalog = HashMap::from([(source_id.to_string(), metadata.clone())]);
-
-        assert_eq!(
-            codex_thread_display_title(source_id, &metadata, &catalog).as_deref(),
-            Some("自定义会话标题")
-        );
-    }
-
-    #[test]
-    fn codex_subagent_title_uses_parent_title_role_and_unique_suffix() {
-        let parent_id = "019e6d8d-588b-7fd2-a326-c525469ed120";
-        let child_id = "01a032ac-bb4f-7940-a090-ee45863b9384";
-        let parent = CodexThreadMetadata {
-            name: Some("Vercel订阅拼接使用本地网络".to_string()),
-            ..CodexThreadMetadata::default()
-        };
-        let child = CodexThreadMetadata {
-            agent_role: Some("explorer".to_string()),
-            thread_source: Some("subagent".to_string()),
-            parent_thread_id: Some(parent_id.to_string()),
-            ..CodexThreadMetadata::default()
-        };
-        let catalog =
-            HashMap::from([(parent_id.to_string(), parent), (child_id.to_string(), child.clone())]);
-
-        assert_eq!(
-            codex_thread_display_title(child_id, &child, &catalog).as_deref(),
-            Some("↳ explorer · Vercel订阅拼接使用本地网络 · 01a032ac")
-        );
-    }
-
-    #[test]
-    fn codex_state_title_strips_resume_transport_prefix() {
-        let metadata = CodexThreadMetadata {
-            title: Some(
-                "codex://threads/019e1269-ac93-7891-9d0e-66e0e1a01660\nContinue this session: I plan to use D:\\Programs to replace D:\\Tools."
-                    .to_string(),
-            ),
-            ..CodexThreadMetadata::default()
-        };
-
-        assert_eq!(
-            state_text_title(&metadata).as_deref(),
-            Some("I plan to use D:\\Programs to replace D:\\Tools.")
-        );
-    }
-
-    #[test]
-    fn refresh_codex_titles_replaces_legacy_untitled_without_overwriting_real_titles() {
-        let store = setup_store();
-        let untitled_id = "019e6d8d-588b-7fd2-a326-c525469ed120";
-        let real_id = "019e6d8d-588b-7fd2-a326-c525469ed121";
-        let mut untitled = make_existing_session(untitled_id, 1, 0);
-        untitled.title = "Untitled".to_string();
-        let mut real = make_existing_session(real_id, 1, 0);
-        real.title = "Existing useful title".to_string();
-        store.insert_session(&untitled).unwrap();
-        store.insert_session(&real).unwrap();
-
-        refresh_codex_titles_in_store(&store, &HashMap::new()).unwrap();
-
-        let sessions = store.list_recent_sessions(10).unwrap();
-        let by_source = sessions
-            .into_iter()
-            .map(|session| (session.source_id.clone(), session.title))
-            .collect::<HashMap<_, _>>();
-        assert_eq!(by_source.get(untitled_id).map(String::as_str), Some("Session · 019e6d8d"));
-        assert_eq!(by_source.get(real_id).map(String::as_str), Some("Existing useful title"));
-    }
-
     fn temp_codex_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "recall-cdx-test-{}-{}",
@@ -1409,30 +1022,6 @@ mod tests {
         writeln!(f, "{meta}").unwrap();
         writeln!(f, "{msg}").unwrap();
         path
-    }
-
-    fn write_codex_state_db(root: &Path, rows: &[(&str, Option<&str>)]) {
-        let conn = Connection::open(root.join("state_5.sqlite")).unwrap();
-        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);").unwrap();
-        for (id, name) in rows {
-            conn.execute(
-                "INSERT INTO threads (id, name) VALUES (?1, ?2)",
-                rusqlite::params![id, name],
-            )
-            .unwrap();
-        }
-    }
-
-    fn write_codex_session_index(root: &Path, rows: &[(&str, &str)]) {
-        let mut file = fs::File::create(root.join("session_index.jsonl")).unwrap();
-        for (id, thread_name) in rows {
-            let value = serde_json::json!({
-                "id": id,
-                "thread_name": thread_name,
-                "updated_at": "2026-08-28T00:00:00Z"
-            });
-            writeln!(file, "{value}").unwrap();
-        }
     }
 
     fn write_codex_event_only_rollout(sessions_dir: &Path, session_uuid: &str) -> PathBuf {
@@ -1510,7 +1099,7 @@ mod tests {
                 "status": "completed",
                 "call_id": "call_patch",
                 "name": "apply_patch",
-                "input": "*** Begin Patch\n*** End Patch"
+                "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** Add File: docs/new.md\n*** End Patch"
             }
         });
         let custom_result = serde_json::json!({
@@ -1531,19 +1120,24 @@ mod tests {
 
         let raw = parse_codex_session(&path).unwrap().unwrap();
 
-        assert_eq!(raw.events.len(), 4);
+        assert_eq!(raw.events.len(), 5);
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].name.as_deref(), Some("exec_command"));
         assert_eq!(raw.events[0].target.as_deref(), Some("sed -n '1,220p' CLAUDE.md"));
         assert_eq!(raw.events[0].source_event_id.as_deref(), Some("call_123"));
         assert_eq!(raw.events[1].kind, "tool_result");
         assert_eq!(raw.events[1].source_event_id.as_deref(), Some("call_123"));
-        assert_eq!(raw.events[2].kind, "tool_call");
+        assert_eq!(raw.events[2].kind, "file_write");
         assert_eq!(raw.events[2].name.as_deref(), Some("apply_patch"));
         assert_eq!(raw.events[2].status.as_deref(), Some("completed"));
+        assert_eq!(raw.events[2].target.as_deref(), Some("src/lib.rs"));
         assert_eq!(raw.events[2].source_event_id.as_deref(), Some("call_patch"));
-        assert_eq!(raw.events[3].kind, "tool_result");
-        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("call_patch"));
+        assert_eq!(raw.events[3].kind, "file_write");
+        assert_eq!(raw.events[3].name.as_deref(), Some("apply_patch"));
+        assert_eq!(raw.events[3].target.as_deref(), Some("docs/new.md"));
+        assert_eq!(raw.events[3].event_seq, 3);
+        assert_eq!(raw.events[4].kind, "tool_result");
+        assert_eq!(raw.events[4].source_event_id.as_deref(), Some("call_patch"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2191,111 +1785,6 @@ mod tests {
         let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_refreshes_codex_thread_name_when_rollout_is_unchanged() {
-        let root = temp_codex_root("thread-name-refresh");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let path = write_codex_rollout(&sessions_dir, uuid, "original first prompt");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        write_codex_state_db(&root, &[(uuid, Some("  Renamed in Codex  "))]);
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "codex",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
-
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 1);
-
-        let stored = store.list_recent_sessions(1).unwrap().pop().unwrap();
-        assert_eq!(stored.custom_title.as_deref(), Some("Renamed in Codex"));
-        assert_eq!(stored.title, "Renamed in Codex");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_for_sync_refreshes_session_index_name_when_rollout_is_unchanged() {
-        let root = temp_codex_root("session-index-refresh");
-        let sessions_dir = root.join("sessions");
-        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let path = write_codex_rollout(&sessions_dir, uuid, "original first prompt");
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        write_codex_state_db(&root, &[(uuid, None)]);
-        write_codex_session_index(&root, &[(uuid, "Native index title")]);
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "codex",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
-
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 1);
-
-        let stored = store.list_recent_sessions(1).unwrap().pop().unwrap();
-        assert_eq!(stored.custom_title.as_deref(), Some("Native index title"));
-        assert_eq!(stored.title, "Native index title");
 
         let _ = fs::remove_dir_all(&root);
     }

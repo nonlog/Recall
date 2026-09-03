@@ -59,7 +59,6 @@ pub(super) fn render_search_box(f: &mut Frame, app: &App, area: Rect) {
 pub(super) fn render_filters(f: &mut Frame, app: &App, area: Rect) {
     let source_label = app.source_filter_label();
     let project_label = truncate_label(&app.project_filter_label(), 20);
-    let topology_label = app.topology_filter_label();
     let time_label = app.time_filter_label();
     let sort_label = app.sort_label();
 
@@ -72,11 +71,6 @@ pub(super) fn render_filters(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("  P:", Style::default().fg(THEME.text_muted)),
         Span::styled(
             format!("[{project_label}]"),
-            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  R:", Style::default().fg(THEME.text_muted)),
-        Span::styled(
-            format!("[{topology_label}]"),
             Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  T:", Style::default().fg(THEME.text_muted)),
@@ -109,7 +103,7 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
     let area = f.area();
     let width = area.width.min(68);
     let available_height = area.height.saturating_sub(2);
-    let height = if available_height == 0 { 1 } else { available_height.min(10) };
+    let height = if available_height == 0 { 1 } else { available_height.min(9) };
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -131,12 +125,6 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
         &app.draft_project_filter_label(),
         "Enter",
         app.filter_focus == FilterFocus::Project,
-    ));
-    lines.push(filter_overview_line(
-        "Thread Role",
-        app.draft_topology_filter_label(),
-        "←/→",
-        app.filter_focus == FilterFocus::Topology,
     ));
     lines.push(filter_overview_line(
         "Time Range",

@@ -22,7 +22,7 @@ pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 2;
-const METADATA_PARSER_VERSION: u32 = 3;
+const METADATA_PARSER_VERSION: u32 = 1;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -77,17 +77,12 @@ impl SourceAdapter for ClaudeCodeAdapter {
         let result = scan_for_sync_impl(&claude_dir, store, since_ts, include_events)?;
         Ok(Some(result))
     }
-
-    fn prune(&self, store: &Store) -> anyhow::Result<()> {
-        prune_missing_claude_sessions(store)
-    }
 }
 
 struct SessionMeta {
     cwd: Option<String>,
     started_at: Option<i64>,
     entrypoint: Option<String>,
-    name: Option<String>,
 }
 
 #[derive(Default)]
@@ -114,7 +109,7 @@ fn scan_for_sync_impl(
     let mut entries = collect_project_entries(claude_dir, &mut indexes);
     entries.extend(collect_transcript_entries(claude_dir));
 
-    let result = file_scan::run_file_scan_with_options(
+    file_scan::run_file_scan_with_options(
         store,
         "claude-code",
         since_ts,
@@ -125,126 +120,47 @@ fn scan_for_sync_impl(
         },
         entries,
         |entry, mtime_ms| parse_claude_session_file(entry, mtime_ms, &indexes, include_events),
-    )?;
-
-    refresh_claude_titles_in_store(store, &indexes)?;
-    Ok(result)
-}
-
-fn prune_missing_claude_sessions(store: &Store) -> anyhow::Result<()> {
-    for session in store.session_paths_for_source("claude-code")? {
-        let Some(path) = session.source_file_path.as_deref() else {
-            continue;
-        };
-        if !Path::new(path).exists() {
-            store.delete_session_data("claude-code", &session.source_id)?;
-        }
-    }
-    Ok(())
+    )
 }
 
 fn load_session_index(claude_dir: &Path) -> HashMap<String, SessionMeta> {
     let sessions_dir = claude_dir.join("sessions");
     let mut index = HashMap::new();
-    merge_session_metadata_dir(&sessions_dir, &mut index);
-
-    // Claude Code 2.x stores the names shown by its job/session UI in
-    // ~/.claude/jobs/<short-id>/state.json. They are native session titles,
-    // including auto/derived names, and must win over Recall's prompt fallback.
-    let jobs_dir = claude_dir.join("jobs");
-    if let Ok(entries) = fs::read_dir(&jobs_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path().join("state.json");
-            merge_session_metadata_file(&path, &mut index);
-        }
+    if !sessions_dir.exists() {
+        return index;
     }
-    index
-}
 
-fn merge_session_metadata_dir(dir: &Path, index: &mut HashMap<String, SessionMeta>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(&sessions_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            debug!("cannot read ~/.claude/sessions: {e}");
+            return index;
+        }
     };
+
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            merge_session_metadata_file(&path, index);
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(session_id) = v.get("sessionId").and_then(|s| s.as_str()) {
+            let meta = SessionMeta {
+                cwd: v.get("cwd").and_then(|s| s.as_str()).map(|s| s.to_string()),
+                started_at: v.get("startedAt").and_then(|s| s.as_i64()),
+                entrypoint: v.get("entrypoint").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            };
+            index.insert(session_id.to_string(), meta);
         }
     }
-}
-
-fn merge_session_metadata_file(path: &Path, index: &mut HashMap<String, SessionMeta>) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&content) else {
-        return;
-    };
-    let Some(session_id) = v.get("sessionId").and_then(|s| s.as_str()) else {
-        return;
-    };
-    let meta = SessionMeta {
-        cwd: v.get("cwd").and_then(|s| s.as_str()).map(str::to_string),
-        started_at: v
-            .get("startedAt")
-            .and_then(|value| value.as_i64())
-            .or_else(|| v.get("createdAt").and_then(parse_claude_metadata_timestamp)),
-        entrypoint: v.get("entrypoint").and_then(|s| s.as_str()).map(str::to_string),
-        name: v
-            .get("name")
-            .and_then(|s| s.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-    };
     index
-        .entry(session_id.to_string())
-        .and_modify(|existing| {
-            if meta.cwd.is_some() {
-                existing.cwd.clone_from(&meta.cwd);
-            }
-            if meta.started_at.is_some() {
-                existing.started_at = meta.started_at;
-            }
-            if meta.entrypoint.is_some() {
-                existing.entrypoint.clone_from(&meta.entrypoint);
-            }
-            if meta.name.is_some() {
-                existing.name.clone_from(&meta.name);
-            }
-        })
-        .or_insert(meta);
-}
-
-fn parse_claude_metadata_timestamp(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
-        .or_else(|| rfc3339_ms(Some(value)))
-}
-
-fn indexed_claude_title(indexes: &SessionIndexes, source_id: &str) -> Option<String> {
-    indexes
-        .live
-        .get(source_id)
-        .and_then(|meta| meta.name.clone())
-        .or_else(|| indexes.project_summaries.get(source_id).cloned())
-}
-
-fn refresh_claude_titles_in_store(store: &Store, indexes: &SessionIndexes) -> anyhow::Result<()> {
-    for session in store.session_paths_for_source("claude-code")? {
-        if let Some(title) = indexed_claude_title(indexes, &session.source_id) {
-            store.update_session_fields(
-                "claude-code",
-                &session.source_id,
-                Some(&title),
-                None,
-                None,
-                None,
-            )?;
-        }
-    }
-    Ok(())
 }
 
 fn collect_project_entries(claude_dir: &Path, indexes: &mut SessionIndexes) -> Vec<FileScanEntry> {
@@ -400,7 +316,6 @@ fn parse_claude_session_file(
         (Some(first), Some(last)) if last >= first => Some(((last - first) / 60_000) as u32),
         _ => None,
     };
-    let indexed_title = indexed_claude_title(indexes, &entry.session_id);
     let summary =
         parsed.summary.or_else(|| indexes.project_summaries.get(&entry.session_id).cloned());
     let (thread_role, parent_links) =
@@ -417,7 +332,7 @@ fn parse_claude_session_file(
         events: parsed.events,
         event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
         source_file_path,
-        custom_title: parsed.custom_title.or(indexed_title),
+        custom_title: parsed.custom_title,
         summary,
         duration_minutes,
         thread_role,
@@ -501,9 +416,8 @@ pub(crate) fn parse_conversation_jsonl(
             _ => continue,
         }
 
-        let is_sidechain = v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false);
         let is_machinery = v.get("isCompactSummary").and_then(|b| b.as_bool()).unwrap_or(false)
-            || is_sidechain
+            || v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false)
             || v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false);
 
         let role = if msg_type == "user" { Role::User } else { Role::Assistant };
@@ -515,13 +429,6 @@ pub(crate) fn parse_conversation_jsonl(
 
         let text = extract_content(message.get("content"));
         let timestamp = rfc3339_ms(v.get("timestamp"));
-
-        if summary.is_none() && is_sidechain && role == Role::User && !text.is_empty() {
-            let title_hint = crate::utils::title_from_user_messages(&[text.as_str()]);
-            if title_hint != "Untitled" {
-                summary = Some(title_hint);
-            }
-        }
 
         let message_seq =
             if !is_machinery && !text.is_empty() { Some(messages.len() as u32) } else { None };
@@ -814,33 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn load_session_index_reads_native_job_name_even_when_auto_derived() {
-        let root = temp_claude_root("job-name");
-        let job = root.join("jobs").join("7afa8100");
-        fs::create_dir_all(&job).unwrap();
-        fs::write(
-            job.join("state.json"),
-            serde_json::json!({
-                "sessionId": "7afa8100-cd9c-459a-8609-fc1287f3c7b1",
-                "name": "Ditto 自启动项与重复启动",
-                "nameSource": "auto",
-                "cwd": "D:\\Workspace\\general",
-                "createdAt": "2026-08-24T01:00:00Z"
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let index = load_session_index(&root);
-        let meta = index.get("7afa8100-cd9c-459a-8609-fc1287f3c7b1").unwrap();
-        assert_eq!(meta.name.as_deref(), Some("Ditto 自启动项与重复启动"));
-        assert_eq!(meta.cwd.as_deref(), Some("D:\\Workspace\\general"));
-        assert!(meta.started_at.is_some());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn parse_claude_session_file_extracts_structured_tool_events() {
         let root = temp_claude_root("events");
         let project = root.join("projects").join("-tmp-foo");
@@ -1046,7 +926,6 @@ mod tests {
                     cwd: Some("/tmp/from-index".to_string()),
                     started_at: None,
                     entrypoint: None,
-                    name: None,
                 },
             )]),
             project_summaries: HashMap::new(),
@@ -1118,29 +997,6 @@ mod tests {
         assert_eq!(raw.summary.as_deref(), Some("First summary"));
         assert_eq!(raw.duration_minutes, Some(2));
 
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn sidechain_user_prompt_becomes_title_hint_without_indexing_sidechain_message() {
-        let root = temp_claude_root("sidechain-title");
-        let path = root.join("sidechain.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                r#"{"type":"user","isSidechain":true,"sessionId":"parent-session","timestamp":"2026-04-08T03:29:50.987Z","message":{"role":"user","content":"Investigate the notification synchronization regression"}}"#,
-                "\n"
-            ),
-        )
-        .unwrap();
-
-        let parsed = parse_conversation_jsonl(&path, 0, true).unwrap();
-
-        assert!(parsed.messages.is_empty());
-        assert_eq!(
-            parsed.summary.as_deref(),
-            Some("Investigate the notification synchronization regression")
-        );
         let _ = fs::remove_dir_all(&root);
     }
 
