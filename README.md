@@ -31,8 +31,24 @@ recall export --project all > recall-export.jsonl # export all sessions
 recall import recall-export.jsonl --dry-run  # preview an import
 recall session list  # list sessions for agents/scripts
 recall session share --id <session-id> --format json  # publish one selected session
+recall session delete --id <session-id> --dry-run  # preview safe session deletion
 recall info  # index stats and worker status
 ```
+
+### Delete sessions
+
+`recall session delete` removes one selected session from Recall and, when the source has a safe native deletion path, from the source agent as well.
+
+```bash
+recall session delete --id <session-id> --dry-run   # preview only
+recall session delete --id <session-id>             # safe default: keep a Recall trash backup
+recall session delete --id <session-id> --permanent # no Recall trash backup
+recall session delete --id <session-id> --index-only # leave source-agent data untouched
+```
+
+Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, OMP, Antigravity, Gemini, Grok, Copilot CLI, Cline, DeepSeek Harness, and Kimi Code use validated per-session files or directories. Shared-database sources without a stable native delete API require `--index-only`; Recall deliberately does not guess writes into their databases.
+
+On Windows, the default trash is the `trash` directory beside the installed `recall.exe`; the Scoop package persists that directory across upgrades. `RECALL_TRASH_DIR` can override the location. On other platforms Recall falls back to its data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
 
 With Skill use **Recall** is the best way.
 

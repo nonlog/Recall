@@ -19,6 +19,7 @@ pub(crate) mod repo_identity;
 pub(crate) mod semantic;
 pub(crate) mod session;
 pub(crate) mod session_action;
+pub(crate) mod session_delete;
 pub(crate) mod share;
 pub(crate) mod share_init;
 pub(crate) mod skill_audit;

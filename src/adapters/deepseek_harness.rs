@@ -134,7 +134,7 @@ fn collect_dsh_entries(sessions_dir: &Path) -> Vec<FileScanEntry> {
         .collect()
 }
 
-fn decode_dsh_session_id(encoded: &str) -> Option<String> {
+pub(crate) fn decode_dsh_session_id(encoded: &str) -> Option<String> {
     let bytes = encoded.as_bytes();
     let mut units = Vec::with_capacity(bytes.len());
     let mut index = 0;

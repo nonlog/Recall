@@ -131,6 +131,31 @@ pub(crate) enum SessionCommands {
         #[arg(long, value_enum, default_value_t = SessionActionFormat::Text)]
         format: SessionActionFormat,
     },
+    #[command(about = "Delete one indexed session")]
+    Delete {
+        #[arg(long, help = "Recall session id")]
+        id: Option<String>,
+        #[arg(long, help = "Source id or label")]
+        source: Option<String>,
+        #[arg(long, help = "Source-native session id")]
+        source_id: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "index_only",
+            help = "Permanently delete native session data instead of moving it to Recall trash"
+        )]
+        permanent: bool,
+        #[arg(
+            long,
+            conflicts_with = "permanent",
+            help = "Delete only the Recall index entry and leave native session data untouched"
+        )]
+        index_only: bool,
+        #[arg(long, help = "Show what would be deleted without changing anything")]
+        dry_run: bool,
+        #[arg(long, value_enum, default_value_t = SessionActionFormat::Text)]
+        format: SessionActionFormat,
+    },
     #[command(about = "Handoff one selected session to a new target agent session")]
     Handoff {
         #[arg(long, help = "Recall session id")]
@@ -293,6 +318,23 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
                 SessionAction::OpenApp,
             )
         }
+        SessionCommands::Delete {
+            id,
+            source,
+            source_id,
+            permanent,
+            index_only,
+            dry_run,
+            format,
+        } => cmd_session_delete(
+            id.as_deref(),
+            source.as_deref(),
+            source_id.as_deref(),
+            permanent,
+            index_only,
+            dry_run,
+            format,
+        ),
         SessionCommands::Handoff { id, source, source_id, to, print_prompt } => {
             cmd_session_handoff(
                 id.as_deref(),
@@ -659,6 +701,67 @@ fn cmd_session_command(
     }
 
     session_action::run(&command, session.directory.as_deref())
+}
+
+fn cmd_session_delete(
+    id: Option<&str>,
+    source_filter: Option<&str>,
+    source_id: Option<&str>,
+    permanent: bool,
+    index_only: bool,
+    dry_run: bool,
+    format: SessionActionFormat,
+) -> Result<()> {
+    let store = Store::open()?;
+    let sources = adapters::source_labels();
+    let session = resolve_session_ref(&store, &sources, id, source_filter, source_id)?;
+    let mode = if index_only {
+        crate::session_delete::DeleteMode::IndexOnly
+    } else if permanent {
+        crate::session_delete::DeleteMode::Permanent
+    } else {
+        crate::session_delete::DeleteMode::Trash
+    };
+    let plan = crate::session_delete::plan(&session, mode)?;
+    let result = crate::session_delete::execute(&store, &session, &plan, dry_run)?;
+
+    match format {
+        SessionActionFormat::Text => {
+            if dry_run {
+                println!(
+                    "Dry run: would delete session {} ({}/{}) using {} mode",
+                    session.id, session.source, session.source_id, result.mode
+                );
+            } else {
+                println!(
+                    "Deleted session {} ({}/{}) using {} mode",
+                    session.id, session.source, session.source_id, result.mode
+                );
+            }
+            for path in &result.native_paths {
+                println!("  native: {path}");
+            }
+            if let Some(trash_dir) = &result.trash_dir {
+                println!("  trash: {trash_dir}");
+            }
+            if result.mode == "index-only" {
+                println!(
+                    "  note: native session data was not changed and may be indexed again by a later sync"
+                );
+            }
+        }
+        SessionActionFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session": session_ref_json(&session),
+                    "delete": result,
+                    "dry_run": dry_run
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_session_handoff(

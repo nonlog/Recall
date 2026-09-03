@@ -49,6 +49,9 @@ pub(crate) trait SourceAdapter {
         Ok(())
     }
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
+    fn delete_command(&self, _source_id: &str) -> Option<ResumeCommand> {
+        None
+    }
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
         None
     }
@@ -215,6 +218,10 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
 
 pub(crate) fn resume_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
     all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.resume_command(source_id))
+}
+
+pub(crate) fn delete_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {
+    all_adapters().iter().find(|a| a.id() == source).and_then(|a| a.delete_command(source_id))
 }
 
 pub(crate) fn app_command_for(source: &str, source_id: &str) -> Option<ResumeCommand> {

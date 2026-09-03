@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::handoff;
+use crate::session_delete::DeleteMode;
 use crate::tui::app::App;
 use crate::tui::search_state::{PanelFocus, ProjectPickerRow, SourcePickerRow};
 use crate::tui::share_state::PendingCommandAction;
@@ -390,8 +391,11 @@ pub(super) fn render_export_input(f: &mut Frame, app: &App) {
 
 pub(super) fn render_settings(f: &mut Frame, app: &App) {
     let area = f.area();
-    let width = area.width.min(70);
-    let height = (app.all_sources.len() as u16 + 7).min(area.height.saturating_sub(2).max(7));
+    let width = area.width.min(118);
+    let shortcut_rows = shortcut_reference_lines().len() as u16 + 2;
+    let source_rows = app.all_sources.len().div_ceil(2) as u16 + 4;
+    let desired_height = shortcut_rows.max(source_rows) + 2;
+    let height = desired_height.min(area.height.saturating_sub(2).max(7));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -401,30 +405,114 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.accent))
         .style(Style::default().bg(THEME.popup_bg));
+    let inner = block.inner(popup);
 
-    let mut lines = Vec::new();
-    let selected_style = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
-    let normal_style = Style::default().fg(THEME.text);
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
 
-    lines.push(Line::from(vec![
-        Span::styled(" Time Scope: ", Style::default().fg(THEME.text_muted)),
-        Span::styled(
-            app.config.sync_window.label(),
-            if app.settings_selected == 0 { selected_style } else { normal_style },
-        ),
-    ]));
-    lines.push(Line::from(""));
-
-    for (index, (source_id, label)) in app.all_sources.iter().enumerate() {
-        let enabled = app.config.is_source_enabled(source_id);
-        let prefix = if enabled { "[x]" } else { "[ ]" };
-        let style = if app.settings_selected == index + 1 { selected_style } else { normal_style };
-        lines.push(Line::from(Span::styled(format!(" {prefix} {label} ({source_id})"), style)));
+    if inner.width < 4 || inner.height == 0 {
+        return;
     }
 
-    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
-    f.render_widget(Clear, popup);
-    f.render_widget(widget, popup);
+    let left_width = if inner.width >= 90 {
+        (inner.width * 32 / 100).max(36)
+    } else {
+        (inner.width / 2).max(28)
+    }
+    .min(inner.width.saturating_sub(1));
+    let right_width = inner.width.saturating_sub(left_width + 1);
+    let left = Rect::new(inner.x, inner.y, left_width, inner.height);
+    let right = Rect::new(inner.x + left_width + 1, inner.y, right_width, inner.height);
+
+    let selected_style = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
+    let normal_style = Style::default().fg(THEME.text);
+    let mut settings = vec![
+        Line::from(vec![
+            Span::styled(" Time Scope: ", Style::default().fg(THEME.text_muted)),
+            Span::styled(
+                app.config.sync_window.label(),
+                if app.settings_selected == 0 { selected_style } else { normal_style },
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let count = app.all_sources.len();
+    let rows = count.div_ceil(2);
+    let cell_width = (left_width as usize).saturating_sub(2).max(2) / 2;
+    for row in 0..rows {
+        let mut spans = Vec::new();
+        for index in [row, row + rows] {
+            if let Some((source_id, label)) = app.all_sources.get(index) {
+                let enabled = app.config.is_source_enabled(source_id);
+                let prefix = if enabled { "[x]" } else { "[ ]" };
+                let raw = format!(" {prefix} {label} ({source_id})");
+                let text = truncate_to_width(&raw, cell_width.saturating_sub(1));
+                let padding = cell_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+                let style =
+                    if app.settings_selected == index + 1 { selected_style } else { normal_style };
+                spans.push(Span::styled(text, style));
+                spans.push(Span::raw(" ".repeat(padding)));
+            } else {
+                spans.push(Span::raw(" ".repeat(cell_width)));
+            }
+        }
+        settings.push(Line::from(spans));
+    }
+
+    f.render_widget(Paragraph::new(settings).wrap(Wrap { trim: false }), left);
+
+    if right.width > 0 {
+        let mut shortcuts = vec![Line::from(Span::styled(
+            " Shortcuts",
+            Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+        ))];
+        shortcuts.extend(shortcut_reference_lines());
+        f.render_widget(Paragraph::new(shortcuts), right);
+    }
+}
+
+fn shortcut_reference_lines() -> Vec<Line<'static>> {
+    vec![
+        shortcut_line("Global", "Ctrl+C quit (except while deleting)"),
+        shortcut_line("Search", "↑/↓ move · PgUp/PgDn page · ←/→ cursor/preview"),
+        shortcut_line("", "Backspace edit · Enter detail · Tab/Ctrl+F filters"),
+        shortcut_line("", "Ctrl+R resume · Ctrl+O app · Ctrl+S settings"),
+        shortcut_line("", "Ins/Ctrl+Space/Space select · Del trash · Ctrl+D purge"),
+        shortcut_line("", "Esc clear/back/quit · q quit(empty query)"),
+        shortcut_line("Preview", "↑/↓/PgUp/PgDn · ← sessions · Enter detail · Esc back"),
+        shortcut_line("Viewer", "↑/↓/j/k/PgUp/PgDn · Home/g first · End/G last"),
+        shortcut_line("", "a subagents · c copy · e export · s share · v preview"),
+        shortcut_line("", "h handoff · / find · n/N match · Ctrl+R resume · Ctrl+O app"),
+        shortcut_line("", "Del trash · Ctrl+D purge · Esc/q back"),
+        shortcut_line("Usage", "m mode · t time · s source · r reset · Enter open · j/k · Esc/q"),
+        shortcut_line(
+            "Filters",
+            "↑/↓ · ←/→ · Enter/Space edit · c clear · d/w/m/l time · r/n sort",
+        ),
+        shortcut_line(
+            "Pickers",
+            "/ filter · Space toggle · Enter apply · Ctrl+A all · Ctrl+U clear",
+        ),
+        shortcut_line("", "↑/↓ · Backspace/←/→/Home/End edit · Esc back"),
+        shortcut_line("Settings", "↑/↓ · ←/→/Enter/Space change · Esc/q close"),
+        shortcut_line("Sub/Handoff", "↑/↓/j/k · Enter/Space open/choose · Esc/q close"),
+        shortcut_line(
+            "Confirm/Share",
+            "Y/Enter confirm · N/Esc cancel · O open · C copy · q close",
+        ),
+        shortcut_line(
+            "Export/Find",
+            "type · Backspace · ←/→ · Home/End(find) · Enter apply/save · Esc",
+        ),
+    ]
+}
+
+fn shortcut_line(label: &'static str, text: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label:<10}"), Style::default().fg(THEME.accent)),
+        Span::styled(text, Style::default().fg(THEME.text_muted)),
+    ])
 }
 
 pub(super) fn render_share_result(f: &mut Frame, app: &App) {
@@ -575,6 +663,116 @@ pub(super) fn render_confirm_resume(f: &mut Frame, app: &App) {
             Span::styled("cancel", Style::default().fg(THEME.text)),
         ]),
     ];
+
+    let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(widget, popup);
+}
+
+pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
+    let Some(pending) = app.pending_delete.as_ref() else {
+        return;
+    };
+
+    let area = f.area();
+    let width = area.width.clamp(52, 88);
+    let mut source_counts = std::collections::BTreeMap::<String, usize>::new();
+    for session in &pending.sessions {
+        *source_counts.entry(session.source.clone()).or_default() += 1;
+    }
+    let source_rows = source_counts.len().min(4) as u16;
+    let height = (10 + source_rows).min(area.height.saturating_sub(2).max(10));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let (mode_label, mode_note, mode_color) = match pending.mode {
+        DeleteMode::Trash => (
+            "Move to trash",
+            "Native data is moved/backed up when supported; unsupported sources require explicit index-only deletion.",
+            THEME.success,
+        ),
+        DeleteMode::Permanent => (
+            "Permanent delete",
+            "Native session data is deleted without a recovery copy when supported.",
+            THEME.error,
+        ),
+        DeleteMode::IndexOnly => {
+            ("Recall only", "Only Recall index entries are removed.", THEME.info)
+        }
+    };
+    let deleting = app.delete_rx.is_some();
+    let block = Block::default()
+        .title(if pending.sessions.len() == 1 {
+            " Confirm delete session "
+        } else {
+            " Confirm bulk delete "
+        })
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(mode_color))
+        .style(Style::default().bg(THEME.popup_bg));
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Sessions: ", Style::default().fg(THEME.text_muted)),
+            Span::styled(
+                pending.sessions.len().to_string(),
+                Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" Action:   ", Style::default().fg(THEME.text_muted)),
+            Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw("           "),
+            Span::styled(
+                truncate_to_width(mode_note, width.saturating_sub(14) as usize),
+                Style::default().fg(THEME.text_muted),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    for (source, count) in source_counts.iter().take(4) {
+        let brand = crate::tui::source_brand::source_brand(source);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{} {}", brand.mark, app.source_label_for(source)),
+                Style::default().fg(brand.color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  ×{count}"), Style::default().fg(THEME.text_muted)),
+        ]));
+    }
+    if source_counts.len() > 4 {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more sources", source_counts.len() - 4),
+            Style::default().fg(THEME.text_muted),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    if deleting {
+        lines.push(Line::from(Span::styled(
+            "  Deleting...",
+            Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  [Y/Enter] ",
+                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("confirm   ", Style::default().fg(THEME.text)),
+            Span::styled(
+                "[N/Esc] ",
+                Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("cancel", Style::default().fg(THEME.text)),
+        ]));
+    }
 
     let widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(Clear, popup);

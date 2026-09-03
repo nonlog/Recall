@@ -38,6 +38,14 @@ impl SourceAdapter for CodexAdapter {
         })
     }
 
+    fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(codex_delete_command(vec![
+            "delete".to_string(),
+            "--force".to_string(),
+            source_id.to_string(),
+        ]))
+    }
+
     fn app_command(&self, source_id: &str) -> Option<ResumeCommand> {
         Some(open_url_command(codex_thread_url(source_id)))
     }
@@ -81,6 +89,18 @@ impl SourceAdapter for CodexAdapter {
 
 fn codex_thread_url(source_id: &str) -> String {
     format!("codex://threads/{source_id}")
+}
+
+#[cfg(target_os = "windows")]
+fn codex_delete_command(args: Vec<String>) -> ResumeCommand {
+    let mut wrapped = vec!["/D".to_string(), "/C".to_string(), "codex".to_string()];
+    wrapped.extend(args);
+    ResumeCommand { program: "cmd.exe".to_string(), args: wrapped }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn codex_delete_command(args: Vec<String>) -> ResumeCommand {
+    ResumeCommand { program: "codex".to_string(), args }
 }
 
 #[cfg(target_os = "macos")]

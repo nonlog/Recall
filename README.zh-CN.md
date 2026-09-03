@@ -26,8 +26,24 @@ recall export > recall-export.jsonl # 导出全部会话
 recall import recall-export.jsonl --dry-run  # 预览导入
 recall session list  # 为 agent/脚本列出会话
 recall session share --id <session-id> --format json  # 发布选中的一个会话
+recall session delete --id <session-id> --dry-run  # 预览安全删除会话
 recall info  # 索引统计与 worker 状态
 ```
+
+### 删除会话
+
+`recall session delete` 会从 Recall 删除指定会话；当来源存在安全的原生删除方式时，也会同步删除对应 Agent 的原始会话。
+
+```bash
+recall session delete --id <session-id> --dry-run    # 仅预览
+recall session delete --id <session-id>              # 安全默认：保留 Recall 回收备份
+recall session delete --id <session-id> --permanent  # 不保留 Recall 回收备份
+recall session delete --id <session-id> --index-only # 保留原 Agent 数据，只删 Recall 索引
+```
+
+Codex 与 OpenCode 使用各自官方删除命令，从而保持它们自己的会话元数据一致。Claude Code、Pi、OMP、Antigravity、Gemini、Grok、Copilot CLI、Cline、DeepSeek Harness 与 Kimi Code 会使用经过验证的独立会话文件或目录。没有稳定原生删除 API 的共享数据库来源需要显式使用 `--index-only`；Recall 不会猜测性地修改这些数据库。
+
+Windows 下默认回收备份位于已安装 `recall.exe` 同目录的 `trash` 目录；Scoop 包会通过 persist 在升级间保留该目录。也可使用 `RECALL_TRASH_DIR` 覆盖位置。其他平台仍回退到 Recall 数据目录。对于带官方原生删除命令的来源，Recall 会先创建安全备份再调用原生命令；对于文件型来源，则把原始会话数据移动到回收目录。导入的会话始终只删除 Recall 索引。
 
 配合 Skill 使用时，**Recall** 是最佳方式。
 

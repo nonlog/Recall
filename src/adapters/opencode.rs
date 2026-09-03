@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
 use serde_json::Value;
 use tracing::debug;
 
@@ -73,6 +73,14 @@ impl SourceAdapter for OpenCodeAdapter {
         })
     }
 
+    fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(opencode_maintenance_command(vec![
+            "session".to_string(),
+            "delete".to_string(),
+            source_id.to_string(),
+        ]))
+    }
+
     fn usage_parser_version(&self) -> Option<u32> {
         Some(USAGE_PARSER_VERSION)
     }
@@ -96,6 +104,39 @@ impl SourceAdapter for OpenCodeAdapter {
 
         Ok(Some(scan_for_sync_conn(&conn, store, since_ts, self.id(), include_events)?))
     }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn opencode_cli_command(args: Vec<String>) -> ResumeCommand {
+    let mut wrapped = vec!["/D".to_string(), "/C".to_string(), "opencode".to_string()];
+    wrapped.extend(args);
+    ResumeCommand { program: "cmd.exe".to_string(), args: wrapped }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn opencode_cli_command(args: Vec<String>) -> ResumeCommand {
+    ResumeCommand { program: "opencode".to_string(), args }
+}
+
+pub(crate) fn opencode_maintenance_command(command_args: Vec<String>) -> ResumeCommand {
+    let mut args = vec!["--pure".to_string()];
+    args.extend(command_args);
+    opencode_cli_command(args)
+}
+
+pub(crate) fn native_session_exists(source_id: &str) -> anyhow::Result<Option<bool>> {
+    let Some(conn) = open_opencode_db()? else {
+        return Ok(None);
+    };
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM session WHERE id = ?1 LIMIT 1",
+            rusqlite::params![source_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(Some(exists))
 }
 
 fn open_opencode_db() -> anyhow::Result<Option<Connection>> {
