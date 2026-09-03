@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.8.1] (2026-09-03)
+
+### nonlog fork
+
+* Rebase the fork onto upstream Recall v0.5.8, including all upstream MCP, `rx`, and adapter additions.
+* Keep the fork's safe Trash/permanent/index-only session deletion and bulk TUI deletion.
+* Keep per-source TUI brand colors/icons while using the upstream `omp` adapter and source id.
+* Move Windows Trash beside the installed binary; Scoop persists `trash` across upgrades.
+* Restore the upstream bottom shortcut bar and show the complete shortcut reference in Ctrl+S Settings.
+
 
 ## [0.5.8](https://github.com/samzong/Recall/compare/v0.5.7...v0.5.8) (2026-09-01)
 
