@@ -1,14 +1,14 @@
 # Recall fork handoff
 
-Last updated: 2026-09-03
+Last updated: 2026-09-06
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.1`
-Release commit: `ac78cc5d8570e62c664cc260559d0839f4048a8e`
+Fork release: `v0.5.8.2` (preparing)
+Release commit: pending
 
 ## Current fork policy
 
-The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a fork-specific item is listed here. The old fork-specific Codex native-title patch, Primary/Subagents/All TUI filter, and custom `oh-my-pi` adapter were intentionally dropped.
+The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a fork-specific item is listed here. The old Primary/Subagents/All TUI filter and custom `oh-my-pi` adapter remain dropped. Codex native-title compatibility is retained because upstream does not consume Codex native title stores.
 
 Retained/requested fork behavior:
 
@@ -17,6 +17,10 @@ Retained/requested fork behavior:
 - Upstream `omp` adapter/source id is authoritative; deletion only adds safe path validation around its indexed session files.
 - Windows Trash defaults beside the installed `recall.exe`; Scoop persists the `trash` directory across upgrades. `RECALL_TRASH_DIR` remains an override.
 - Upstream bottom shortcut bar is preserved exactly. Ctrl+S Settings contains the full keyboard shortcut reference.
+- Codex native titles are read from `state_5.sqlite.threads.name` plus latest `session_index.jsonl` rename records; session-index names win when the state DB lags.
+- Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
+- Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
+- Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
 
 ## Release / validation
 

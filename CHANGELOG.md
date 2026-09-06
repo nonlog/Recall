@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.8.2] (2026-09-06)
+
+### nonlog fork
+
+* Restore Codex native thread titles from `state_5.sqlite` and the latest append-only `session_index.jsonl` rename, including unchanged indexed sessions.
+* Bound structured session-event summaries to 4096 characters and migrate oversized rows so tool-result mirrors no longer dominate `recall.db`.
+* Move the Windows default database to `data/recall.db` beside the installed binary; `RECALL_DB_PATH` remains an explicit override.
+* Expand Skill Audit discovery to shared, Pi, Gemini, and OpenCode skill roots, use robust Windows home discovery, and recognize Windows backslash Skill paths.
+
+
 ## [0.5.8.1] (2026-09-03)
 
 ### nonlog fork
