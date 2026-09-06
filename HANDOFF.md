@@ -3,8 +3,8 @@
 Last updated: 2026-09-06
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.3` (preparing)
-Release commit: pending
+Fork release: `v0.5.8.3`
+Release commit: `235a0e1f083dfc58a1a60dabc23a88272d1c09b3`
 
 ## Current fork policy
 
@@ -23,13 +23,18 @@ Retained/requested fork behavior:
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
 
-## v0.5.8.3 title compatibility
+## v0.5.8.3 closeout
 
 - Feature commit: `1d29883de0eb8c5d9f5aa72b39ef75a8164b5932` (`fix: restore Claude and Pi native titles`), Codex author+committer. PR #13 passed the required GitHub CI and was fast-forwarded to `main`; GitHub records the same feature SHA as the merge commit.
 - Claude Code now uses explicit `custom-title` when present, otherwise the latest `ai-title.aiTitle`; Pi uses the latest `session_info.name`. Both adapters bumped metadata parser version from 1 to 2 so unchanged sessions are backfilled.
 - LOG pre-fix diagnosis found 8/8 indexed Claude Code sessions with `ai-title` mismatched and 6/13 indexed Pi sessions with `session_info.name` mismatched.
 - `FORK_FEATURES.md` is now the authoritative retained-feature contract. Root `AGENTS.md` requires it and this handoff to be read before every upstream merge/rebase.
 - Local required gate passed: Recall core 651/651; extension/CLI suites passed; `rx` 141 passed / 1 ignored; audit, fmt, workspace Clippy `-D warnings`, and workspace tests all passed.
+- Release tag `v0.5.8.3` points to `235a0e1f083dfc58a1a60dabc23a88272d1c09b3`. Release workflow run `34038114920` passed check, Windows x86_64, Linux x86_64, macOS x86_64, macOS aarch64, and publication. Windows asset SHA256: `6862bc14723182d51d1e0896e65527eaa844899104793b6ae1bdf9f4346070fb`.
+- Scoop bucket commit `eb7f0e95f56d8426334ffd48f79547bea03b8139` publishes 0.5.8.3 and continues to persist both `trash` and `data`. LOG was upgraded to Scoop 0.5.8.3; internal `recall --version` remains upstream base `0.5.8`.
+- Installed LOG backfill validation: Claude Code native/generated title mismatches are 0/10 indexed sessions with `custom-title`/`ai-title`; Pi native/generated title mismatches are 0/15 indexed sessions with `session_info.name`. The reported Claude session now resolves to `cua-driver 连接 Claude Code 与 pi`; the reported Pi session resolves to `VS Code 多 Profile 快捷键配置是否同步`; the Showly Pi session resolves to `分析 Showly APK 并复用 Trakt API 凭据`.
+- Persisted DB remains `D:\Programs\Scoop\persist\recall\data\recall.db`; `quick_check=ok`; the legacy `%APPDATA%\recall\recall.db` remains absent after installed sync.
+- CodSpeed remains the same non-gating external authorization issue: the benchmark suite executes and measures successfully, then upload returns `401 Unauthorized` because `nonlog/Recall` is not authorized in CodSpeed.
 
 ## v0.5.8.2 closeout
 
