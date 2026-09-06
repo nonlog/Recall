@@ -22,7 +22,7 @@ pub(crate) struct ClaudeCodeAdapter;
 
 const USAGE_PARSER_VERSION: u32 = 5;
 const EVENT_PARSER_VERSION: u32 = 2;
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -366,6 +366,7 @@ pub(crate) fn parse_conversation_jsonl(
     let mut usage_index: HashMap<String, usize> = HashMap::new();
     let mut cwd: Option<String> = None;
     let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
@@ -397,6 +398,15 @@ pub(crate) fn parse_conversation_jsonl(
             let trimmed = title.trim();
             if !trimmed.is_empty() {
                 custom_title = Some(trimmed.to_string());
+            }
+            continue;
+        }
+        if msg_type == "ai-title"
+            && let Some(title) = v.get("aiTitle").and_then(|t| t.as_str())
+        {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                ai_title = Some(trimmed.to_string());
             }
             continue;
         }
@@ -486,7 +496,7 @@ pub(crate) fn parse_conversation_jsonl(
         usage_events,
         events,
         cwd,
-        custom_title,
+        custom_title: custom_title.or(ai_title),
         summary,
         first_ts,
         last_ts,
@@ -996,6 +1006,136 @@ mod tests {
         assert_eq!(raw.custom_title.as_deref(), Some("Final title"));
         assert_eq!(raw.summary.as_deref(), Some("First summary"));
         assert_eq!(raw.duration_minutes, Some(2));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_file_prefers_explicit_title_over_latest_ai_title() {
+        let root = temp_claude_root("ai-title");
+        let project = root.join("projects").join("-tmp-ai-title");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("ai-title-session.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": "real user prompt"},
+                "timestamp": "2026-04-13T10:00:00Z"
+            }),
+            serde_json::json!({
+                "type": "ai-title",
+                "aiTitle": "First generated title"
+            }),
+            serde_json::json!({
+                "type": "ai-title",
+                "aiTitle": "Final generated title"
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let indexes = SessionIndexes::default();
+        let entry = FileScanEntry {
+            session_id: "ai-title-session".to_string(),
+            stat_target: path.clone(),
+            directory: Some("/tmp/ai-title".to_string()),
+        };
+        let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
+        assert_eq!(raw.custom_title.as_deref(), Some("Final generated title"));
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type": "custom-title", "customTitle": "Manual title"})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type": "ai-title", "aiTitle": "Later generated title"})
+        )
+        .unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let entry = FileScanEntry {
+            session_id: "ai-title-session".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/ai-title".to_string()),
+        };
+        let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
+        assert_eq!(raw.custom_title.as_deref(), Some("Manual title"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_backfills_claude_ai_title_when_metadata_version_changes() {
+        let root = temp_claude_root("ai-title-backfill");
+        let project = root.join("projects").join("-tmp-ai-title");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("ai-title-backfill.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": "real user prompt"},
+                "timestamp": "2026-04-13T10:00:00Z"
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "ai-title",
+                "aiTitle": "cua-driver connect Claude Code and pi"
+            })
+        )
+        .unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session("ai-title-backfill", mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "claude-code",
+                "ai-title-backfill",
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_session_events_for_existing_session(
+                "claude-code",
+                "ai-title-backfill",
+                &[],
+                EVENT_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "claude-code",
+                "ai-title-backfill",
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION - 1),
+                },
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(
+            result.sessions[0].custom_title.as_deref(),
+            Some("cua-driver connect Claude Code and pi")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

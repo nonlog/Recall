@@ -16,6 +16,15 @@ at the root, the independent `rx` launcher under `crates/rx`, plus official
 extension crates under `extensions/`. Nothing is
 published to crates.io — these are application binaries, not library crates.
 
+## Fork preservation contract
+
+This repository is the `nonlog/Recall` fork. Before any upstream merge/rebase,
+read `FORK_FEATURES.md` and `HANDOFF.md`. `FORK_FEATURES.md` is the authoritative
+list of retained fork behavior. Do not drop a listed feature just because
+upstream lacks it or has refactored the surrounding code; either preserve the
+behavior additively or prove the upstream implementation is equivalent. Update
+the contract and handoff whenever a retained feature is deliberately changed.
+
 ## Commands
 
 ```bash

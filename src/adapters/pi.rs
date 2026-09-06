@@ -19,7 +19,7 @@ use crate::types::{ParentLink, ParentRelation, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) struct PiAdapter;
 
-const METADATA_PARSER_VERSION: u32 = 1;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 const USAGE_PARSER_VERSION: u32 = 1;
 
@@ -84,6 +84,7 @@ struct ParsedPiSession {
     messages: Vec<RawMessage>,
     usage_events: Vec<RawUsageEvent>,
     parent_session: Option<String>,
+    custom_title: Option<String>,
 }
 
 fn resolve_pi_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
@@ -306,7 +307,7 @@ fn parse_pi_session_file(
         events: Vec::new(),
         event_parser_version: None,
         source_file_path,
-        custom_title: None,
+        custom_title: parsed.custom_title,
         summary: None,
         duration_minutes: None,
         thread_role: Some(ThreadRole::Primary),
@@ -327,6 +328,7 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
     let mut current_model: Option<String> = None;
     let mut inherited_usage_cutoff = None;
     let mut parent_session = None;
+    let mut custom_title = None;
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
 
@@ -357,6 +359,16 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
                 {
                     inherited_usage_cutoff = header_timestamp;
                     parent_session = Some(parent.to_string());
+                }
+            }
+            "session_info" => {
+                if let Some(name) = entry
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    custom_title = Some(name.to_string());
                 }
             }
             "model_change" => {
@@ -417,7 +429,15 @@ fn parse_pi_session(path: &Path, fallback_timestamp: i64) -> anyhow::Result<Pars
         }
     }
 
-    Ok(ParsedPiSession { session_id, cwd, started_at, messages, usage_events, parent_session })
+    Ok(ParsedPiSession {
+        session_id,
+        cwd,
+        started_at,
+        messages,
+        usage_events,
+        parent_session,
+        custom_title,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -862,6 +882,124 @@ mod tests {
         assert_eq!(event.token_source, crate::types::TokenSource::Observed);
         assert_eq!(event.parser_version, USAGE_PARSER_VERSION);
         assert_eq!(event.source_path.as_deref(), Some(path.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_pi_session_file_uses_latest_session_info_name_as_title() {
+        let root = temp_pi_root("session-info-title");
+        let session_dir = root.join("--tmp-pi-project--");
+        let session_id = "019e5af2-5528-7d10-888a-b299c21d0e2e";
+        let path = write_pi_session(
+            &session_dir,
+            session_id,
+            &[
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": session_id,
+                    "timestamp": "1970-01-01T00:00:01.000Z",
+                    "cwd": "/tmp/pi-project"
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "id": "user1",
+                    "timestamp": "1970-01-01T00:00:02.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "real prompt",
+                        "timestamp": 2000
+                    }
+                }),
+                serde_json::json!({
+                    "type": "session_info",
+                    "id": "info1",
+                    "name": "First generated title"
+                }),
+                serde_json::json!({
+                    "type": "session_info",
+                    "id": "info2",
+                    "name": "Final generated title"
+                }),
+            ],
+        );
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let raw = parse_pi_session_file(
+            FileScanEntry {
+                session_id: session_id.to_string(),
+                stat_target: path,
+                directory: None,
+            },
+            mtime,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(raw.custom_title.as_deref(), Some("Final generated title"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_backfills_pi_session_info_title_when_metadata_version_changes() {
+        let root = temp_pi_root("session-info-backfill");
+        let session_dir = root.join("--tmp-pi-project--");
+        let session_id = "019e5af2-5528-7d10-888a-b299c21d0e2e";
+        let path = write_pi_session(
+            &session_dir,
+            session_id,
+            &[
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": session_id,
+                    "timestamp": "1970-01-01T00:00:01.000Z",
+                    "cwd": "/tmp/pi-project"
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "id": "user1",
+                    "timestamp": "1970-01-01T00:00:02.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "real prompt",
+                        "timestamp": 2000
+                    }
+                }),
+                serde_json::json!({
+                    "type": "session_info",
+                    "id": "info1",
+                    "name": "Pi native session title"
+                }),
+            ],
+        );
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let store = setup_store();
+        store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
+        store
+            .persist_usage_events_for_existing_session(
+                "pi",
+                session_id,
+                &[],
+                USAGE_PARSER_VERSION,
+                Some(mtime),
+            )
+            .unwrap();
+        store
+            .persist_topology_for_existing_session(
+                "pi",
+                session_id,
+                &crate::db::store::SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(METADATA_PARSER_VERSION - 1),
+                },
+            )
+            .unwrap();
+
+        let result = scan_for_sync_impl(&[session_dir], &store, None, true).unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("Pi native session title"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -8,7 +8,7 @@ Release commit: `0b9084472bb3a3b6bea505ce36418e84ef75f247`
 
 ## Current fork policy
 
-The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a fork-specific item is listed here. The old Primary/Subagents/All TUI filter and custom `oh-my-pi` adapter remain dropped. Codex native-title compatibility is retained because upstream does not consume Codex native title stores.
+The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a fork-specific item is listed here or in `FORK_FEATURES.md`. `FORK_FEATURES.md` is the mandatory preservation checklist for every upstream merge/rebase. The old Primary/Subagents/All TUI filter and custom `oh-my-pi` adapter remain dropped. Native-title compatibility is retained where upstream misses source-native title metadata.
 
 Retained/requested fork behavior:
 
@@ -18,6 +18,7 @@ Retained/requested fork behavior:
 - Windows Trash defaults beside the installed `recall.exe`; Scoop persists the `trash` directory across upgrades. `RECALL_TRASH_DIR` remains an override.
 - Upstream bottom shortcut bar is preserved exactly. Ctrl+S Settings contains the full keyboard shortcut reference.
 - Codex native titles are read from `state_5.sqlite.threads.name` plus latest `session_index.jsonl` rename records; session-index names win when the state DB lags.
+- Claude Code titles prefer explicit `custom-title`, otherwise latest `ai-title.aiTitle`; Pi titles use latest `session_info.name`. Metadata parser version bumps must backfill unchanged sessions when these rules change.
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
