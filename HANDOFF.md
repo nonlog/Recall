@@ -3,8 +3,8 @@
 Last updated: 2026-09-06
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.2` (preparing)
-Release commit: pending
+Fork release: `v0.5.8.2`
+Release commit: `0b9084472bb3a3b6bea505ce36418e84ef75f247`
 
 ## Current fork policy
 
@@ -21,6 +21,20 @@ Retained/requested fork behavior:
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
+
+## v0.5.8.2 closeout
+
+- Feature commit: `0a10a89bcd2da472e98a1482c1b8b1ff4cc7bb54` (`fix: compact index and restore native metadata`), Codex author+committer. PR #12 passed the required GitHub CI and was fast-forwarded to `main`; GitHub records the same feature SHA as the merge commit.
+- Local required gate: `make check` passed. Recall core was 647/647; extension/CLI suites passed; `rx` was 141 passed / 1 ignored. Audit, fmt, workspace Clippy `-D warnings`, and workspace tests all passed.
+- Release tag `v0.5.8.2` points to `0b9084472bb3a3b6bea505ce36418e84ef75f247`. Release workflow run `34035105043` passed check, Windows x86_64, Linux x86_64, macOS x86_64, macOS aarch64, and publication.
+- Windows release asset SHA256: `b48f6f7068b5f8e0d6c1c85c261375e16b3761185da2aa070e44cd8506d1bfda`.
+- Scoop bucket commit: `cdecf2f491a4daf5eeb8bc9c0ed499a5823831fc`; manifest version 0.5.8.2 persists both `trash` and `data`.
+- LOG is installed on Scoop 0.5.8.2 (`recall --version` remains upstream base `0.5.8`). `current/data` -> `D:\Programs\Scoop\persist\recall\data`; `current/trash` -> `D:\Programs\Scoop\persist\recall\trash`.
+- The legacy `%APPDATA%\recall\recall.db` was migrated and removed only after the persisted database passed integrity/count checks. Final persisted DB: 558,202,880 bytes (~532.34 MiB), down 74.15% from the 2,158,985,216-byte legacy DB. Final rows: 355 sessions, 61,192 messages, 81,227 usage events, 141,936 session events; schema v12; zero summaries over 4096 chars; `quick_check=ok`. `recall info` after removal did not recreate the legacy DB.
+- Installed Codex sync restored native titles without rollout reparsing. For 84 indexed sessions that also had a native title from `state_5.sqlite` / latest `session_index.jsonl`, mismatches were 0. The reported DTU session `01a055bf-e77a-7d01-8516-913eca321720` now resolves to `选择4G DTU开发工具 (2)`.
+- Installed Skill Audit reports 86 installed skills, 19 occasional and 67 dormant for the current default range. Windows-path normalization expanded real indexed skill activity from 385 old-path matches to 2,215 matches (+1,830 backslash-only events).
+- `recall usage --json --time 7d` still works after migration; the checked report contained 63 sessions / 4,318 usage events and 492,800,640 total tokens, confirming usage data survived the move.
+- CodSpeed remains a non-gating external integration issue: benchmarks execute successfully, then upload returns 401 because `nonlog/Recall` is not authorized in CodSpeed.
 
 ## Release / validation
 
