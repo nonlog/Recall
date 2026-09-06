@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -43,8 +43,11 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 10 {
         migrate_v10(conn)?;
     }
-    if version < SCHEMA_VERSION {
+    if version < 11 {
         migrate_v11(conn)?;
+    }
+    if version < SCHEMA_VERSION {
+        migrate_v12(conn)?;
     }
     Ok(())
 }
@@ -376,6 +379,25 @@ pub(crate) const fn current_schema_version() -> i64 {
     SCHEMA_VERSION
 }
 
+fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
+    let has_session_events: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_events'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_session_events {
+        conn.execute_batch(
+            "UPDATE session_events
+             SET summary = substr(summary, 1, 4096)
+             WHERE summary IS NOT NULL AND length(summary) > 4096;",
+        )?;
+    }
+    conn.execute_batch("PRAGMA user_version = 12;")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +621,49 @@ mod tests {
             [],
         );
         assert!(err.is_err(), "thread_role CHECK must reject values outside primary/subagent");
+    }
+
+    #[test]
+    fn migrate_v12_compacts_oversized_event_summaries() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'codex', 'c1', 'existing', 0);",
+        )
+        .unwrap();
+        let oversized = "x".repeat(8_192);
+        conn.execute(
+            "INSERT INTO session_events (
+                session_id, source, source_id, event_seq, kind, actor, summary, parser_version, created_at
+             ) VALUES ('s1', 'codex', 'c1', 1, 'tool_result', 'tool', ?1, 1, 1)",
+            rusqlite::params![oversized],
+        )
+        .unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), 11);
+        init(&conn).unwrap();
+
+        let length: i64 = conn
+            .query_row(
+                "SELECT length(summary) FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(length, 4096);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

@@ -15,8 +15,9 @@ impl Store {
                     e.name, e.target, e.attrs_json
              FROM session_events e
              JOIN sessions s ON s.id = e.session_id
-             WHERE (LOWER(e.name) IN ('skill', 'use_skill') OR e.target LIKE '%/skills/%/SKILL.md%'
-                    OR e.target LIKE '%/skills/%/references/%')",
+             WHERE (LOWER(e.name) IN ('skill', 'use_skill')
+                    OR REPLACE(e.target, char(92), '/') LIKE '%/skills/%/SKILL.md%'
+                    OR REPLACE(e.target, char(92), '/') LIKE '%/skills/%/references/%')",
         );
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();

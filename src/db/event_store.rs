@@ -7,6 +7,8 @@ use rusqlite::OptionalExtension;
 use super::store::{EventSessionStateMeta, Store};
 use crate::types::{RawSessionEvent, SessionEventRecord};
 
+const EVENT_SUMMARY_CHAR_CAP: usize = 4_096;
+
 impl Store {
     pub(crate) fn event_state_meta_map(
         &self,
@@ -122,6 +124,7 @@ pub(crate) fn replace_session_events(
          )",
     )?;
     for event in session_events {
+        let compact_summary = event.summary.as_deref().map(compact_event_summary);
         stmt.execute(rusqlite::params![
             session_id,
             source,
@@ -134,7 +137,7 @@ pub(crate) fn replace_session_events(
             event.status,
             event.target,
             event.message_seq,
-            event.summary,
+            compact_summary,
             event.source_path,
             event.source_event_id,
             event.attrs_json,
@@ -169,4 +172,28 @@ pub(crate) fn replace_session_events(
     }
 
     Ok(())
+}
+
+fn compact_event_summary(summary: &str) -> String {
+    let mut chars = summary.chars();
+    let compact: String = chars.by_ref().take(EVENT_SUMMARY_CHAR_CAP).collect();
+    if chars.next().is_some() { compact } else { summary.to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_summary_is_capped_on_unicode_boundaries() {
+        let summary = "界".repeat(EVENT_SUMMARY_CHAR_CAP + 8);
+        let compact = compact_event_summary(&summary);
+        assert_eq!(compact.chars().count(), EVENT_SUMMARY_CHAR_CAP);
+        assert!(compact.is_char_boundary(compact.len()));
+    }
+
+    #[test]
+    fn short_event_summary_is_preserved() {
+        assert_eq!(compact_event_summary("small result"), "small result");
+    }
 }

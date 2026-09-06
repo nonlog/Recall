@@ -102,10 +102,26 @@ pub(crate) struct SkillAuditEventRow {
 
 impl Store {
     pub(crate) fn default_db_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?
-            .join("recall");
-        Ok(data_dir.join("recall.db"))
+        if let Some(path) = std::env::var_os("RECALL_DB_PATH").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(path));
+        }
+
+        #[cfg(windows)]
+        {
+            let executable = std::env::current_exe()?;
+            let install_dir = executable
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine Recall install directory"))?;
+            return Ok(install_dir.join("data").join("recall.db"));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let data_dir = dirs::data_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?
+                .join("recall");
+            Ok(data_dir.join("recall.db"))
+        }
     }
 
     pub(crate) fn open() -> Result<Self> {

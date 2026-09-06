@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
@@ -22,6 +24,8 @@ pub(crate) struct CodexAdapter;
 const USAGE_PARSER_VERSION: u32 = 4;
 const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 1;
+
+type CodexNativeTitles = HashMap<String, String>;
 
 impl SourceAdapter for CodexAdapter {
     fn id(&self) -> &str {
@@ -58,6 +62,7 @@ impl SourceAdapter for CodexAdapter {
         let Some(codex_dir) = resolve_codex_dir()? else {
             return Ok(vec![]);
         };
+        let native_titles = load_codex_native_titles(&codex_dir);
         let sessions_dir = codex_dir.join("sessions");
         let archived_dir = codex_dir.join("archived_sessions");
 
@@ -66,7 +71,8 @@ impl SourceAdapter for CodexAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(raw) = parse_codex_session_for_entry(entry, mtime_ms, true)? {
+            if let Some(mut raw) = parse_codex_session_for_entry(entry, mtime_ms, true)? {
+                apply_codex_native_title(&mut raw, &native_titles);
                 sessions.push(raw);
             }
         }
@@ -131,10 +137,11 @@ fn scan_for_sync_impl(
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
+    let native_titles = load_codex_native_titles(codex_dir);
     let sessions_dir = codex_dir.join("sessions");
     let archived_dir = codex_dir.join("archived_sessions");
     let entries = collect_codex_entries(&[&sessions_dir, &archived_dir]);
-    file_scan::run_file_scan_with_options(
+    let mut result = file_scan::run_file_scan_with_options(
         store,
         "codex",
         since_ts,
@@ -145,16 +152,142 @@ fn scan_for_sync_impl(
         },
         entries,
         |entry, mtime_ms| {
-            let Some(session) = parse_codex_session_for_entry(entry, mtime_ms, include_events)?
+            let Some(mut session) = parse_codex_session_for_entry(entry, mtime_ms, include_events)?
             else {
                 return Ok(None);
             };
+            apply_codex_native_title(&mut session, &native_titles);
             if !include_events && session.messages.is_empty() && session.usage_events.is_empty() {
                 return Ok(None);
             }
             Ok(Some(session))
         },
-    )
+    )?;
+
+    // Codex persists native thread names outside rollout JSONL mtimes. Refresh
+    // indexed sessions directly so renames and generated native titles appear
+    // without forcing an expensive transcript reparse.
+    refresh_codex_native_titles_in_store(store, &native_titles)?;
+    for session in &mut result.sessions {
+        apply_codex_native_title(session, &native_titles);
+    }
+    Ok(result)
+}
+
+fn load_codex_native_titles(codex_dir: &Path) -> CodexNativeTitles {
+    let mut titles = CodexNativeTitles::new();
+    let db_path = codex_dir.join("state_5.sqlite");
+    if db_path.is_file() {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        match Connection::open_with_flags(&db_path, flags) {
+            Ok(conn) => match read_codex_state_names(&conn) {
+                Ok(state_titles) => titles.extend(state_titles),
+                Err(error) => {
+                    debug!("failed to read Codex native names from {}: {error}", db_path.display())
+                }
+            },
+            Err(error) => debug!(
+                "failed to open Codex state database {} read-only: {error}",
+                db_path.display()
+            ),
+        }
+    }
+
+    let index_path = codex_dir.join("session_index.jsonl");
+    if let Ok(file) = fs::File::open(&index_path) {
+        for row in jsonl_indexed(BufReader::new(file).lines()) {
+            let (_, value) = match row {
+                Ok(row) => row,
+                Err(error) => {
+                    debug!("failed to read Codex session index {}: {error}", index_path.display());
+                    break;
+                }
+            };
+            let Some(source_id) = value.get("id").and_then(Value::as_str).map(str::trim) else {
+                continue;
+            };
+            let Some(title) = value
+                .get("thread_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+            else {
+                continue;
+            };
+            if source_id.is_empty() {
+                continue;
+            }
+            // session_index.jsonl is append-only; later rename records win.
+            titles.insert(source_id.to_string(), title.to_string());
+        }
+    }
+    titles
+}
+
+fn read_codex_state_names(conn: &Connection) -> anyhow::Result<CodexNativeTitles> {
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(CodexNativeTitles::new());
+    }
+
+    let mut has_id = false;
+    let mut has_name = false;
+    let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        match column?.as_str() {
+            "id" => has_id = true,
+            "name" => has_name = true,
+            _ => {}
+        }
+    }
+    if !has_id || !has_name {
+        return Ok(CodexNativeTitles::new());
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT id, name FROM threads WHERE name IS NOT NULL AND trim(name) <> ''")?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut titles = CodexNativeTitles::new();
+    for row in rows {
+        let (source_id, title) = row?;
+        let source_id = source_id.trim();
+        let title = title.trim();
+        if !source_id.is_empty() && !title.is_empty() {
+            titles.insert(source_id.to_string(), title.to_string());
+        }
+    }
+    Ok(titles)
+}
+
+fn apply_codex_native_title(session: &mut RawSession, titles: &CodexNativeTitles) {
+    if let Some(title) = titles.get(&session.source_id) {
+        session.custom_title = Some(title.clone());
+    }
+}
+
+fn refresh_codex_native_titles_in_store(
+    store: &Store,
+    titles: &CodexNativeTitles,
+) -> anyhow::Result<()> {
+    for session in store.session_paths_for_source("codex")? {
+        if let Some(title) = titles.get(&session.source_id) {
+            store.update_session_fields(
+                "codex",
+                &session.source_id,
+                Some(title),
+                None,
+                None,
+                None,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
@@ -996,6 +1129,66 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn write_codex_state_names(root: &Path, rows: &[(&str, Option<&str>)]) {
+        let conn = Connection::open(root.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);").unwrap();
+        for (id, name) in rows {
+            conn.execute(
+                "INSERT INTO threads (id, name) VALUES (?1, ?2)",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_codex_session_index(root: &Path, rows: &[(&str, &str)]) {
+        let mut file = fs::File::create(root.join("session_index.jsonl")).unwrap();
+        for (id, thread_name) in rows {
+            let value = serde_json::json!({
+                "id": id,
+                "thread_name": thread_name,
+                "updated_at": "2026-09-06T00:00:00Z"
+            });
+            writeln!(file, "{value}").unwrap();
+        }
+    }
+
+    #[test]
+    fn native_titles_merge_state_and_latest_session_index_name() {
+        let root = temp_codex_root("native-titles");
+        let state_only = "019a4c01-e8f4-7270-bdab-7f19273b237e";
+        let renamed = "01a055bf-e77a-7d01-8516-913eca321720";
+        write_codex_state_names(
+            &root,
+            &[(state_only, Some("State title")), (renamed, Some("Old state title"))],
+        );
+        write_codex_session_index(
+            &root,
+            &[(renamed, "选择4G DTU开发工具"), (renamed, "选择4G DTU开发工具 (2)")],
+        );
+
+        let titles = load_codex_native_titles(&root);
+        assert_eq!(titles.get(state_only).map(String::as_str), Some("State title"));
+        assert_eq!(titles.get(renamed).map(String::as_str), Some("选择4G DTU开发工具 (2)"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_native_titles_updates_existing_untitled_session() {
+        let source_id = "01a055bf-e77a-7d01-8516-913eca321720";
+        let store = setup_store();
+        let mut session = make_existing_session(source_id, 1, 1);
+        session.title = "Untitled".to_string();
+        store.insert_session(&session).unwrap();
+
+        let titles = HashMap::from([(source_id.to_string(), "选择4G DTU开发工具 (2)".to_string())]);
+        refresh_codex_native_titles_in_store(&store, &titles).unwrap();
+
+        let stored = store.list_recent_sessions(1).unwrap().pop().unwrap();
+        assert_eq!(stored.title, "选择4G DTU开发工具 (2)");
+        assert_eq!(stored.custom_title.as_deref(), Some("选择4G DTU开发工具 (2)"));
     }
 
     fn write_codex_rollout(sessions_dir: &Path, session_uuid: &str, text: &str) -> PathBuf {

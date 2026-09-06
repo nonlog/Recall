@@ -189,14 +189,26 @@ pub(crate) fn scan_installed_skills() -> Vec<InstalledSkill> {
 }
 
 fn personal_skill_roots(home: &Path) -> Vec<PathBuf> {
-    [home.join(".claude/skills"), home.join(".codex/skills"), home.join(".agents/skills")]
-        .into_iter()
-        .filter(|path| path.is_dir())
-        .collect()
+    [
+        home.join(".agents/skills"),
+        home.join(".claude/skills"),
+        home.join(".codex/skills"),
+        home.join(".pi/agent/skills"),
+        home.join(".gemini/skills"),
+        home.join(".config/opencode/skills"),
+        home.join(".opencode/skills"),
+    ]
+    .into_iter()
+    .filter(|path| path.is_dir())
+    .collect()
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    dirs::home_dir()
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()).map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()).map(PathBuf::from)
+        })
 }
 
 fn shorten_home_path(path: &Path) -> String {
@@ -241,9 +253,10 @@ fn skill_from_attrs(attrs_json: Option<&str>) -> Option<String> {
 }
 
 fn skill_id_from_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
     let marker = "/skills/";
-    let idx = path.find(marker)?;
-    let rest = &path[idx + marker.len()..];
+    let idx = normalized.find(marker)?;
+    let rest = &normalized[idx + marker.len()..];
     let mut parts = rest.split('/');
     let skill_id = trim_path_token(parts.next()?);
     if skill_id.is_empty() {
@@ -335,9 +348,29 @@ mod tests {
     }
 
     #[test]
+    fn personal_skill_roots_include_shared_and_harness_locations() {
+        let root = tempfile::tempdir().unwrap();
+        for relative in [".agents/skills", ".pi/agent/skills", ".gemini/skills"] {
+            std::fs::create_dir_all(root.path().join(relative)).unwrap();
+        }
+        let roots = personal_skill_roots(root.path());
+        assert_eq!(roots[0], root.path().join(".agents/skills"));
+        assert!(roots.contains(&root.path().join(".pi/agent/skills")));
+        assert!(roots.contains(&root.path().join(".gemini/skills")));
+    }
+
+    #[test]
     fn skill_id_from_path_reads_parent_skill_md() {
         assert_eq!(
             skill_id_from_path("/Users/x/.agents/skills/pre-ship/SKILL.md").as_deref(),
+            Some("pre-ship")
+        );
+    }
+
+    #[test]
+    fn skill_id_from_windows_path_reads_skill_md() {
+        assert_eq!(
+            skill_id_from_path(r#"C:\Users\www\.agents\skills\pre-ship\SKILL.md"#).as_deref(),
             Some("pre-ship")
         );
     }
@@ -474,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn list_skill_audit_events_includes_command_wrapped_skill_md_reads() {
+    fn list_skill_audit_events_includes_windows_command_wrapped_skill_md_reads() {
         use crate::db::schema;
         use crate::db::search::TimeRange;
         use crate::db::store::Store;
@@ -509,9 +542,7 @@ mod tests {
             actor: "assistant".to_string(),
             name: Some("bash".to_string()),
             status: None,
-            target: Some(
-                r#"cat "/Users/x/.agents/skills/pre-ship/SKILL.md" && echo ok"#.to_string(),
-            ),
+            target: Some(r#"type "C:\Users\www\.agents\skills\pre-ship\SKILL.md""#.to_string()),
             message_seq: None,
             summary: None,
             source_path: None,
