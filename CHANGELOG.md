@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.8.3] (2026-09-06)
+
+### nonlog fork
+
+* Restore Claude Code generated titles from the latest `ai-title.aiTitle`, while preserving explicit `custom-title` precedence.
+* Restore Pi generated/native titles from the latest `session_info.name`.
+* Bump adapter metadata parser versions so unchanged indexed sessions backfill the restored titles.
+* Add `FORK_FEATURES.md` and repository-agent guardrails so retained fork behavior is explicitly audited during future upstream merges.
+
+
 ## [0.5.8.2] (2026-09-06)
 
 ### nonlog fork

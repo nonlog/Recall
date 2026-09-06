@@ -3,8 +3,8 @@
 Last updated: 2026-09-06
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.2`
-Release commit: `0b9084472bb3a3b6bea505ce36418e84ef75f247`
+Fork release: `v0.5.8.3` (preparing)
+Release commit: pending
 
 ## Current fork policy
 
@@ -22,6 +22,14 @@ Retained/requested fork behavior:
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
+
+## v0.5.8.3 title compatibility
+
+- Feature commit: `1d29883de0eb8c5d9f5aa72b39ef75a8164b5932` (`fix: restore Claude and Pi native titles`), Codex author+committer. PR #13 passed the required GitHub CI and was fast-forwarded to `main`; GitHub records the same feature SHA as the merge commit.
+- Claude Code now uses explicit `custom-title` when present, otherwise the latest `ai-title.aiTitle`; Pi uses the latest `session_info.name`. Both adapters bumped metadata parser version from 1 to 2 so unchanged sessions are backfilled.
+- LOG pre-fix diagnosis found 8/8 indexed Claude Code sessions with `ai-title` mismatched and 6/13 indexed Pi sessions with `session_info.name` mismatched.
+- `FORK_FEATURES.md` is now the authoritative retained-feature contract. Root `AGENTS.md` requires it and this handoff to be read before every upstream merge/rebase.
+- Local required gate passed: Recall core 651/651; extension/CLI suites passed; `rx` 141 passed / 1 ignored; audit, fmt, workspace Clippy `-D warnings`, and workspace tests all passed.
 
 ## v0.5.8.2 closeout
 
