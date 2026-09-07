@@ -3,8 +3,8 @@
 Last updated: 2026-09-07
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.4` (preparing)
-Release commit: pending
+Fork release: `v0.5.8.4`
+Release commit: `ceca382367ba1e8b44fb17aa83d23f3c8b205363`
 
 ## Current fork policy
 
@@ -29,7 +29,11 @@ Retained/requested fork behavior:
 - Installed v0.5.8.3 pre-fix audit checked all 22 indexed Pi sessions: all 17 with an existing indexed JSONL generated valid Trash plans; the 5 failures all referenced missing files, and none of those five source ids exists anywhere under the current Pi session root.
 - Native-aware deletion now stages Recall-side cleanup under `BEGIN IMMEDIATE` before entering the native phase. SQLite staging failure leaves native data untouched; native failure rolls the pending Recall deletion back; direct Trash moves retain rollback on commit failure.
 - Pi deletion validates the indexed JSONL first and can recover a moved path by searching configured Pi session roots for exactly one matching source id. Zero matches are reported as missing native data; multiple matches fail closed.
-- Release workflow and LOG/Scoop validation pending.
+- Release tag `v0.5.8.4` points to `ceca382367ba1e8b44fb17aa83d23f3c8b205363`. Release workflow run `34127778865` passed `make check`, Windows x86_64, Linux x86_64, macOS x86_64, macOS aarch64, and publication. Windows asset SHA256: `a6a64f086f8e45720b5334a72c08e95ef9f220aa5a141a28f42882d8a4aeb7ea`.
+- Scoop bucket commit `6b675ae50247ac7edb9df55aa3f5d9d0b7b91ac2` publishes 0.5.8.4 and continues to persist both `trash` and `data`. LOG upgraded successfully; `recall --version` remains upstream base `0.5.8`. `current/data` and `current/trash` are persisted junctions, `PRAGMA quick_check=ok`, schema is v12, and the legacy `%APPDATA%\recall\recall.db` remains absent.
+- Installed real-session dry-runs resolve native paths for Pi (`~/.pi/agent/sessions/...jsonl`), Claude Code (`~/.claude/projects/...jsonl`), and Codex (`~/.codex/sessions/.../rollout-...jsonl`, with the official `codex delete --force` command). A confirmed orphan Pi row now reports missing/unvalidated native data instead of claiming Pi deletion is unsupported.
+- Isolated before/after regression reproduced both reported failures without touching real sessions. On v0.5.8.3, a Pi JSONL moved within the configured Pi root still produced `native deletion is not supported for source pi`; v0.5.8.4 re-resolved the same source id to the moved file and Trash deletion completed with native file absent, Recall row absent, and one Trash manifest.
+- The v0.5.8.3 Codex-shim/blocked-DB fixture reproduced the exact inconsistency error with `NativeExists=false`, `IndexRows=1`, and a retained safety backup. On v0.5.8.4 the same forced DB failure occurs before native execution (`NativeExists=true`, `IndexRows=1`, `TrashEntries=0`); after removing the blocker, deletion completed with `NativeExists=false`, `IndexRows=0`, and one Trash backup. All temporary fixtures were removed after validation.
 
 ## 2026-09-07 deletion consistency investigation
 
