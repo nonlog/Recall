@@ -988,8 +988,8 @@ mod tests {
         let project = sessions.join("--project--");
         fs::create_dir_all(&project).unwrap();
         let id = "11111111-1111-1111-1111-111111111111";
-        let actual = project.join(format!("2026-09-07T00-00-00Z_{id}.jsonl"));
-        fs::write(&actual, format!(r#"{{"type":"session","id":"{id}"}}\n"#)).unwrap();
+        let actual = project.join("renamed-session.jsonl");
+        fs::write(&actual, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
         let stale = dir.path().join("old-location.jsonl");
 
         let roots = pi_session_roots_under(Some(&stale), id, &[sessions]).unwrap();
@@ -1005,8 +1005,8 @@ mod tests {
         for project_name in ["--one--", "--two--"] {
             let project = sessions.join(project_name);
             fs::create_dir_all(&project).unwrap();
-            let path = project.join(format!("2026-09-07T00-00-00Z_{id}.jsonl"));
-            fs::write(&path, format!(r#"{{"type":"session","id":"{id}"}}\n"#)).unwrap();
+            let path = project.join("renamed-session.jsonl");
+            fs::write(&path, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
         }
 
         let error = pi_session_roots_under(None, id, &[sessions]).unwrap_err();

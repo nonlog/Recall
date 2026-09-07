@@ -25,7 +25,7 @@ Retained/requested fork behavior:
 
 ## 2026-09-07 deletion consistency investigation
 
-- LOG real native paths were verified as Pi under `C:\\Users\\www\\.pi\\agent\\sessions\\...`, Claude Code under `C:\\Users\\www\\.claude\\projects\\...`, and Codex rollouts under `C:\\Users\\www\\.codex\\sessions\\YYYY\\MM\\DD\\rollout-...jsonl`.
+- LOG real native paths were verified as Pi under `C:\Users\www\.pi\agent\sessions\...`, Claude Code under `C:\Users\www\.claude\projects\...`, and Codex rollouts under `C:\Users\www\.codex\sessions\YYYY\MM\DD\rollout-...jsonl`.
 - All 22 indexed Pi sessions were dry-run checked on installed v0.5.8.3. Every one of the 17 entries whose indexed JSONL still exists produced a valid Trash plan; the 5 failures all point at missing JSONL files. The old generic `native deletion is not supported for source pi` message therefore conflated a stale/missing indexed path with unsupported deletion.
 - Pi deletion now validates the indexed JSONL first, then searches the adapter's configured session roots for a unique matching source id when the indexed path is stale. Multiple matches fail closed; zero matches instruct index-only cleanup only when native data is already gone.
 - The native/index inconsistency was structural: `session_delete::execute` previously mutated native state first and only afterward opened a separate Recall deletion transaction. A later SQLite busy/constraint/message-vector failure could therefore leave native data deleted while the index remained.
