@@ -87,7 +87,7 @@ struct ParsedPiSession {
     custom_title: Option<String>,
 }
 
-fn resolve_pi_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn resolve_pi_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
     let mut session_dirs = Vec::new();
     let mut seen = HashSet::new();

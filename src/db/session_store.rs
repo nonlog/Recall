@@ -398,6 +398,25 @@ impl Store {
         Ok(())
     }
 
+    /// Stage the Recall-side deletion under an IMMEDIATE write transaction before
+    /// touching native session data. If staging or the native operation fails,
+    /// dropping the transaction restores the index automatically.
+    pub(crate) fn with_staged_session_delete<T>(
+        &self,
+        source: &str,
+        source_id: &str,
+        native_delete: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        delete_session_data_tx(&tx, source, source_id)?;
+        let result = native_delete()?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn list_sessions_by_ids(&self, session_ids: &[String]) -> Result<Vec<Session>> {
         if session_ids.is_empty() {
             return Ok(Vec::new());

@@ -68,6 +68,12 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
     let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
     if native_command.is_none() && native_roots.is_empty() {
+        if session.source == "pi" {
+            anyhow::bail!(
+                "native Pi session data could not be found or safely validated for {}; the indexed file may have moved or already been removed; use --index-only explicitly only if the native session is already gone",
+                session.source_id
+            );
+        }
         anyhow::bail!(
             "native deletion is not supported for source {}; use --index-only explicitly to remove only the Recall index",
             session.source
@@ -111,87 +117,109 @@ pub(crate) fn execute(
         });
     }
 
+    if plan.mode == DeleteMode::IndexOnly {
+        store.delete_session_data(&session.source, &session.source_id)?;
+        return Ok(DeleteResult {
+            mode: plan.mode.as_str(),
+            deleted_from_index: true,
+            native_paths,
+            native_command,
+            trash_dir: None,
+        });
+    }
+
     let mut moved_trash = None;
     let mut trash_dir = None;
     let mut native_deleted_irreversibly = false;
+    let mut native_phase_entered = false;
     let opencode_already_missing = session.source == "opencode"
         && crate::adapters::opencode::native_session_exists(&session.source_id)? == Some(false);
 
-    match plan.mode {
-        DeleteMode::Trash => {
-            if let Some(command) = &plan.native_command {
-                if !opencode_already_missing {
-                    let backup_dir =
-                        backup_before_native_command(session, &plan.native_roots, command)?;
-                    if let Err(error) = run_native_delete_command(command) {
-                        let native_now_missing = session.source == "opencode"
-                            && crate::adapters::opencode::native_session_exists(
-                                &session.source_id,
-                            )? == Some(false);
-                        if !native_now_missing {
-                            let _ = fs::remove_dir_all(&backup_dir);
-                            return Err(error);
+    let delete_result =
+        store.with_staged_session_delete(&session.source, &session.source_id, || -> Result<()> {
+            native_phase_entered = true;
+            match plan.mode {
+                DeleteMode::Trash => {
+                    if let Some(command) = &plan.native_command {
+                        if !opencode_already_missing {
+                            let backup_dir =
+                                backup_before_native_command(session, &plan.native_roots, command)?;
+                            if let Err(error) = run_native_delete_command(command) {
+                                let native_now_missing = session.source == "opencode"
+                                    && crate::adapters::opencode::native_session_exists(
+                                        &session.source_id,
+                                    )? == Some(false);
+                                if !native_now_missing {
+                                    let _ = fs::remove_dir_all(&backup_dir);
+                                    return Err(error);
+                                }
+                            }
+                            native_deleted_irreversibly = true;
+                            trash_dir = Some(backup_dir);
+                        }
+                    } else {
+                        let moved = move_to_trash(session, &plan.native_roots, None)?;
+                        trash_dir = Some(moved.dir.clone());
+                        moved_trash = Some(moved);
+                    }
+                }
+                DeleteMode::Permanent => {
+                    if let Some(command) = &plan.native_command {
+                        if !opencode_already_missing
+                            && let Err(error) = run_native_delete_command(command)
+                        {
+                            let native_now_missing = session.source == "opencode"
+                                && crate::adapters::opencode::native_session_exists(
+                                    &session.source_id,
+                                )? == Some(false);
+                            if !native_now_missing {
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        for root in &plan.native_roots {
+                            remove_path(root).with_context(|| {
+                                format!("failed to permanently delete {}", root.display())
+                            })?;
                         }
                     }
                     native_deleted_irreversibly = true;
-                    trash_dir = Some(backup_dir);
                 }
-            } else {
-                let moved = move_to_trash(session, &plan.native_roots, None)?;
-                trash_dir = Some(moved.dir.clone());
-                moved_trash = Some(moved);
+                DeleteMode::IndexOnly => unreachable!("index-only handled before native phase"),
             }
-        }
-        DeleteMode::Permanent => {
-            if let Some(command) = &plan.native_command {
-                if !opencode_already_missing && let Err(error) = run_native_delete_command(command)
-                {
-                    let native_now_missing = session.source == "opencode"
-                        && crate::adapters::opencode::native_session_exists(&session.source_id)?
-                            == Some(false);
-                    if !native_now_missing {
-                        return Err(error);
-                    }
-                }
-            } else {
-                for root in &plan.native_roots {
-                    remove_path(root).with_context(|| {
-                        format!("failed to permanently delete {}", root.display())
-                    })?;
-                }
-            }
-            native_deleted_irreversibly = true;
-        }
-        DeleteMode::IndexOnly => {}
-    }
 
-    if plan.mode != DeleteMode::IndexOnly {
-        for root in &plan.native_roots {
-            if root.exists() {
+            for root in &plan.native_roots {
+                if root.exists() {
+                    anyhow::bail!(
+                        "native deletion reported success but session path still exists: {}",
+                        root.display()
+                    );
+                }
+            }
+            if session.source == "opencode"
+                && crate::adapters::opencode::native_session_exists(&session.source_id)?
+                    == Some(true)
+            {
                 anyhow::bail!(
-                    "native deletion reported success but session path still exists: {}",
-                    root.display()
+                    "OpenCode delete command reported success but session {} still exists in the native database",
+                    session.source_id
                 );
             }
-        }
-        if session.source == "opencode"
-            && crate::adapters::opencode::native_session_exists(&session.source_id)? == Some(true)
-        {
-            anyhow::bail!(
-                "OpenCode delete command reported success but session {} still exists in the native database",
-                session.source_id
-            );
-        }
-    }
+            Ok(())
+        });
 
-    let delete_index_result = store.delete_session_data(&session.source, &session.source_id);
-    if let Err(error) = delete_index_result {
+    if let Err(error) = delete_result {
         if let Some(moved) = &moved_trash
             && let Err(rollback_error) = rollback_trash_move(moved)
         {
             return Err(anyhow::anyhow!(
-                "failed to delete Recall index: {error}; additionally failed to restore trashed native data: {rollback_error}"
+                "failed to commit Recall index deletion: {error}; additionally failed to restore trashed native data: {rollback_error}"
             ));
+        }
+        if !native_phase_entered {
+            return Err(error).context(
+                "failed to stage Recall index deletion before native data was changed; native session data was left untouched",
+            );
         }
         if native_deleted_irreversibly {
             let backup_note = trash_dir
@@ -199,7 +227,7 @@ pub(crate) fn execute(
                 .map(|path| format!("; safety backup retained at {}", path.display()))
                 .unwrap_or_default();
             return Err(anyhow::anyhow!(
-                "native session deletion succeeded, but deleting the Recall index failed: {error}{backup_note}"
+                "native session deletion succeeded, but committing the staged Recall index deletion failed: {error}{backup_note}"
             ));
         }
         return Err(error);
@@ -218,10 +246,7 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     let source_path = session.source_file_path.as_deref().map(PathBuf::from);
     let roots = match session.source.as_str() {
         "codex" => source_path.into_iter().collect(),
-        "pi" => source_path
-            .and_then(|path| pi_session_file(&path, &session.source_id))
-            .into_iter()
-            .collect(),
+        "pi" => pi_session_roots(session)?,
         "omp" => {
             source_path.map(|path| omp_session_roots(&path, &session.source_id)).unwrap_or_default()
         }
@@ -262,6 +287,51 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     };
 
     normalize_roots(roots)
+}
+
+fn pi_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let session_dirs = adapters::pi::resolve_pi_session_dirs()?;
+    pi_session_roots_under(
+        session.source_file_path.as_deref().map(Path::new),
+        &session.source_id,
+        &session_dirs,
+    )
+}
+
+fn pi_session_roots_under(
+    indexed_path: Option<&Path>,
+    source_id: &str,
+    session_dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if let Some(path) = indexed_path
+        && let Some(file) = pi_session_file(path, source_id)
+    {
+        return Ok(vec![file]);
+    }
+
+    let mut matches = Vec::new();
+    for session_dir in session_dirs {
+        if !session_dir.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(session_dir).into_iter().filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(file) = pi_session_file(path, source_id) {
+                matches.push(file);
+            }
+        }
+    }
+
+    let matches = normalize_roots(matches)?;
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "multiple Pi session files matched source id {source_id}; refusing native deletion until the ambiguity is resolved"
+        );
+    }
+    Ok(matches)
 }
 
 fn pi_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
@@ -912,6 +982,39 @@ mod tests {
     }
 
     #[test]
+    fn pi_relocates_stale_indexed_path_with_unique_source_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let project = sessions.join("--project--");
+        fs::create_dir_all(&project).unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        let actual = project.join(format!("2026-09-07T00-00-00Z_{id}.jsonl"));
+        fs::write(&actual, format!(r#"{{"type":"session","id":"{id}"}}\n"#)).unwrap();
+        let stale = dir.path().join("old-location.jsonl");
+
+        let roots = pi_session_roots_under(Some(&stale), id, &[sessions]).unwrap();
+
+        assert_eq!(roots, vec![actual]);
+    }
+
+    #[test]
+    fn pi_relocation_refuses_ambiguous_duplicate_source_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let id = "11111111-1111-1111-1111-111111111111";
+        for project_name in ["--one--", "--two--"] {
+            let project = sessions.join(project_name);
+            fs::create_dir_all(&project).unwrap();
+            let path = project.join(format!("2026-09-07T00-00-00Z_{id}.jsonl"));
+            fs::write(&path, format!(r#"{{"type":"session","id":"{id}"}}\n"#)).unwrap();
+        }
+
+        let error = pi_session_roots_under(None, id, &[sessions]).unwrap_err();
+
+        assert!(error.to_string().contains("multiple Pi session files matched"));
+    }
+
+    #[test]
     fn omp_delete_uses_upstream_session_file_and_artifact_directory() {
         let root = tempfile::tempdir().unwrap();
         let omp_root = root.path().join(".omp");
@@ -1086,6 +1189,31 @@ mod tests {
         let error = plan(&session, DeleteMode::Trash).unwrap_err();
         assert!(error.to_string().contains("native deletion is not supported"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn recall_index_delete_is_staged_before_native_trash_move() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-session.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"pi-session\"}\n").unwrap();
+        let session = session("pi", "pi-session", Some(path.to_string_lossy().into_owned()));
+        store.insert_session(&session).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER block_session_delete BEFORE DELETE ON sessions \
+                 BEGIN SELECT RAISE(ABORT, 'blocked delete'); END;",
+            )
+            .unwrap();
+        let delete_plan = plan(&session, DeleteMode::Trash).unwrap();
+
+        let error = execute(&store, &session, &delete_plan, false).unwrap_err();
+
+        assert!(error.to_string().contains("failed to stage Recall index deletion"));
+        assert!(path.exists(), "native data must not move when Recall staging fails");
+        assert!(store.get_session_by_id(&session.id).unwrap().is_some());
     }
 
     #[test]

@@ -32,6 +32,12 @@ Before merging or rebasing a new upstream release:
 - TUI supports bulk selection and one confirmation for the selected set.
 - Unsupported/unsafe native deletion must fail closed and require explicit
   index-only deletion rather than pretending native data was removed.
+- Pi deletion re-resolves a stale indexed path by source id inside Pi's configured
+  session roots. A unique validated match may be trashed; no match is reported as
+  missing native data, and multiple matches fail closed instead of guessing.
+- Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
+  transaction before native data is touched. SQLite lock/constraint/vector cleanup
+  failures therefore happen first; native failure rolls the staged index change back.
 - Upstream `omp` remains the authoritative OMP adapter/source id; the fork only
   adds safe deletion/path handling around it.
 - Landmarks: `src/session_delete.rs`, `src/session.rs`, `src/tui/app.rs`,

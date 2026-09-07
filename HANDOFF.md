@@ -1,6 +1,6 @@
 # Recall fork handoff
 
-Last updated: 2026-09-06
+Last updated: 2026-09-07
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
 Fork release: `v0.5.8.3`
@@ -12,7 +12,7 @@ The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a 
 
 Retained/requested fork behavior:
 
-- Native-aware safe session deletion: Trash, permanent delete, explicit index-only delete, dry-run, TUI bulk selection and one-confirmation deletion.
+- Native-aware safe session deletion: Trash, permanent delete, explicit index-only delete, dry-run, TUI bulk selection and one-confirmation deletion. Recall stages index deletion under an IMMEDIATE transaction before native mutation; Pi can safely re-resolve stale indexed paths by unique source-id match in configured Pi session roots.
 - Per-source TUI colors/icons with terminal-safe fallbacks.
 - Upstream `omp` adapter/source id is authoritative; deletion only adds safe path validation around its indexed session files.
 - Windows Trash defaults beside the installed `recall.exe`; Scoop persists the `trash` directory across upgrades. `RECALL_TRASH_DIR` remains an override.
@@ -22,6 +22,14 @@ Retained/requested fork behavior:
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
+
+## 2026-09-07 deletion consistency investigation
+
+- LOG real native paths were verified as Pi under `C:\\Users\\www\\.pi\\agent\\sessions\\...`, Claude Code under `C:\\Users\\www\\.claude\\projects\\...`, and Codex rollouts under `C:\\Users\\www\\.codex\\sessions\\YYYY\\MM\\DD\\rollout-...jsonl`.
+- All 22 indexed Pi sessions were dry-run checked on installed v0.5.8.3. Every one of the 17 entries whose indexed JSONL still exists produced a valid Trash plan; the 5 failures all point at missing JSONL files. The old generic `native deletion is not supported for source pi` message therefore conflated a stale/missing indexed path with unsupported deletion.
+- Pi deletion now validates the indexed JSONL first, then searches the adapter's configured session roots for a unique matching source id when the indexed path is stale. Multiple matches fail closed; zero matches instruct index-only cleanup only when native data is already gone.
+- The native/index inconsistency was structural: `session_delete::execute` previously mutated native state first and only afterward opened a separate Recall deletion transaction. A later SQLite busy/constraint/message-vector failure could therefore leave native data deleted while the index remained.
+- The fix stages `delete_session_data_tx` under `BEGIN IMMEDIATE` before entering the native phase. If staging fails, native data is untouched; if native deletion fails, the uncommitted index deletion rolls back; direct Trash moves are still restored if the final commit fails.
 
 ## v0.5.8.3 closeout
 
