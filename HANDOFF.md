@@ -3,8 +3,8 @@
 Last updated: 2026-09-07
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.3`
-Release commit: `235a0e1f083dfc58a1a60dabc23a88272d1c09b3`
+Fork release: `v0.5.8.4` (preparing)
+Release commit: pending
 
 ## Current fork policy
 
@@ -22,6 +22,14 @@ Retained/requested fork behavior:
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
+
+## v0.5.8.4 deletion consistency
+
+- Feature commits: `46a44729bae8ef5cf2825506e2bdd869293c11a6` (`fix: make native session deletion consistent`) and `74865b2ea372d643d5fb03b96cae6837116a6876` (`test: cover relocated Pi session headers`), both Codex author+committer. PR #14 passed GitHub CI run `34127526571` and was fast-forwarded to `main`; GitHub records `74865b2ea372d643d5fb03b96cae6837116a6876` as the merge SHA.
+- Installed v0.5.8.3 pre-fix audit checked all 22 indexed Pi sessions: all 17 with an existing indexed JSONL generated valid Trash plans; the 5 failures all referenced missing files, and none of those five source ids exists anywhere under the current Pi session root.
+- Native-aware deletion now stages Recall-side cleanup under `BEGIN IMMEDIATE` before entering the native phase. SQLite staging failure leaves native data untouched; native failure rolls the pending Recall deletion back; direct Trash moves retain rollback on commit failure.
+- Pi deletion validates the indexed JSONL first and can recover a moved path by searching configured Pi session roots for exactly one matching source id. Zero matches are reported as missing native data; multiple matches fail closed.
+- Release workflow and LOG/Scoop validation pending.
 
 ## 2026-09-07 deletion consistency investigation
 

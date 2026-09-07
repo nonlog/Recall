@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.8.4] (2026-09-07)
+
+### nonlog fork
+
+* Stage Recall index deletion under an IMMEDIATE SQLite transaction before touching native session data, eliminating the normal SQLite-lock/constraint failure window after native deletion.
+* Re-resolve stale Pi indexed paths by a unique validated source-id match inside Pi's configured session roots.
+* Report missing Pi native data separately from unsupported-source deletion and fail closed when multiple native files match the same source id.
+* Add regression coverage proving Recall DB staging failures leave native data untouched and Pi relocation does not guess ambiguous files.
+
+
 ## [0.5.8.3] (2026-09-06)
 
 ### nonlog fork
