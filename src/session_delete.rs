@@ -341,7 +341,7 @@ fn pi_session_roots_under(
     session_dirs: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
     if let Some(path) = indexed_path
-        && let Some(file) = pi_session_file(path, source_id)
+        && let Some(file) = pi_session_file_checked(path, source_id)?
     {
         return Ok(vec![file]);
     }
@@ -359,7 +359,7 @@ fn pi_session_roots_under(
             if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(file) = pi_session_file(path, source_id) {
+            if let Some(file) = pi_session_file_checked(path, source_id)? {
                 matches.push(file);
             }
         }
@@ -375,31 +375,41 @@ fn pi_session_roots_under(
 }
 
 fn pi_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
+    pi_session_file_checked(path, source_id).ok().flatten()
+}
+
+fn pi_session_file_checked(path: &Path, source_id: &str) -> Result<Option<PathBuf>> {
     if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") || !path.is_file() {
-        return None;
+        return Ok(None);
     }
 
-    let stem = path.file_stem()?.to_str()?;
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
     let filename_id = stem
         .rsplit_once('_')
         .map(|(_, tail)| tail)
         .filter(|tail| uuid::Uuid::try_parse(tail).is_ok())
         .unwrap_or(stem);
 
-    let file = fs::File::open(path).ok()?;
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read Pi session candidate {}", path.display()))?;
     for line in BufReader::new(file).lines().take(256) {
-        let Ok(line) = line else { continue };
+        let line = line
+            .with_context(|| format!("failed to read Pi session candidate {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if value.get("type").and_then(|value| value.as_str()) != Some("session") {
             continue;
         }
-        return (value.get("id").and_then(|value| value.as_str()) == Some(source_id))
-            .then(|| path.to_path_buf());
+        return Ok(
+            (value.get("id").and_then(|value| value.as_str()) == Some(source_id))
+                .then(|| path.to_path_buf()),
+        );
     }
 
-    (filename_id == source_id).then(|| path.to_path_buf())
+    Ok((filename_id == source_id).then(|| path.to_path_buf()))
 }
 
 fn omp_session_roots(path: &Path, source_id: &str) -> Vec<PathBuf> {
@@ -1010,6 +1020,18 @@ mod tests {
 
         assert!(pi_session_file(&path, "expected").is_none());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn pi_checked_session_lookup_accepts_matching_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("renamed.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"checked-session\"}\n").unwrap();
+
+        assert_eq!(
+            pi_session_file_checked(&path, "checked-session").unwrap(),
+            Some(path)
+        );
     }
 
     #[test]

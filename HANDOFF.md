@@ -38,7 +38,7 @@ Retained/requested fork behavior:
 ## 2026-09-08 Pi orphan deletion follow-up
 
 - LOG still contained five historical Pi index rows whose recorded JSONL paths no longer exist and whose source ids have no match anywhere under the configured Pi session roots. TUI bulk delete therefore still reported failures in v0.5.8.4 even though there was no native data left to protect.
-- This follow-up distinguishes an unsupported source from a verified Pi orphan. Pi root traversal now propagates scan errors; only a complete successful scan with zero source-id matches, where the indexed path belongs to a currently available configured Pi root, may classify native data as already absent. Unavailable roots remain fail-closed.
+- This follow-up distinguishes an unsupported source from a verified Pi orphan. Pi root traversal and candidate-file I/O errors now propagate; only a complete successful scan with zero source-id matches, where the indexed path belongs to a currently available configured Pi root, may classify native data as already absent. Unavailable roots and unreadable candidates remain fail-closed.
 - For that verified-absent state, a confirmed Trash/permanent delete stages and commits Recall index cleanup without touching native storage or creating an empty Trash directory. The native roots are rechecked inside the staged transaction; if a matching Pi session appears before commit, deletion fails closed and the index rolls back.
 
 ## 2026-09-07 deletion consistency investigation

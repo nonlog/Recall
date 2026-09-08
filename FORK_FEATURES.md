@@ -36,8 +36,8 @@ Before merging or rebasing a new upstream release:
   session roots. A unique validated match may be trashed; after a complete successful
   trusted-root scan whose indexed path belongs to a currently available root, zero matches
   mean native data is already absent and an explicitly confirmed delete removes the stale
-  Recall index only. Multiple matches, unavailable roots, or scan errors
-  fail closed instead of guessing.
+  Recall index only. Multiple matches, unavailable roots, traversal/file-read errors, or
+  other incomplete scans fail closed instead of guessing.
 - Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
   transaction before native data is touched. SQLite lock/constraint/vector cleanup
   failures therefore happen first; native failure rolls the staged index change back.
