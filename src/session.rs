@@ -744,7 +744,17 @@ fn cmd_session_delete(
             if let Some(trash_dir) = &result.trash_dir {
                 println!("  trash: {trash_dir}");
             }
-            if result.mode == "index-only" {
+            if result.native_already_missing {
+                if dry_run {
+                    println!(
+                        "  note: native Pi session data is already absent; only the stale Recall index would be removed"
+                    );
+                } else {
+                    println!(
+                        "  note: native Pi session data was already absent; removed the stale Recall index"
+                    );
+                }
+            } else if result.mode == "index-only" {
                 println!(
                     "  note: native session data was not changed and may be indexed again by a later sync"
                 );

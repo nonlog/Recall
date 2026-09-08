@@ -35,6 +35,8 @@ pub(crate) struct DeletePlan {
     pub(crate) mode: DeleteMode,
     pub(crate) native_roots: Vec<PathBuf>,
     pub(crate) native_command: Option<ResumeCommand>,
+    /// True only when a file-backed source was exhaustively checked and its native data is already absent.
+    pub(crate) native_already_missing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +46,7 @@ pub(crate) struct DeleteResult {
     pub(crate) native_paths: Vec<String>,
     pub(crate) native_command: Option<String>,
     pub(crate) trash_dir: Option<String>,
+    pub(crate) native_already_missing: bool,
 }
 
 #[derive(Serialize)]
@@ -62,18 +65,18 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
             mode: DeleteMode::IndexOnly,
             native_roots: Vec::new(),
             native_command: None,
+            native_already_missing: false,
         });
     }
 
     let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
-    if native_command.is_none() && native_roots.is_empty() {
-        if session.source == "pi" {
-            anyhow::bail!(
-                "native Pi session data could not be found or safely validated for {}; the indexed file may have moved or already been removed; use --index-only explicitly only if the native session is already gone",
-                session.source_id
-            );
-        }
+    // Pi is a file-backed source whose complete configured session roots are searched above.
+    // If that exhaustive scan finds no matching source id, there is no native data left to delete;
+    // an explicitly confirmed delete may safely remove the stale Recall index entry.
+    let native_already_missing =
+        session.source == "pi" && native_command.is_none() && native_roots.is_empty();
+    if native_command.is_none() && native_roots.is_empty() && !native_already_missing {
         anyhow::bail!(
             "native deletion is not supported for source {}; use --index-only explicitly to remove only the Recall index",
             session.source
@@ -91,7 +94,7 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         );
     }
 
-    Ok(DeletePlan { mode, native_roots, native_command })
+    Ok(DeletePlan { mode, native_roots, native_command, native_already_missing })
 }
 
 pub(crate) fn execute(
@@ -114,6 +117,7 @@ pub(crate) fn execute(
             native_paths,
             native_command,
             trash_dir: None,
+            native_already_missing: plan.native_already_missing,
         });
     }
 
@@ -125,6 +129,7 @@ pub(crate) fn execute(
             native_paths,
             native_command,
             trash_dir: None,
+            native_already_missing: false,
         });
     }
 
@@ -137,6 +142,17 @@ pub(crate) fn execute(
 
     let delete_result =
         store.with_staged_session_delete(&session.source, &session.source_id, || -> Result<()> {
+            if plan.native_already_missing {
+                // Re-check after the Recall write transaction is staged. If Pi recreated/moved the
+                // session between planning and execution, fail closed and let the index rollback.
+                let current_roots = native_roots_for_session(session)?;
+                if current_roots.is_empty() {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "native Pi session data appeared after deletion was planned; retry deletion so it can be removed safely"
+                );
+            }
             native_phase_entered = true;
             match plan.mode {
                 DeleteMode::Trash => {
@@ -239,6 +255,7 @@ pub(crate) fn execute(
         native_paths,
         native_command,
         trash_dir: trash_dir.map(|path| path.to_string_lossy().into_owned()),
+        native_already_missing: plan.native_already_missing,
     })
 }
 
@@ -314,7 +331,10 @@ fn pi_session_roots_under(
         if !session_dir.exists() {
             continue;
         }
-        for entry in WalkDir::new(session_dir).into_iter().filter_map(|entry| entry.ok()) {
+        for entry in WalkDir::new(session_dir) {
+            let entry = entry.with_context(|| {
+                format!("failed to scan Pi session root {}", session_dir.display())
+            })?;
             let path = entry.path();
             if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
@@ -1015,6 +1035,31 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_pi_delete_cleans_stale_index_when_native_data_is_already_absent() {
+        crate::db::schema::register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        let session = session(
+            "pi",
+            "33333333-3333-4333-8333-333333333333",
+            Some("definitely-missing-pi-session.jsonl".to_string()),
+        );
+        store.insert_session(&session).unwrap();
+        let delete_plan = DeletePlan {
+            mode: DeleteMode::Trash,
+            native_roots: Vec::new(),
+            native_command: None,
+            native_already_missing: true,
+        };
+
+        let result = execute(&store, &session, &delete_plan, false).unwrap();
+
+        assert!(result.deleted_from_index);
+        assert!(result.native_already_missing);
+        assert!(result.trash_dir.is_none());
+        assert!(store.get_session_by_id(&session.id).unwrap().is_none());
+    }
+
+    #[test]
     fn omp_delete_uses_upstream_session_file_and_artifact_directory() {
         let root = tempfile::tempdir().unwrap();
         let omp_root = root.path().join(".omp");
@@ -1240,6 +1285,7 @@ mod tests {
             mode: DeleteMode::Permanent,
             native_roots: vec![path.clone()],
             native_command: Some(command),
+            native_already_missing: false,
         };
 
         let error = execute(&store, &session, &delete_plan, false).unwrap_err();
