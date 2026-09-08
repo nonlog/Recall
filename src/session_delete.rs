@@ -1045,8 +1045,14 @@ mod tests {
         let missing_inside = sessions.join("--project--").join("missing.jsonl");
         let missing_outside = dir.path().join("elsewhere").join("missing.jsonl");
 
-        assert!(pi_native_absence_confirmed_under(Some(&missing_inside), std::slice::from_ref(&sessions)));
-        assert!(!pi_native_absence_confirmed_under(Some(&missing_outside), std::slice::from_ref(&sessions)));
+        assert!(pi_native_absence_confirmed_under(
+            Some(&missing_inside),
+            std::slice::from_ref(&sessions)
+        ));
+        assert!(!pi_native_absence_confirmed_under(
+            Some(&missing_outside),
+            std::slice::from_ref(&sessions)
+        ));
         assert!(!pi_native_absence_confirmed_under(Some(&missing_inside), &[]));
         assert!(!pi_native_absence_confirmed_under(None, std::slice::from_ref(&sessions)));
     }
@@ -1069,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_pi_delete_cleans_stale_index_when_native_data_is_already_absent() {
+    fn verified_missing_pi_state_requires_trusted_available_root() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
