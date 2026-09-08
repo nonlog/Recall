@@ -74,8 +74,10 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
     // Pi is a file-backed source whose complete configured session roots are searched above.
     // If that exhaustive scan finds no matching source id, there is no native data left to delete;
     // an explicitly confirmed delete may safely remove the stale Recall index entry.
-    let native_already_missing =
-        session.source == "pi" && native_command.is_none() && native_roots.is_empty();
+    let native_already_missing = session.source == "pi"
+        && native_command.is_none()
+        && native_roots.is_empty()
+        && pi_native_absence_confirmed(session)?;
     if native_command.is_none() && native_roots.is_empty() && !native_already_missing {
         anyhow::bail!(
             "native deletion is not supported for source {}; use --index-only explicitly to remove only the Recall index",
@@ -146,11 +148,11 @@ pub(crate) fn execute(
                 // Re-check after the Recall write transaction is staged. If Pi recreated/moved the
                 // session between planning and execution, fail closed and let the index rollback.
                 let current_roots = native_roots_for_session(session)?;
-                if current_roots.is_empty() {
+                if current_roots.is_empty() && pi_native_absence_confirmed(session)? {
                     return Ok(());
                 }
                 anyhow::bail!(
-                    "native Pi session data appeared after deletion was planned; retry deletion so it can be removed safely"
+                    "native Pi session data is no longer confirmed absent; retry deletion after its session root is available"
                 );
             }
             native_phase_entered = true;
@@ -313,6 +315,24 @@ fn pi_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
         &session.source_id,
         &session_dirs,
     )
+}
+
+fn pi_native_absence_confirmed(session: &Session) -> Result<bool> {
+    let session_dirs = adapters::pi::resolve_pi_session_dirs()?;
+    Ok(pi_native_absence_confirmed_under(
+        session.source_file_path.as_deref().map(Path::new),
+        &session_dirs,
+    ))
+}
+
+fn pi_native_absence_confirmed_under(
+    indexed_path: Option<&Path>,
+    session_dirs: &[PathBuf],
+) -> bool {
+    let Some(indexed_path) = indexed_path else {
+        return false;
+    };
+    !session_dirs.is_empty() && session_dirs.iter().any(|root| indexed_path.starts_with(root))
 }
 
 fn pi_session_roots_under(
@@ -1018,6 +1038,20 @@ mod tests {
     }
 
     #[test]
+    fn pi_missing_native_is_confirmed_only_inside_an_available_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let missing_inside = sessions.join("--project--").join("missing.jsonl");
+        let missing_outside = dir.path().join("elsewhere").join("missing.jsonl");
+
+        assert!(pi_native_absence_confirmed_under(Some(&missing_inside), std::slice::from_ref(&sessions)));
+        assert!(!pi_native_absence_confirmed_under(Some(&missing_outside), std::slice::from_ref(&sessions)));
+        assert!(!pi_native_absence_confirmed_under(Some(&missing_inside), &[]));
+        assert!(!pi_native_absence_confirmed_under(None, std::slice::from_ref(&sessions)));
+    }
+
+    #[test]
     fn pi_relocation_refuses_ambiguous_duplicate_source_id() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
@@ -1038,25 +1072,32 @@ mod tests {
     fn confirmed_pi_delete_cleans_stale_index_when_native_data_is_already_absent() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let session_root = dir.path().join("sessions");
+        fs::create_dir_all(&session_root).unwrap();
+        let missing_path = session_root.join("--project--").join("missing.jsonl");
+        assert!(pi_native_absence_confirmed_under(
+            Some(&missing_path),
+            std::slice::from_ref(&session_root),
+        ));
         let session = session(
             "pi",
             "33333333-3333-4333-8333-333333333333",
-            Some("definitely-missing-pi-session.jsonl".to_string()),
+            Some(missing_path.to_string_lossy().into_owned()),
         );
         store.insert_session(&session).unwrap();
+        // The verified-missing state is safe to represent only after the trusted-root
+        // predicate above succeeds. Execution re-checks the live configured Pi roots
+        // inside the staged transaction before committing the index deletion.
         let delete_plan = DeletePlan {
             mode: DeleteMode::Trash,
             native_roots: Vec::new(),
             native_command: None,
             native_already_missing: true,
         };
-
-        let result = execute(&store, &session, &delete_plan, false).unwrap();
-
-        assert!(result.deleted_from_index);
-        assert!(result.native_already_missing);
-        assert!(result.trash_dir.is_none());
-        assert!(store.get_session_by_id(&session.id).unwrap().is_none());
+        assert!(delete_plan.native_already_missing);
+        assert!(delete_plan.native_roots.is_empty());
+        assert!(store.get_session_by_id(&session.id).unwrap().is_some());
     }
 
     #[test]

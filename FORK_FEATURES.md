@@ -34,8 +34,9 @@ Before merging or rebasing a new upstream release:
   index-only deletion rather than pretending native data was removed.
 - Pi deletion re-resolves a stale indexed path by source id inside Pi's configured
   session roots. A unique validated match may be trashed; after a complete successful
-  trusted-root scan, zero matches mean native data is already absent and an explicitly
-  confirmed delete removes the stale Recall index only. Multiple matches or scan errors
+  trusted-root scan whose indexed path belongs to a currently available root, zero matches
+  mean native data is already absent and an explicitly confirmed delete removes the stale
+  Recall index only. Multiple matches, unavailable roots, or scan errors
   fail closed instead of guessing.
 - Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
   transaction before native data is touched. SQLite lock/constraint/vector cleanup
