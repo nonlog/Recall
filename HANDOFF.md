@@ -1,10 +1,10 @@
 # Recall fork handoff
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.4`
-Release commit: `ceca382367ba1e8b44fb17aa83d23f3c8b205363`
+Fork release: `v0.5.8.5` (preparing)
+Release commit: pending
 
 ## Current fork policy
 
@@ -22,6 +22,12 @@ Retained/requested fork behavior:
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
+
+## v0.5.8.5 Pi orphan deletion
+
+- Feature branch `fix/pi-orphan-delete-cleanup-20260908` landed through PR #15. Final feature SHA is `117babb246b43d265628f4e59e89dfad5341ec5c`; all feature/style commits use Codex author+committer. GitHub PR CI run `34199666325` passed `make check`.
+- LOG diagnosis immediately before release still found exactly five Pi orphan index rows. Their historical paths all lie under the available `C:\Users\www\.pi\agent\sessions` root; the root exists, all 13 current JSONL files were readable, and none of the five source ids had a matching native file.
+- v0.5.8.5 therefore makes normal confirmed TUI/CLI deletion clean these verified stale Recall rows without creating an empty Trash entry. It does not generalize automatic index-only fallback to Cursor/Kiro or other unsupported/shared-database sources.
 
 ## v0.5.8.4 deletion consistency
 

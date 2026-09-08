@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.8.5] (2026-09-08)
+
+### nonlog fork
+
+* Treat a confirmed Pi native-missing state as an already-deleted native session so an explicitly confirmed Trash/permanent action removes the stale Recall index instead of reporting a bulk-delete failure.
+* Re-check Pi native roots inside the staged Recall transaction before committing orphan cleanup, rolling the index deletion back if the session reappears.
+* Require the historical indexed path to belong to a currently available configured Pi session root before classifying native data as absent.
+* Propagate Pi root traversal and candidate-file I/O failures so unavailable or incomplete scans remain fail-closed.
+
 ## [0.5.8.4] (2026-09-07)
 
 ### nonlog fork
