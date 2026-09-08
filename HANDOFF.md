@@ -3,8 +3,8 @@
 Last updated: 2026-09-08
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.5` (preparing)
-Release commit: pending
+Fork release: `v0.5.8.5`
+Release commit: `28f5c3ba37d88959efd4f15dfa3b088e3aa9f9c1`
 
 ## Current fork policy
 
@@ -28,6 +28,8 @@ Retained/requested fork behavior:
 - Feature branch `fix/pi-orphan-delete-cleanup-20260908` landed through PR #15. Final feature SHA is `117babb246b43d265628f4e59e89dfad5341ec5c`; all feature/style commits use Codex author+committer. GitHub PR CI run `34199666325` passed `make check`.
 - LOG diagnosis immediately before release still found exactly five Pi orphan index rows. Their historical paths all lie under the available `C:\Users\www\.pi\agent\sessions` root; the root exists, all 13 current JSONL files were readable, and none of the five source ids had a matching native file.
 - v0.5.8.5 therefore makes normal confirmed TUI/CLI deletion clean these verified stale Recall rows without creating an empty Trash entry. It does not generalize automatic index-only fallback to Cursor/Kiro or other unsupported/shared-database sources.
+- Release workflow `34199889333` passed the tagged `make check`, Windows x86_64, Linux x86_64, macOS x86_64, macOS aarch64, and publication. Windows ZIP SHA256 is `a715df4847a5fcd371a9563bebb0878b54fb395755ef4e56e6d57f2dc6790448`. Scoop bucket commit `70d0d2a90992c8665be84420b1bd528657199f4d` publishes v0.5.8.5.
+- LOG upgraded from v0.5.8.4 to v0.5.8.5 after closing the running Recall TUI process. All five known Pi orphan rows then passed `session delete --dry-run`: exit 0, `native_already_missing=true`, zero native paths, and no index mutation. A text dry-run explicitly reports that only the stale Recall index would be removed. The local `D:\Workspace\Recall` repository remained clean.
 
 ## v0.5.8.4 deletion consistency
 
