@@ -403,10 +403,8 @@ fn pi_session_file_checked(path: &Path, source_id: &str) -> Result<Option<PathBu
         if value.get("type").and_then(|value| value.as_str()) != Some("session") {
             continue;
         }
-        return Ok(
-            (value.get("id").and_then(|value| value.as_str()) == Some(source_id))
-                .then(|| path.to_path_buf()),
-        );
+        return Ok((value.get("id").and_then(|value| value.as_str()) == Some(source_id))
+            .then(|| path.to_path_buf()));
     }
 
     Ok((filename_id == source_id).then(|| path.to_path_buf()))
@@ -1028,10 +1026,7 @@ mod tests {
         let path = dir.path().join("renamed.jsonl");
         fs::write(&path, "{\"type\":\"session\",\"id\":\"checked-session\"}\n").unwrap();
 
-        assert_eq!(
-            pi_session_file_checked(&path, "checked-session").unwrap(),
-            Some(path)
-        );
+        assert_eq!(pi_session_file_checked(&path, "checked-session").unwrap(), Some(path));
     }
 
     #[test]
