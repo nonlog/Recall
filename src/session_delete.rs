@@ -124,13 +124,7 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         );
     }
 
-    Ok(DeletePlan {
-        mode,
-        native_roots,
-        native_command,
-        native_database,
-        native_already_missing,
-    })
+    Ok(DeletePlan { mode, native_roots, native_command, native_database, native_already_missing })
 }
 
 pub(crate) fn execute(
@@ -452,15 +446,13 @@ fn copilot_chat_session_roots_under(
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to scan {}", workspace_storage.display())
-                });
+                return Err(error)
+                    .with_context(|| format!("failed to scan {}", workspace_storage.display()));
             }
         };
         for entry in entries {
-            let entry = entry.with_context(|| {
-                format!("failed to scan {}", workspace_storage.display())
-            })?;
+            let entry =
+                entry.with_context(|| format!("failed to scan {}", workspace_storage.display()))?;
             if entry.path().is_dir() {
                 collect_named_chat_files(
                     &entry.path().join("chatSessions"),
@@ -513,10 +505,8 @@ fn copilot_chat_indexed_path_is_allowed(path: &Path, source_id: &str, user_root:
     let Ok(relative) = path.strip_prefix(user_root) else {
         return false;
     };
-    let parts = relative
-        .components()
-        .filter_map(|part| part.as_os_str().to_str())
-        .collect::<Vec<_>>();
+    let parts =
+        relative.components().filter_map(|part| part.as_os_str().to_str()).collect::<Vec<_>>();
     matches!(
         parts.as_slice(),
         ["globalStorage", "emptyWindowChatSessions", _]
@@ -539,7 +529,9 @@ fn copilot_cli_session_roots_under(source_id: &str, root: &Path) -> Result<Vec<P
     let metadata = match fs::metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("failed to inspect {}", root.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", root.display()));
+        }
     };
     if !metadata.is_dir() {
         anyhow::bail!("Copilot CLI session root is not a directory: {}", root.display());
@@ -569,25 +561,20 @@ fn copilot_cli_events_match(path: &Path, source_id: &str) -> Result<bool> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read Copilot CLI session {}", path.display()))?;
     for line in BufReader::new(file).lines().take(16) {
-        let line = line
-            .with_context(|| format!("failed to read Copilot CLI session {}", path.display()))?;
+        let line =
+            line.with_context(|| format!("failed to read Copilot CLI session {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if value.get("type").and_then(|value| value.as_str()) == Some("session.start") {
-            return Ok(
-                value
-                    .get("data")
-                    .and_then(|data| data.get("sessionId"))
-                    .and_then(|value| value.as_str())
-                    == Some(source_id),
-            );
+            return Ok(value
+                .get("data")
+                .and_then(|data| data.get("sessionId"))
+                .and_then(|value| value.as_str())
+                == Some(source_id));
         }
     }
-    Ok(path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
+    Ok(path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str())
         == Some(source_id))
 }
 
@@ -625,14 +612,17 @@ fn grok_session_roots_under(source_id: &str, root: &Path) -> Result<Vec<PathBuf>
     let metadata = match fs::metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("failed to inspect {}", root.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", root.display()));
+        }
     };
     if !metadata.is_dir() {
         anyhow::bail!("Grok session root is not a directory: {}", root.display());
     }
     let mut matches = Vec::new();
     for entry in WalkDir::new(root).min_depth(2).max_depth(2) {
-        let entry = entry.with_context(|| format!("failed to scan Grok root {}", root.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to scan Grok root {}", root.display()))?;
         if entry.file_type().is_dir()
             && entry.file_name().to_str() == Some(source_id)
             && entry.path().join("updates.jsonl").is_file()
@@ -669,7 +659,8 @@ fn zcode_native_session_exists(db_path: &Path, source_id: &str) -> Result<bool> 
     if !db_path.is_file() {
         anyhow::bail!("ZCode native database is unavailable: {}", db_path.display());
     }
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = rusqlite::Connection::open_with_flags(db_path, flags)
         .with_context(|| format!("failed to open ZCode database {}", db_path.display()))?;
     let exists: bool = conn.query_row(
@@ -699,10 +690,7 @@ fn delete_zcode_session(db_path: &Path, source_id: &str) -> Result<bool> {
             rusqlite::params![source_id],
         )?;
     }
-    let deleted = tx.execute(
-        "DELETE FROM session WHERE id = ?1",
-        rusqlite::params![source_id],
-    )?;
+    let deleted = tx.execute("DELETE FROM session WHERE id = ?1", rusqlite::params![source_id])?;
     tx.commit()?;
     Ok(deleted > 0)
 }
@@ -732,7 +720,8 @@ fn backup_sqlite_database(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         anyhow::bail!("refusing to overwrite SQLite backup {}", destination.display());
     }
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = rusqlite::Connection::open_with_flags(source, flags)
         .with_context(|| format!("failed to open SQLite source {}", source.display()))?;
     let destination_text = destination.to_string_lossy().into_owned();
@@ -1688,10 +1677,7 @@ mod tests {
         let user = dir.path().join("User");
         let id = "44444444-4444-4444-8444-444444444444";
         let global = user.join("globalStorage").join("emptyWindowChatSessions");
-        let workspace = user
-            .join("workspaceStorage")
-            .join("workspace-id")
-            .join("chatSessions");
+        let workspace = user.join("workspaceStorage").join("workspace-id").join("chatSessions");
         fs::create_dir_all(&global).unwrap();
         fs::create_dir_all(&workspace).unwrap();
         let global_file = global.join(format!("{id}.jsonl"));
