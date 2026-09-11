@@ -370,21 +370,20 @@ fn codex_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
 }
 
 fn codex_native_absence_confirmed(session: &Session) -> Result<bool> {
-    if uuid::Uuid::try_parse(&session.source_id).is_err() {
-        return Ok(false);
-    }
     let session_dirs = adapters::codex::resolve_codex_session_dirs()?;
     Ok(codex_native_absence_confirmed_under(
+        &session.source_id,
         session.source_file_path.as_deref().map(Path::new),
         &session_dirs,
     ))
 }
 
 fn codex_native_absence_confirmed_under(
+    source_id: &str,
     indexed_path: Option<&Path>,
     session_dirs: &[PathBuf],
 ) -> bool {
-    if session_dirs.is_empty() {
+    if uuid::Uuid::try_parse(source_id).is_err() || session_dirs.is_empty() {
         return false;
     }
     indexed_path.is_none_or(|path| session_dirs.iter().any(|root| path.starts_with(root)))
@@ -1440,20 +1439,24 @@ mod tests {
         let inside = sessions.join("missing.jsonl");
         let outside = dir.path().join("outside").join("missing.jsonl");
 
+        let id = "33333333-3333-4333-8333-333333333333";
         assert!(codex_native_absence_confirmed_under(
+            id,
             Some(&inside),
             std::slice::from_ref(&sessions)
         ));
         assert!(!codex_native_absence_confirmed_under(
+            id,
             Some(&outside),
             std::slice::from_ref(&sessions)
         ));
-        assert!(!codex_native_absence_confirmed_under(Some(&inside), &[]));
+        assert!(!codex_native_absence_confirmed_under(id, Some(&inside), &[]));
         assert!(codex_native_absence_confirmed_under(
+            id,
             None,
             std::slice::from_ref(&sessions)
         ));
-        assert!(!codex_native_absence_confirmed_under(None, &[]));
+        assert!(!codex_native_absence_confirmed_under(id, None, &[]));
     }
 
     #[test]
@@ -1461,10 +1464,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
-        let session = session("codex", "not-a-codex-thread-id", None);
 
-        assert!(uuid::Uuid::try_parse(&session.source_id).is_err());
-        assert!(codex_native_absence_confirmed_under(
+        assert!(!codex_native_absence_confirmed_under(
+            "not-a-codex-thread-id",
             None,
             std::slice::from_ref(&sessions)
         ));
