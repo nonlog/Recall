@@ -1451,11 +1451,7 @@ mod tests {
             std::slice::from_ref(&sessions)
         ));
         assert!(!codex_native_absence_confirmed_under(id, Some(&inside), &[]));
-        assert!(codex_native_absence_confirmed_under(
-            id,
-            None,
-            std::slice::from_ref(&sessions)
-        ));
+        assert!(codex_native_absence_confirmed_under(id, None, std::slice::from_ref(&sessions)));
         assert!(!codex_native_absence_confirmed_under(id, None, &[]));
     }
 
