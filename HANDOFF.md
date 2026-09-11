@@ -1,10 +1,10 @@
 # Recall fork handoff
 
-Last updated: 2026-09-08
+Last updated: 2026-09-11
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
-Fork release: `v0.5.8.5`
-Release commit: `28f5c3ba37d88959efd4f15dfa3b088e3aa9f9c1`
+Fork release: `v0.5.8.7`
+Release commit: `ed37095b31e0c7b80f4913d50c0f75865dcf49cc`
 
 ## Current fork policy
 
@@ -12,7 +12,7 @@ The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a 
 
 Retained/requested fork behavior:
 
-- Native-aware safe session deletion: Trash, permanent delete, explicit index-only delete, dry-run, TUI bulk selection and one-confirmation deletion. Recall stages index deletion under an IMMEDIATE transaction before native mutation; Pi can safely re-resolve stale indexed paths by unique source-id match in configured Pi session roots.
+- Native-aware safe session deletion: Trash, permanent delete, explicit index-only delete, dry-run, TUI bulk selection and one-confirmation deletion. Recall stages index deletion under an IMMEDIATE transaction before native mutation; source-specific safe deletion/reconciliation covers every source currently indexed on LOG, including stale-path handling and ZCode database backup/delete semantics.
 - Per-source TUI colors/icons with terminal-safe fallbacks.
 - Upstream `omp` adapter/source id is authoritative; deletion only adds safe path validation around its indexed session files.
 - Windows Trash defaults beside the installed `recall.exe`; Scoop persists the `trash` directory across upgrades. `RECALL_TRASH_DIR` remains an override.
@@ -22,6 +22,14 @@ Retained/requested fork behavior:
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
+
+## v0.5.8.7 deletion closeout
+
+- PR #17 (final feature SHA `c2cfd0764b22be051c0be7fee5e5e0b49d49a5f0`) expanded the Codex fix into complete safe deletion coverage for the sources currently present on LOG. The final PR CI run for the comprehensive implementation passed `make check`; all commits were authored and committed by `Codex <codex@openai.com>`.
+- Release `v0.5.8.7` is tagged at `ed37095b31e0c7b80f4913d50c0f75865dcf49cc`. Release workflow `34554187694` passed check, Linux x86_64, Windows x86_64, macOS x86_64, macOS aarch64, and publication. Windows ZIP SHA256 is `789e6f3f79860899d857a7058adc2b621640ad31658761bae0f3e7317a739e95`. Scoop bucket commit `c339aa7eddca340aedde59e4ebccfae3967b92e5` publishes v0.5.8.7.
+- LOG is installed at `D:\Programs\Scoop\apps\recall\0.5.8.7`. A normal Trash-mode dry-run was executed for every one of the 334 current Recall rows: **334 passed, 0 failed**, and the Recall DB row count remained 334 before/after. Breakdown: Claude Code 12/12, Codex 270/270, Copilot Chat 6/6, Copilot CLI 2/2, Grok 12/12, OMP 9/9, OpenCode 5/5, Pi 16/16, ZCode 2/2.
+- Isolated non-dry-run validation used temporary copies only. The exact screenshot failure row and the pathless Codex edge row both removed only their temporary Recall index entries while all real rows remained present. A temporary ZCode DB + Recall DB test deleted one target ZCode session, preserved the other session, created exactly one pre-delete SQLite backup, retained the target in that backup, and passed `PRAGMA quick_check=ok`; the real Recall and ZCode databases were unchanged. The temporary validation tree was removed afterward.
+- This validation intentionally did not delete any real user session. Future deletion failures should therefore represent real safety conditions (I/O/lock/unreadable store/ambiguous native matches) rather than the previously known stale or unsupported cases.
 
 ## 2026-09-11 Codex deletion reconciliation
 
