@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.8.6] (2026-09-11)
+
+### nonlog fork
+
+* Fix recurring Codex deletion failures by validating and re-resolving rollout files only inside trusted Codex session roots.
+* Treat a Codex session as native-missing only when the rollout scan finds no match and `state_5.sqlite` also confirms the thread id is absent, allowing confirmed stale Recall rows to be removed safely.
+* Reconcile nonzero `codex delete --force` exits against both the rollout filesystem and Codex thread registry; accept an already-completed native deletion instead of rolling the Recall index deletion back.
+* When Codex no longer tracks a session but the same validated rollout remains, fall back to removing that already-backed-up rollout directly; ambiguous registry state, moved paths, duplicates, and incomplete scans still fail closed.
+
 ## [0.5.8.5] (2026-09-08)
 
 ### nonlog fork
