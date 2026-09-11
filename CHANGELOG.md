@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.8.7] (2026-09-11)
+
+### nonlog fork
+
+* Complete native-aware Trash/permanent deletion for every source currently indexed on LOG.
+* Allow legacy pathless Codex stale rows only after a valid UUID, complete trusted-root scan, zero rollout matches, and explicit native thread-registry absence.
+* Add VS Code Copilot Chat deletion for exact session JSON/JSONL files inside canonical chat stores.
+* Add Copilot CLI and Grok directory deletion with source-id re-resolution and safe native-missing cleanup for historical stale rows.
+* Add ZCode SQLite-native session deletion: Trash mode first creates and verifies a full database snapshot, then removes only the selected session using an IMMEDIATE foreign-key-aware transaction; permanent mode skips the snapshot.
+* Preserve fail-closed behavior for unreadable stores, unexpected paths, duplicate native matches, ambiguous registry state, and database errors.
+
 ## [0.5.8.6] (2026-09-11)
 
 ### nonlog fork
