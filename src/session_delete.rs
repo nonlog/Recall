@@ -1702,7 +1702,7 @@ mod tests {
         let id = "55555555-5555-4555-8555-555555555555";
         fs::write(
             alias.join("events.jsonl"),
-            format!(r#"{{"type":"session.start","data":{{"sessionId":"{id}"}}}}\n"#),
+            format!("{{\"type\":\"session.start\",\"data\":{{\"sessionId\":\"{id}\"}}}}\n"),
         )
         .unwrap();
 
@@ -2017,17 +2017,17 @@ mod tests {
     }
 
     #[test]
-    fn directory_backed_sources_plan_session_directory() {
+    fn directory_backed_copilot_cli_helper_plans_session_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let session_dir = dir.path().join("session-state").join("session-id");
+        let root = dir.path().join("session-state");
+        let session_dir = root.join("session-id");
         fs::create_dir_all(&session_dir).unwrap();
         let path = session_dir.join("events.jsonl");
-        fs::write(&path, "data").unwrap();
-        let session = session("copilot-cli", "s1", Some(path.to_string_lossy().into_owned()));
+        fs::write(&path, "{}\n").unwrap();
 
-        let plan = plan(&session, DeleteMode::Trash).unwrap();
+        let roots = copilot_cli_session_roots_under("session-id", &root).unwrap();
 
-        assert_eq!(plan.native_roots, vec![session_dir]);
+        assert_eq!(roots, vec![session_dir]);
     }
 
     #[test]
