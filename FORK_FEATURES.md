@@ -44,7 +44,10 @@ Before merging or rebasing a new upstream release:
   the thread id is absent. If `codex delete --force` exits nonzero, Recall rechecks both
   native surfaces: an already-absent rollout is accepted, or a still-present unchanged
   validated rollout may be removed directly only when Codex's registry is already absent.
-  Registry ambiguity, moved paths, duplicate rollouts, and incomplete scans fail closed.
+  Registry ambiguity, moved paths, duplicate rollouts, and incomplete scans fail closed. Legacy
+  Codex rows with no stored `source_file_path` may still be classified as native-missing, but only
+  when the source id is a valid UUID, at least one trusted Codex root is available and fully scanned,
+  no rollout matches, and the native thread registry explicitly confirms the id is absent.
 - Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
   transaction before native data is touched. SQLite lock/constraint/vector cleanup
   failures therefore happen first; native failure rolls the staged index change back.

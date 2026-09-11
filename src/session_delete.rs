@@ -370,6 +370,9 @@ fn codex_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
 }
 
 fn codex_native_absence_confirmed(session: &Session) -> Result<bool> {
+    if uuid::Uuid::try_parse(&session.source_id).is_err() {
+        return Ok(false);
+    }
     let session_dirs = adapters::codex::resolve_codex_session_dirs()?;
     Ok(codex_native_absence_confirmed_under(
         session.source_file_path.as_deref().map(Path::new),
@@ -381,10 +384,10 @@ fn codex_native_absence_confirmed_under(
     indexed_path: Option<&Path>,
     session_dirs: &[PathBuf],
 ) -> bool {
-    let Some(indexed_path) = indexed_path else {
+    if session_dirs.is_empty() {
         return false;
-    };
-    !session_dirs.is_empty() && session_dirs.iter().any(|root| indexed_path.starts_with(root))
+    }
+    indexed_path.is_none_or(|path| session_dirs.iter().any(|root| path.starts_with(root)))
 }
 
 fn codex_session_roots_under(
@@ -1446,6 +1449,25 @@ mod tests {
             std::slice::from_ref(&sessions)
         ));
         assert!(!codex_native_absence_confirmed_under(Some(&inside), &[]));
+        assert!(codex_native_absence_confirmed_under(
+            None,
+            std::slice::from_ref(&sessions)
+        ));
+        assert!(!codex_native_absence_confirmed_under(None, &[]));
+    }
+
+    #[test]
+    fn codex_native_absence_rejects_non_uuid_source_id_without_indexed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let session = session("codex", "not-a-codex-thread-id", None);
+
+        assert!(uuid::Uuid::try_parse(&session.source_id).is_err());
+        assert!(codex_native_absence_confirmed_under(
+            None,
+            std::slice::from_ref(&sessions)
+        ));
     }
 
     #[test]

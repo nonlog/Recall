@@ -29,6 +29,7 @@ Retained/requested fork behavior:
 - Full LOG audit found 270 Recall-indexed Codex sessions: 166 have both a current rollout and native thread row; 104 have neither. There were zero relocated matches and zero duplicate current rollout ids. These 104 historical stale rows explain why deletion failures could recur long after the Pi-specific fix.
 - The Codex deletion path now validates/re-resolves rollouts within the available `~/.codex/sessions` and `~/.codex/archived_sessions` roots, requires the native Codex thread registry to confirm missing ids before stale-index cleanup, and reconciles nonzero native delete exits against both surfaces. A failed native command may remove the same already-backed-up validated rollout directly only when Codex itself no longer tracks the id; otherwise deletion remains fail-closed.
 - The local `D:\Workspace\Recall` repository was not modified; implementation is being developed and validated through GitHub/Actions, with LOG used only for runtime audit/smoke tests.
+- Post-v0.5.8.6 full dry-run found 103/104 stale Codex rows passing. The only remaining row (Recall `18c838c0-134a-4cb8-8ca3-98e6216034bc`, Codex `019e97b7-93b3-7992-b134-9c850f550e17`) has `source_file_path = NULL`, no current rollout, and no native thread row. Both canonical Codex roots exist. The follow-up permits this legacy pathless case only with a valid UUID, a complete trusted-root scan with zero matches, and explicit native-registry absence.
 
 ## v0.5.8.5 Pi orphan deletion
 
