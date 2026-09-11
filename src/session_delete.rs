@@ -420,7 +420,9 @@ fn codex_session_roots_under(
 }
 
 fn codex_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
-    if !path.is_file() || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl" | "json")) {
+    if !path.is_file()
+        || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl" | "json"))
+    {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
@@ -459,8 +461,7 @@ fn codex_failed_delete_action(
 fn reconcile_failed_codex_delete(session: &Session, planned_roots: &[PathBuf]) -> Result<bool> {
     let current_roots = codex_session_roots(session)?;
     let native_exists = adapters::codex::native_session_exists(&session.source_id)?;
-    let absence_confirmed =
-        current_roots.is_empty() && codex_native_absence_confirmed(session)?;
+    let absence_confirmed = current_roots.is_empty() && codex_native_absence_confirmed(session)?;
     match codex_failed_delete_action(
         planned_roots,
         &current_roots,
@@ -1394,22 +1395,15 @@ mod tests {
         let path = sessions.join(format!("rollout-2026-09-11T00-00-00-{id}.jsonl"));
         fs::write(&path, "data").unwrap();
 
-        let roots = codex_session_roots_under(
-            Some(&path),
-            id,
-            std::slice::from_ref(&sessions),
-        )
-        .unwrap();
+        let roots =
+            codex_session_roots_under(Some(&path), id, std::slice::from_ref(&sessions)).unwrap();
         let command = adapters::delete_command_for("codex", id).unwrap();
 
         assert_eq!(roots, vec![path]);
         #[cfg(target_os = "windows")]
         {
             assert_eq!(command.program, "cmd.exe");
-            assert_eq!(
-                command.args,
-                vec!["/D", "/C", "codex", "delete", "--force", id]
-            );
+            assert_eq!(command.args, vec!["/D", "/C", "codex", "delete", "--force", id]);
         }
         #[cfg(not(target_os = "windows"))]
         {

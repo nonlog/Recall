@@ -142,9 +142,10 @@ pub(crate) fn resolve_codex_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
             Ok(_) => anyhow::bail!("Codex session root is not a directory: {}", dir.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).map_err(|error| {
-                    anyhow::anyhow!("failed to inspect Codex session root {}: {error}", dir.display())
-                });
+                anyhow::bail!(
+                    "failed to inspect Codex session root {}: {error}",
+                    dir.display()
+                );
             }
         }
     }
@@ -158,10 +159,7 @@ pub(crate) fn native_session_exists(source_id: &str) -> anyhow::Result<Option<bo
     native_session_exists_under(&codex_dir, source_id)
 }
 
-fn native_session_exists_under(
-    codex_dir: &Path,
-    source_id: &str,
-) -> anyhow::Result<Option<bool>> {
+fn native_session_exists_under(codex_dir: &Path, source_id: &str) -> anyhow::Result<Option<bool>> {
     let db_path = codex_dir.join("state_5.sqlite");
     if !db_path.is_file() {
         return Ok(None);
