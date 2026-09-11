@@ -62,7 +62,7 @@ impl SourceAdapter for CopilotChatAdapter {
     }
 }
 
-fn vscode_user_roots() -> Vec<PathBuf> {
+pub(crate) fn vscode_user_roots() -> Vec<PathBuf> {
     let Some(config) = dirs::config_dir() else {
         return Vec::new();
     };

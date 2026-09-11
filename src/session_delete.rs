@@ -35,7 +35,8 @@ pub(crate) struct DeletePlan {
     pub(crate) mode: DeleteMode,
     pub(crate) native_roots: Vec<PathBuf>,
     pub(crate) native_command: Option<ResumeCommand>,
-    /// True only when a file-backed source and any authoritative native registry were checked and its native data is already absent.
+    pub(crate) native_database: Option<PathBuf>,
+    /// True only when source-specific trusted storage checks prove native data is already absent.
     pub(crate) native_already_missing: bool,
 }
 
@@ -65,15 +66,23 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
             mode: DeleteMode::IndexOnly,
             native_roots: Vec::new(),
             native_command: None,
+            native_database: None,
             native_already_missing: false,
         });
     }
 
     let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
-    // File-backed sources may retain stale Recall rows after their native data is gone.
-    // Only classify that state after an exhaustive trusted-root scan; Codex additionally
-    // requires its authoritative thread registry to confirm the source id is absent.
+    let native_database =
+        (session.source == "zcode").then(adapters::zcode::resolve_zcode_db_path).flatten();
+    let zcode_native_exists = match native_database.as_deref() {
+        Some(path) if session.source == "zcode" => {
+            Some(zcode_native_session_exists(path, &session.source_id)?)
+        }
+        _ => None,
+    };
+    // File-backed/database-backed sources can retain stale Recall rows after native data is gone.
+    // Every source below has its own trusted-storage predicate; incomplete or ambiguous scans fail closed.
     let native_already_missing = (session.source == "pi"
         && native_command.is_none()
         && native_roots.is_empty()
@@ -81,8 +90,22 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         || (session.source == "codex"
             && native_roots.is_empty()
             && codex_native_absence_confirmed(session)?
-            && adapters::codex::native_session_exists(&session.source_id)? == Some(false));
-    if native_command.is_none() && native_roots.is_empty() && !native_already_missing {
+            && adapters::codex::native_session_exists(&session.source_id)? == Some(false))
+        || (session.source == "copilot-chat"
+            && native_roots.is_empty()
+            && copilot_chat_native_absence_confirmed(session)?)
+        || (session.source == "copilot-cli"
+            && native_roots.is_empty()
+            && copilot_cli_native_absence_confirmed(session)?)
+        || (session.source == "grok"
+            && native_roots.is_empty()
+            && grok_native_absence_confirmed(session)?)
+        || (session.source == "zcode" && zcode_native_exists == Some(false));
+    if native_command.is_none()
+        && native_roots.is_empty()
+        && native_database.is_none()
+        && !native_already_missing
+    {
         anyhow::bail!(
             "native deletion is not supported for source {}; use --index-only explicitly to remove only the Recall index",
             session.source
@@ -101,7 +124,13 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         );
     }
 
-    Ok(DeletePlan { mode, native_roots, native_command, native_already_missing })
+    Ok(DeletePlan {
+        mode,
+        native_roots,
+        native_command,
+        native_database,
+        native_already_missing,
+    })
 }
 
 pub(crate) fn execute(
@@ -110,11 +139,14 @@ pub(crate) fn execute(
     plan: &DeletePlan,
     dry_run: bool,
 ) -> Result<DeleteResult> {
-    let native_paths = plan
+    let mut native_paths = plan
         .native_roots
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
+    if let Some(path) = &plan.native_database {
+        native_paths.push(path.to_string_lossy().into_owned());
+    }
     let native_command = plan.native_command.as_ref().map(ResumeCommand::display);
 
     if dry_run {
@@ -165,6 +197,27 @@ pub(crate) fn execute(
                             && adapters::codex::native_session_exists(&session.source_id)?
                                 == Some(false)
                     }
+                    "copilot-chat" => {
+                        let current_roots = copilot_chat_session_roots(session)?;
+                        current_roots.is_empty() && copilot_chat_native_absence_confirmed(session)?
+                    }
+                    "copilot-cli" => {
+                        let current_roots = copilot_cli_session_roots(session)?;
+                        current_roots.is_empty() && copilot_cli_native_absence_confirmed(session)?
+                    }
+                    "grok" => {
+                        let current_roots = grok_session_roots(session)?;
+                        current_roots.is_empty() && grok_native_absence_confirmed(session)?
+                    }
+                    "zcode" => match (
+                        plan.native_database.as_ref(),
+                        adapters::zcode::resolve_zcode_db_path().as_ref(),
+                    ) {
+                        (Some(expected), Some(current)) if expected == current => {
+                            !zcode_native_session_exists(current, &session.source_id)?
+                        }
+                        _ => false,
+                    },
                     _ => false,
                 };
                 if still_missing {
@@ -177,7 +230,15 @@ pub(crate) fn execute(
             }
             match plan.mode {
                 DeleteMode::Trash => {
-                    if let Some(command) = &plan.native_command {
+                    if let Some(db_path) = &plan.native_database {
+                        let backup_dir = backup_zcode_database(session, db_path)?;
+                        if let Err(error) = delete_zcode_session(db_path, &session.source_id) {
+                            let _ = fs::remove_dir_all(&backup_dir);
+                            return Err(error);
+                        }
+                        native_deleted_irreversibly = true;
+                        trash_dir = Some(backup_dir);
+                    } else if let Some(command) = &plan.native_command {
                         if !opencode_already_missing {
                             let backup_dir =
                                 backup_before_native_command(session, &plan.native_roots, command)?;
@@ -221,7 +282,9 @@ pub(crate) fn execute(
                     }
                 }
                 DeleteMode::Permanent => {
-                    if let Some(command) = &plan.native_command {
+                    if let Some(db_path) = &plan.native_database {
+                        delete_zcode_session(db_path, &session.source_id)?;
+                    } else if let Some(command) = &plan.native_command {
                         if !opencode_already_missing
                             && let Err(error) = run_native_delete_command(command)
                         {
@@ -272,6 +335,15 @@ pub(crate) fn execute(
             {
                 anyhow::bail!(
                     "Codex deletion removed the rollout path but session {} still exists in the native thread registry",
+                    session.source_id
+                );
+            }
+            if session.source == "zcode"
+                && let Some(db_path) = &plan.native_database
+                && zcode_native_session_exists(db_path, &session.source_id)?
+            {
+                anyhow::bail!(
+                    "ZCode deletion completed but session {} still exists in the native database",
                     session.source_id
                 );
             }
@@ -326,13 +398,9 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
             .into_iter()
             .collect(),
         "claude-code" => claude_session_roots(session, source_path.as_deref())?,
-        "grok" => source_path
-            .and_then(|path| grok_session_root(&path, &session.source_id))
-            .into_iter()
-            .collect(),
-        "copilot-cli" => {
-            source_path.and_then(|path| copilot_session_root(&path)).into_iter().collect()
-        }
+        "grok" => grok_session_roots(session)?,
+        "copilot-cli" => copilot_cli_session_roots(session)?,
+        "copilot-chat" => copilot_chat_session_roots(session)?,
         "cline" | "roo" => source_path
             .and_then(|path| cline_session_root(&path, &session.source_id))
             .into_iter()
@@ -358,6 +426,328 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     };
 
     normalize_roots(roots)
+}
+
+fn copilot_chat_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let user_roots = adapters::copilot_chat::vscode_user_roots();
+    copilot_chat_session_roots_under(&session.source_id, &user_roots)
+}
+
+fn copilot_chat_session_roots_under(
+    source_id: &str,
+    user_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if source_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut matches = Vec::new();
+    for user_root in user_roots {
+        collect_named_chat_files(
+            &user_root.join("globalStorage").join("emptyWindowChatSessions"),
+            source_id,
+            &mut matches,
+        )?;
+        let workspace_storage = user_root.join("workspaceStorage");
+        let entries = match fs::read_dir(&workspace_storage) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to scan {}", workspace_storage.display())
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("failed to scan {}", workspace_storage.display())
+            })?;
+            if entry.path().is_dir() {
+                collect_named_chat_files(
+                    &entry.path().join("chatSessions"),
+                    source_id,
+                    &mut matches,
+                )?;
+            }
+        }
+    }
+    normalize_roots(matches)
+}
+
+fn collect_named_chat_files(dir: &Path, source_id: &str, out: &mut Vec<PathBuf>) -> Result<()> {
+    for extension in ["jsonl", "json"] {
+        let path = dir.join(format!("{source_id}.{extension}"));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                if canonical_path_is_within(&path, dir) {
+                    out.push(path);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copilot_chat_native_absence_confirmed(session: &Session) -> Result<bool> {
+    let user_roots = adapters::copilot_chat::vscode_user_roots();
+    let Some(path) = session.source_file_path.as_deref().map(Path::new) else {
+        return Ok(false);
+    };
+    Ok(!user_roots.is_empty()
+        && user_roots
+            .iter()
+            .any(|root| copilot_chat_indexed_path_is_allowed(path, &session.source_id, root)))
+}
+
+fn copilot_chat_indexed_path_is_allowed(path: &Path, source_id: &str, user_root: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name != format!("{source_id}.jsonl") && name != format!("{source_id}.json") {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(user_root) else {
+        return false;
+    };
+    let parts = relative
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    matches!(
+        parts.as_slice(),
+        ["globalStorage", "emptyWindowChatSessions", _]
+            | ["workspaceStorage", _, "chatSessions", _]
+    )
+}
+
+fn expected_copilot_cli_root() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".copilot").join("session-state"))
+}
+
+fn copilot_cli_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let Some(root) = expected_copilot_cli_root() else {
+        return Ok(Vec::new());
+    };
+    copilot_cli_session_roots_under(&session.source_id, &root)
+}
+
+fn copilot_cli_session_roots_under(source_id: &str, root: &Path) -> Result<Vec<PathBuf>> {
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {}", root.display())),
+    };
+    if !metadata.is_dir() {
+        anyhow::bail!("Copilot CLI session root is not a directory: {}", root.display());
+    }
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(root).with_context(|| format!("failed to scan {}", root.display()))? {
+        let entry = entry.with_context(|| format!("failed to scan {}", root.display()))?;
+        let session_dir = entry.path();
+        if !session_dir.is_dir() {
+            continue;
+        }
+        let events = session_dir.join("events.jsonl");
+        if events.is_file() && copilot_cli_events_match(&events, source_id)? {
+            matches.push(session_dir);
+        }
+    }
+    let matches = normalize_roots(matches)?;
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "multiple Copilot CLI session directories matched source id {source_id}; refusing native deletion"
+        );
+    }
+    Ok(matches)
+}
+
+fn copilot_cli_events_match(path: &Path, source_id: &str) -> Result<bool> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read Copilot CLI session {}", path.display()))?;
+    for line in BufReader::new(file).lines().take(16) {
+        let line = line
+            .with_context(|| format!("failed to read Copilot CLI session {}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|value| value.as_str()) == Some("session.start") {
+            return Ok(
+                value
+                    .get("data")
+                    .and_then(|data| data.get("sessionId"))
+                    .and_then(|value| value.as_str())
+                    == Some(source_id),
+            );
+        }
+    }
+    Ok(path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some(source_id))
+}
+
+fn copilot_cli_native_absence_confirmed(session: &Session) -> Result<bool> {
+    if uuid::Uuid::try_parse(&session.source_id).is_err() {
+        return Ok(false);
+    }
+    let Some(root) = expected_copilot_cli_root() else {
+        return Ok(false);
+    };
+    let Some(path) = session.source_file_path.as_deref().map(Path::new) else {
+        return Ok(false);
+    };
+    Ok(path.file_name().and_then(|name| name.to_str()) == Some("events.jsonl")
+        && path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str())
+            == Some(session.source_id.as_str())
+        && path.starts_with(root))
+}
+
+fn expected_grok_root() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".grok").join("sessions"))
+}
+
+fn grok_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let Some(root) = expected_grok_root() else {
+        return Ok(Vec::new());
+    };
+    grok_session_roots_under(&session.source_id, &root)
+}
+
+fn grok_session_roots_under(source_id: &str, root: &Path) -> Result<Vec<PathBuf>> {
+    if uuid::Uuid::try_parse(source_id).is_err() {
+        return Ok(Vec::new());
+    }
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {}", root.display())),
+    };
+    if !metadata.is_dir() {
+        anyhow::bail!("Grok session root is not a directory: {}", root.display());
+    }
+    let mut matches = Vec::new();
+    for entry in WalkDir::new(root).min_depth(2).max_depth(2) {
+        let entry = entry.with_context(|| format!("failed to scan Grok root {}", root.display()))?;
+        if entry.file_type().is_dir()
+            && entry.file_name().to_str() == Some(source_id)
+            && entry.path().join("updates.jsonl").is_file()
+        {
+            matches.push(entry.path().to_path_buf());
+        }
+    }
+    let matches = normalize_roots(matches)?;
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "multiple Grok session directories matched source id {source_id}; refusing native deletion"
+        );
+    }
+    Ok(matches)
+}
+
+fn grok_native_absence_confirmed(session: &Session) -> Result<bool> {
+    if uuid::Uuid::try_parse(&session.source_id).is_err() {
+        return Ok(false);
+    }
+    let Some(root) = expected_grok_root() else {
+        return Ok(false);
+    };
+    let Some(path) = session.source_file_path.as_deref().map(Path::new) else {
+        return Ok(false);
+    };
+    Ok(path.file_name().and_then(|name| name.to_str()) == Some("updates.jsonl")
+        && path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str())
+            == Some(session.source_id.as_str())
+        && path.starts_with(root))
+}
+
+fn zcode_native_session_exists(db_path: &Path, source_id: &str) -> Result<bool> {
+    if !db_path.is_file() {
+        anyhow::bail!("ZCode native database is unavailable: {}", db_path.display());
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(db_path, flags)
+        .with_context(|| format!("failed to open ZCode database {}", db_path.display()))?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?1)",
+        rusqlite::params![source_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn delete_zcode_session(db_path: &Path, source_id: &str) -> Result<bool> {
+    if !db_path.is_file() {
+        anyhow::bail!("ZCode native database is unavailable: {}", db_path.display());
+    }
+    let mut conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("failed to open ZCode database {}", db_path.display()))?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let has_input_history: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('input_history') WHERE name = 'session_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_input_history {
+        tx.execute(
+            "DELETE FROM input_history WHERE session_id = ?1",
+            rusqlite::params![source_id],
+        )?;
+    }
+    let deleted = tx.execute(
+        "DELETE FROM session WHERE id = ?1",
+        rusqlite::params![source_id],
+    )?;
+    tx.commit()?;
+    Ok(deleted > 0)
+}
+
+fn backup_zcode_database(session: &Session, db_path: &Path) -> Result<PathBuf> {
+    let deleted_at_ms = Utc::now().timestamp_millis();
+    let trash_dir = new_trash_dir(session, deleted_at_ms)?;
+    if let Err(error) = write_manifest(
+        session,
+        std::slice::from_ref(&db_path.to_path_buf()),
+        &trash_dir,
+        deleted_at_ms,
+        Some(format!("sqlite delete ZCode session {}", session.source_id)),
+    ) {
+        let _ = fs::remove_dir_all(&trash_dir);
+        return Err(error);
+    }
+    let backup_path = trash_dir.join("zcode-db-before.sqlite");
+    if let Err(error) = backup_sqlite_database(db_path, &backup_path) {
+        let _ = fs::remove_dir_all(&trash_dir);
+        return Err(error);
+    }
+    Ok(trash_dir)
+}
+
+fn backup_sqlite_database(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        anyhow::bail!("refusing to overwrite SQLite backup {}", destination.display());
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(source, flags)
+        .with_context(|| format!("failed to open SQLite source {}", source.display()))?;
+    let destination_text = destination.to_string_lossy().into_owned();
+    conn.execute("VACUUM INTO ?1", rusqlite::params![destination_text])
+        .with_context(|| format!("failed to back up SQLite database {}", source.display()))?;
+    drop(conn);
+    if fs::metadata(destination).map(|metadata| metadata.len()).unwrap_or_default() == 0 {
+        anyhow::bail!("SQLite safety backup is empty: {}", destination.display());
+    }
+    let verify = rusqlite::Connection::open_with_flags(destination, flags)?;
+    let quick_check: String = verify.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        anyhow::bail!("SQLite safety backup failed quick_check: {quick_check}");
+    }
+    Ok(())
 }
 
 fn codex_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
@@ -655,17 +1045,6 @@ fn file_parent_with_name(path: &Path, expected_names: &[&str]) -> Option<PathBuf
     let parent = path.parent()?;
     parent.parent()?;
     Some(parent.to_path_buf())
-}
-
-fn grok_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
-    let root = file_parent_with_name(path, &["updates.jsonl"])?;
-    (root.file_name()?.to_str()? == source_id).then_some(root)
-}
-
-fn copilot_session_root(path: &Path) -> Option<PathBuf> {
-    let root = file_parent_with_name(path, &["events.jsonl"])?;
-    let parent_name = root.parent()?.file_name()?.to_str()?;
-    (parent_name == "session-state").then_some(root)
 }
 
 fn cline_session_root(path: &Path, source_id: &str) -> Option<PathBuf> {
@@ -1295,11 +1674,145 @@ mod tests {
             mode: DeleteMode::Trash,
             native_roots: Vec::new(),
             native_command: None,
+            native_database: None,
             native_already_missing: true,
         };
         assert!(delete_plan.native_already_missing);
         assert!(delete_plan.native_roots.is_empty());
         assert!(store.get_session_by_id(&session.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn copilot_chat_delete_finds_files_only_in_known_chat_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("User");
+        let id = "44444444-4444-4444-8444-444444444444";
+        let global = user.join("globalStorage").join("emptyWindowChatSessions");
+        let workspace = user
+            .join("workspaceStorage")
+            .join("workspace-id")
+            .join("chatSessions");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let global_file = global.join(format!("{id}.jsonl"));
+        let workspace_file = workspace.join(format!("{id}.json"));
+        fs::write(&global_file, "{}\n").unwrap();
+        fs::write(&workspace_file, "{}").unwrap();
+        fs::write(user.join(format!("{id}.jsonl")), "outside").unwrap();
+
+        let mut roots = copilot_chat_session_roots_under(id, &[user]).unwrap();
+        roots.sort();
+        let mut expected = vec![global_file, workspace_file];
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    #[test]
+    fn copilot_cli_relocates_session_by_header_and_confirms_stale_path_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("session-state");
+        let alias = root.join("alias-dir");
+        fs::create_dir_all(&alias).unwrap();
+        let id = "55555555-5555-4555-8555-555555555555";
+        fs::write(
+            alias.join("events.jsonl"),
+            format!(r#"{{"type":"session.start","data":{{"sessionId":"{id}"}}}}\n"#),
+        )
+        .unwrap();
+
+        let roots = copilot_cli_session_roots_under(id, &root).unwrap();
+        assert_eq!(roots, vec![alias]);
+    }
+
+    #[test]
+    fn grok_delete_finds_unique_session_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "66666666-6666-4666-8666-666666666666";
+        let session_dir = root.join("workspace").join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("updates.jsonl"), "{}\n").unwrap();
+
+        let roots = grok_session_roots_under(id, &root).unwrap();
+        assert_eq!(roots, vec![session_dir]);
+    }
+
+    #[test]
+    fn zcode_delete_cascades_session_rows_and_keeps_other_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE session (id TEXT PRIMARY KEY);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT REFERENCES session(id) ON DELETE CASCADE);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT REFERENCES message(id) ON DELETE CASCADE);
+             CREATE TABLE input_history (id INTEGER PRIMARY KEY, session_id TEXT);
+             INSERT INTO session VALUES ('target');
+             INSERT INTO session VALUES ('other');
+             INSERT INTO message VALUES ('m-target', 'target');
+             INSERT INTO message VALUES ('m-other', 'other');
+             INSERT INTO part VALUES ('p-target', 'm-target');
+             INSERT INTO part VALUES ('p-other', 'm-other');
+             INSERT INTO input_history(session_id) VALUES ('target');
+             INSERT INTO input_history(session_id) VALUES ('other');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(zcode_native_session_exists(&db, "target").unwrap());
+        assert!(delete_zcode_session(&db, "target").unwrap());
+        assert!(!zcode_native_session_exists(&db, "target").unwrap());
+        assert!(zcode_native_session_exists(&db, "other").unwrap());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM input_history WHERE session_id='target'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM part WHERE id='p-target'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM part WHERE id='p-other'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_backup_preserves_pre_delete_zcode_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let backup = dir.path().join("backup.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY); INSERT INTO session VALUES ('target');",
+        )
+        .unwrap();
+        drop(conn);
+
+        backup_sqlite_database(&db, &backup).unwrap();
+        delete_zcode_session(&db, "target").unwrap();
+
+        let conn = rusqlite::Connection::open(&backup).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session WHERE id='target'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1594,6 +2107,7 @@ mod tests {
             mode: DeleteMode::Permanent,
             native_roots: vec![path.clone()],
             native_command: Some(command),
+            native_database: None,
             native_already_missing: false,
         };
 

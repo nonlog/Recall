@@ -48,6 +48,15 @@ Before merging or rebasing a new upstream release:
   Codex rows with no stored `source_file_path` may still be classified as native-missing, but only
   when the source id is a valid UUID, at least one trusted Codex root is available and fully scanned,
   no rollout matches, and the native thread registry explicitly confirms the id is absent.
+- VS Code Copilot Chat deletion removes only exact session-id JSON/JSONL files from known
+  `User/globalStorage/emptyWindowChatSessions` and `User/workspaceStorage/*/chatSessions`
+  locations. Copilot CLI and Grok deletion re-resolve whole session directories inside their
+  canonical per-user stores, and historical rows are treated as native-missing only when their
+  recorded path has the expected source-id structure. Scan/read ambiguities remain fail closed.
+- ZCode deletion operates on its native `cli/db/db.sqlite` session row. Trash mode first creates
+  a verified SQLite snapshot under Recall Trash, enables foreign keys, removes unconstrained
+  `input_history` rows, then deletes the target `session` so native cascades/SET NULL rules run.
+  Permanent mode skips the backup. Other ZCode sessions are never selected by the delete query.
 - Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
   transaction before native data is touched. SQLite lock/constraint/vector cleanup
   failures therefore happen first; native failure rolls the staged index change back.

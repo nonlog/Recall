@@ -67,7 +67,7 @@ fn open_zcode_db() -> anyhow::Result<Option<rusqlite::Connection>> {
     opencode::open_readonly(&db_path)
 }
 
-fn resolve_zcode_db_path() -> Option<PathBuf> {
+pub(crate) fn resolve_zcode_db_path() -> Option<PathBuf> {
     resolve_zcode_db_path_from(std::env::var("ZCODE_STORAGE_DIR").ok(), dirs::home_dir()?)
 }
 
