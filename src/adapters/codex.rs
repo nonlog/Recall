@@ -142,10 +142,7 @@ pub(crate) fn resolve_codex_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
             Ok(_) => anyhow::bail!("Codex session root is not a directory: {}", dir.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                anyhow::bail!(
-                    "failed to inspect Codex session root {}: {error}",
-                    dir.display()
-                );
+                anyhow::bail!("failed to inspect Codex session root {}: {error}", dir.display());
             }
         }
     }
