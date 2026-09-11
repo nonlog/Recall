@@ -747,11 +747,13 @@ fn cmd_session_delete(
             if result.native_already_missing {
                 if dry_run {
                     println!(
-                        "  note: native Pi session data is already absent; only the stale Recall index would be removed"
+                        "  note: native {} session data is already absent; only the stale Recall index would be removed",
+                        session.source
                     );
                 } else {
                     println!(
-                        "  note: native Pi session data was already absent; removed the stale Recall index"
+                        "  note: native {} session data was already absent; removed the stale Recall index",
+                        session.source
                     );
                 }
             } else if result.mode == "index-only" {

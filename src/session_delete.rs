@@ -35,7 +35,7 @@ pub(crate) struct DeletePlan {
     pub(crate) mode: DeleteMode,
     pub(crate) native_roots: Vec<PathBuf>,
     pub(crate) native_command: Option<ResumeCommand>,
-    /// True only when a file-backed source was exhaustively checked and its native data is already absent.
+    /// True only when a file-backed source and any authoritative native registry were checked and its native data is already absent.
     pub(crate) native_already_missing: bool,
 }
 
@@ -71,13 +71,17 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
 
     let native_command = adapters::delete_command_for(&session.source, &session.source_id);
     let native_roots = native_roots_for_session(session)?;
-    // Pi is a file-backed source whose complete configured session roots are searched above.
-    // If that exhaustive scan finds no matching source id, there is no native data left to delete;
-    // an explicitly confirmed delete may safely remove the stale Recall index entry.
-    let native_already_missing = session.source == "pi"
+    // File-backed sources may retain stale Recall rows after their native data is gone.
+    // Only classify that state after an exhaustive trusted-root scan; Codex additionally
+    // requires its authoritative thread registry to confirm the source id is absent.
+    let native_already_missing = (session.source == "pi"
         && native_command.is_none()
         && native_roots.is_empty()
-        && pi_native_absence_confirmed(session)?;
+        && pi_native_absence_confirmed(session)?)
+        || (session.source == "codex"
+            && native_roots.is_empty()
+            && codex_native_absence_confirmed(session)?
+            && adapters::codex::native_session_exists(&session.source_id)? == Some(false));
     if native_command.is_none() && native_roots.is_empty() && !native_already_missing {
         anyhow::bail!(
             "native deletion is not supported for source {}; use --index-only explicitly to remove only the Recall index",
@@ -89,6 +93,7 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         && native_command.is_some()
         && native_roots.is_empty()
         && session.source != "opencode"
+        && !native_already_missing
     {
         anyhow::bail!(
             "source {} has a native delete command but no safe backup path; use Ctrl+D/permanent delete or --index-only explicitly",
@@ -144,18 +149,32 @@ pub(crate) fn execute(
 
     let delete_result =
         store.with_staged_session_delete(&session.source, &session.source_id, || -> Result<()> {
+            native_phase_entered = true;
             if plan.native_already_missing {
-                // Re-check after the Recall write transaction is staged. If Pi recreated/moved the
-                // session between planning and execution, fail closed and let the index rollback.
-                let current_roots = native_roots_for_session(session)?;
-                if current_roots.is_empty() && pi_native_absence_confirmed(session)? {
+                // Re-check after Recall stages the write transaction so a session recreated or moved
+                // between planning and execution cannot be silently dropped from the index.
+                let still_missing = match session.source.as_str() {
+                    "pi" => {
+                        let current_roots = pi_session_roots(session)?;
+                        current_roots.is_empty() && pi_native_absence_confirmed(session)?
+                    }
+                    "codex" => {
+                        let current_roots = codex_session_roots(session)?;
+                        current_roots.is_empty()
+                            && codex_native_absence_confirmed(session)?
+                            && adapters::codex::native_session_exists(&session.source_id)?
+                                == Some(false)
+                    }
+                    _ => false,
+                };
+                if still_missing {
                     return Ok(());
                 }
                 anyhow::bail!(
-                    "native Pi session data is no longer confirmed absent; retry deletion after its session root is available"
+                    "native {} session data is no longer confirmed absent; retry deletion after its native state is available",
+                    session.source
                 );
             }
-            native_phase_entered = true;
             match plan.mode {
                 DeleteMode::Trash => {
                     if let Some(command) = &plan.native_command {
@@ -163,13 +182,33 @@ pub(crate) fn execute(
                             let backup_dir =
                                 backup_before_native_command(session, &plan.native_roots, command)?;
                             if let Err(error) = run_native_delete_command(command) {
-                                let native_now_missing = session.source == "opencode"
-                                    && crate::adapters::opencode::native_session_exists(
+                                let reconciled = match session.source.as_str() {
+                                    "opencode" => crate::adapters::opencode::native_session_exists(
                                         &session.source_id,
-                                    )? == Some(false);
-                                if !native_now_missing {
-                                    let _ = fs::remove_dir_all(&backup_dir);
-                                    return Err(error);
+                                    )? == Some(false),
+                                    "codex" => reconcile_failed_codex_delete(
+                                        session,
+                                        &plan.native_roots,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "Codex native delete command failed: {error}; safety backup retained at {}",
+                                            backup_dir.display()
+                                        )
+                                    })?,
+                                    _ => false,
+                                };
+                                if !reconciled {
+                                    let native_paths_unchanged =
+                                        plan.native_roots.iter().all(|root| root.exists());
+                                    if native_paths_unchanged {
+                                        let _ = fs::remove_dir_all(&backup_dir);
+                                        return Err(error);
+                                    }
+                                    return Err(anyhow::anyhow!(
+                                        "{error}; native paths changed despite the command error; safety backup retained at {}",
+                                        backup_dir.display()
+                                    ));
                                 }
                             }
                             native_deleted_irreversibly = true;
@@ -186,11 +225,16 @@ pub(crate) fn execute(
                         if !opencode_already_missing
                             && let Err(error) = run_native_delete_command(command)
                         {
-                            let native_now_missing = session.source == "opencode"
-                                && crate::adapters::opencode::native_session_exists(
+                            let reconciled = match session.source.as_str() {
+                                "opencode" => crate::adapters::opencode::native_session_exists(
                                     &session.source_id,
-                                )? == Some(false);
-                            if !native_now_missing {
+                                )? == Some(false),
+                                "codex" => {
+                                    reconcile_failed_codex_delete(session, &plan.native_roots)?
+                                }
+                                _ => false,
+                            };
+                            if !reconciled {
                                 return Err(error);
                             }
                         }
@@ -220,6 +264,14 @@ pub(crate) fn execute(
             {
                 anyhow::bail!(
                     "OpenCode delete command reported success but session {} still exists in the native database",
+                    session.source_id
+                );
+            }
+            if session.source == "codex"
+                && adapters::codex::native_session_exists(&session.source_id)? == Some(true)
+            {
+                anyhow::bail!(
+                    "Codex deletion removed the rollout path but session {} still exists in the native thread registry",
                     session.source_id
                 );
             }
@@ -264,7 +316,7 @@ pub(crate) fn execute(
 fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     let source_path = session.source_file_path.as_deref().map(PathBuf::from);
     let roots = match session.source.as_str() {
-        "codex" => source_path.into_iter().collect(),
+        "codex" => codex_session_roots(session)?,
         "pi" => pi_session_roots(session)?,
         "omp" => {
             source_path.map(|path| omp_session_roots(&path, &session.source_id)).unwrap_or_default()
@@ -306,6 +358,130 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     };
 
     normalize_roots(roots)
+}
+
+fn codex_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let session_dirs = adapters::codex::resolve_codex_session_dirs()?;
+    codex_session_roots_under(
+        session.source_file_path.as_deref().map(Path::new),
+        &session.source_id,
+        &session_dirs,
+    )
+}
+
+fn codex_native_absence_confirmed(session: &Session) -> Result<bool> {
+    let session_dirs = adapters::codex::resolve_codex_session_dirs()?;
+    Ok(codex_native_absence_confirmed_under(
+        session.source_file_path.as_deref().map(Path::new),
+        &session_dirs,
+    ))
+}
+
+fn codex_native_absence_confirmed_under(
+    indexed_path: Option<&Path>,
+    session_dirs: &[PathBuf],
+) -> bool {
+    let Some(indexed_path) = indexed_path else {
+        return false;
+    };
+    !session_dirs.is_empty() && session_dirs.iter().any(|root| indexed_path.starts_with(root))
+}
+
+fn codex_session_roots_under(
+    indexed_path: Option<&Path>,
+    source_id: &str,
+    session_dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if let Some(path) = indexed_path
+        && session_dirs.iter().any(|root| canonical_path_is_within(path, root))
+        && let Some(file) = codex_session_file(path, source_id)
+    {
+        return Ok(vec![file]);
+    }
+
+    let mut matches = Vec::new();
+    for session_dir in session_dirs {
+        for entry in WalkDir::new(session_dir) {
+            let entry = entry.with_context(|| {
+                format!("failed to scan Codex session root {}", session_dir.display())
+            })?;
+            if let Some(file) = codex_session_file(entry.path(), source_id) {
+                matches.push(file);
+            }
+        }
+    }
+    let matches = normalize_roots(matches)?;
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "multiple Codex rollout files matched source id {source_id}; refusing native deletion until the ambiguity is resolved"
+        );
+    }
+    Ok(matches)
+}
+
+fn codex_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
+    if !path.is_file() || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl" | "json")) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    if !stem.starts_with("rollout-") || uuid::Uuid::try_parse(source_id).is_err() {
+        return None;
+    }
+    let prefix = stem.strip_suffix(source_id)?;
+    prefix.ends_with('-').then(|| path.to_path_buf())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexFailedDeleteAction {
+    AcceptAlreadyMissing,
+    RemoveValidatedRoots,
+    FailClosed,
+}
+
+fn codex_failed_delete_action(
+    planned_roots: &[PathBuf],
+    current_roots: &[PathBuf],
+    native_exists: Option<bool>,
+    absence_confirmed: bool,
+) -> CodexFailedDeleteAction {
+    if native_exists != Some(false) {
+        return CodexFailedDeleteAction::FailClosed;
+    }
+    if current_roots.is_empty() && absence_confirmed {
+        return CodexFailedDeleteAction::AcceptAlreadyMissing;
+    }
+    if !current_roots.is_empty() && current_roots == planned_roots {
+        return CodexFailedDeleteAction::RemoveValidatedRoots;
+    }
+    CodexFailedDeleteAction::FailClosed
+}
+
+fn reconcile_failed_codex_delete(session: &Session, planned_roots: &[PathBuf]) -> Result<bool> {
+    let current_roots = codex_session_roots(session)?;
+    let native_exists = adapters::codex::native_session_exists(&session.source_id)?;
+    let absence_confirmed =
+        current_roots.is_empty() && codex_native_absence_confirmed(session)?;
+    match codex_failed_delete_action(
+        planned_roots,
+        &current_roots,
+        native_exists,
+        absence_confirmed,
+    ) {
+        CodexFailedDeleteAction::AcceptAlreadyMissing => Ok(true),
+        CodexFailedDeleteAction::RemoveValidatedRoots => {
+            for root in &current_roots {
+                remove_path(root).with_context(|| {
+                    format!(
+                        "Codex no longer tracks session {}, but failed to remove validated rollout {}",
+                        session.source_id,
+                        root.display()
+                    )
+                })?;
+            }
+            Ok(true)
+        }
+        CodexFailedDeleteAction::FailClosed => Ok(false),
+    }
 }
 
 fn pi_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
@@ -1210,45 +1386,100 @@ mod tests {
     }
 
     #[test]
-    fn codex_uses_native_delete_command_and_keeps_file_for_backup() {
+    fn codex_uses_native_delete_command_and_validates_trusted_rollout_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.jsonl");
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let path = sessions.join(format!("rollout-2026-09-11T00-00-00-{id}.jsonl"));
         fs::write(&path, "data").unwrap();
-        let session = session(
-            "codex",
-            "11111111-1111-1111-1111-111111111111",
-            Some(path.to_string_lossy().into_owned()),
-        );
 
-        let plan = plan(&session, DeleteMode::Trash).unwrap();
-        let command = plan.native_command.unwrap();
+        let roots = codex_session_roots_under(
+            Some(&path),
+            id,
+            std::slice::from_ref(&sessions),
+        )
+        .unwrap();
+        let command = adapters::delete_command_for("codex", id).unwrap();
 
-        assert_eq!(plan.native_roots, vec![path]);
+        assert_eq!(roots, vec![path]);
         #[cfg(target_os = "windows")]
         {
             assert_eq!(command.program, "cmd.exe");
             assert_eq!(
                 command.args,
-                vec![
-                    "/D",
-                    "/C",
-                    "codex",
-                    "delete",
-                    "--force",
-                    "11111111-1111-1111-1111-111111111111"
-                ]
+                vec!["/D", "/C", "codex", "delete", "--force", id]
             );
         }
         #[cfg(not(target_os = "windows"))]
         {
             assert_eq!(command.program, "codex");
-            assert_eq!(
-                command.args,
-                vec!["delete", "--force", "11111111-1111-1111-1111-111111111111"]
-            );
+            assert_eq!(command.args, vec!["delete", "--force", id]);
         }
     }
 
+    #[test]
+    fn codex_relocates_stale_indexed_path_by_unique_source_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        let id = "22222222-2222-4222-8222-222222222222";
+        let actual = archived.join(format!("rollout-2026-09-11T00-00-00-{id}.jsonl"));
+        fs::write(&actual, "data").unwrap();
+        let stale = sessions.join(format!("rollout-2026-09-10T00-00-00-{id}.jsonl"));
+
+        let roots = codex_session_roots_under(Some(&stale), id, &[sessions, archived]).unwrap();
+
+        assert_eq!(roots, vec![actual]);
+    }
+
+    #[test]
+    fn codex_missing_native_requires_available_trusted_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let inside = sessions.join("missing.jsonl");
+        let outside = dir.path().join("outside").join("missing.jsonl");
+
+        assert!(codex_native_absence_confirmed_under(
+            Some(&inside),
+            std::slice::from_ref(&sessions)
+        ));
+        assert!(!codex_native_absence_confirmed_under(
+            Some(&outside),
+            std::slice::from_ref(&sessions)
+        ));
+        assert!(!codex_native_absence_confirmed_under(Some(&inside), &[]));
+    }
+
+    #[test]
+    fn codex_failed_command_recovery_requires_registry_absence_and_stable_roots() {
+        let planned = vec![PathBuf::from("rollout-a.jsonl")];
+        let moved = vec![PathBuf::from("rollout-b.jsonl")];
+
+        assert_eq!(
+            codex_failed_delete_action(&planned, &[], Some(false), true),
+            CodexFailedDeleteAction::AcceptAlreadyMissing
+        );
+        assert_eq!(
+            codex_failed_delete_action(&planned, &planned, Some(false), false),
+            CodexFailedDeleteAction::RemoveValidatedRoots
+        );
+        assert_eq!(
+            codex_failed_delete_action(&planned, &planned, Some(true), false),
+            CodexFailedDeleteAction::FailClosed
+        );
+        assert_eq!(
+            codex_failed_delete_action(&planned, &planned, None, false),
+            CodexFailedDeleteAction::FailClosed
+        );
+        assert_eq!(
+            codex_failed_delete_action(&planned, &moved, Some(false), false),
+            CodexFailedDeleteAction::FailClosed
+        );
+    }
     #[test]
     fn opencode_uses_native_delete_command_without_database_writes() {
         let session = session("opencode", "ses_123", None);

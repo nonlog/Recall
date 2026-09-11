@@ -127,8 +127,75 @@ fn open_url_command(url: String) -> ResumeCommand {
     ResumeCommand { program: "xdg-open".to_string(), args: vec![url] }
 }
 
-fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
+pub(crate) fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
     resolve_home_dir(".codex", "~/.codex not found, skipping Codex")
+}
+
+pub(crate) fn resolve_codex_session_dirs() -> anyhow::Result<Vec<PathBuf>> {
+    let Some(codex_dir) = resolve_codex_dir()? else {
+        return Ok(Vec::new());
+    };
+    let mut dirs = Vec::new();
+    for dir in [codex_dir.join("sessions"), codex_dir.join("archived_sessions")] {
+        match fs::metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => dirs.push(dir),
+            Ok(_) => anyhow::bail!("Codex session root is not a directory: {}", dir.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).map_err(|error| {
+                    anyhow::anyhow!("failed to inspect Codex session root {}: {error}", dir.display())
+                });
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+pub(crate) fn native_session_exists(source_id: &str) -> anyhow::Result<Option<bool>> {
+    let Some(codex_dir) = resolve_codex_dir()? else {
+        return Ok(None);
+    };
+    native_session_exists_under(&codex_dir, source_id)
+}
+
+fn native_session_exists_under(
+    codex_dir: &Path,
+    source_id: &str,
+) -> anyhow::Result<Option<bool>> {
+    let db_path = codex_dir.join("state_5.sqlite");
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&db_path, flags)?;
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(None);
+    }
+
+    let mut has_id = false;
+    let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column?.as_str() == "id" {
+            has_id = true;
+            break;
+        }
+    }
+    if !has_id {
+        return Ok(None);
+    }
+
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
+        rusqlite::params![source_id],
+        |row| row.get(0),
+    )?;
+    Ok(Some(exists))
 }
 
 fn scan_for_sync_impl(
@@ -1153,6 +1220,20 @@ mod tests {
             });
             writeln!(file, "{value}").unwrap();
         }
+    }
+
+    #[test]
+    fn codex_native_state_presence_is_queryable() {
+        let root = temp_codex_root("native-state");
+        let present = "019a4c01-e8f4-7270-bdab-7f19273b237e";
+        let absent = "019a4c01-e8f4-7270-bdab-7f19273b237f";
+        write_codex_state_names(&root, &[(present, Some("Present"))]);
+
+        assert_eq!(native_session_exists_under(&root, present).unwrap(), Some(true));
+        assert_eq!(native_session_exists_under(&root, absent).unwrap(), Some(false));
+        fs::remove_file(root.join("state_5.sqlite")).unwrap();
+        assert_eq!(native_session_exists_under(&root, present).unwrap(), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

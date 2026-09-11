@@ -23,6 +23,13 @@ Retained/requested fork behavior:
 - Windows database defaults to `<recall.exe>/data/recall.db`; `RECALL_DB_PATH` overrides it. Scoop must persist both `trash` and `data`.
 - Skill Audit scans shared `.agents`, Claude, Codex, Pi, Gemini, and OpenCode locations and normalizes Windows backslash paths for Skill-read detection.
 
+## 2026-09-11 Codex deletion reconciliation
+
+- LOG reproduced another deletion class on Recall row `7abf6fc1-2a42-4304-90bf-4e61c24bfba0` / Codex thread `01a04b13-631e-7362-aef0-7545d0a508b0`: `codex delete --force` returned exit 1, while the rollout file and Codex `state_5.sqlite.threads` row were both absent afterward. Recall rolled its staged index deletion back because command-failure reconciliation existed only for OpenCode.
+- Full LOG audit found 270 Recall-indexed Codex sessions: 166 have both a current rollout and native thread row; 104 have neither. There were zero relocated matches and zero duplicate current rollout ids. These 104 historical stale rows explain why deletion failures could recur long after the Pi-specific fix.
+- The Codex deletion path now validates/re-resolves rollouts within the available `~/.codex/sessions` and `~/.codex/archived_sessions` roots, requires the native Codex thread registry to confirm missing ids before stale-index cleanup, and reconciles nonzero native delete exits against both surfaces. A failed native command may remove the same already-backed-up validated rollout directly only when Codex itself no longer tracks the id; otherwise deletion remains fail-closed.
+- The local `D:\Workspace\Recall` repository was not modified; implementation is being developed and validated through GitHub/Actions, with LOG used only for runtime audit/smoke tests.
+
 ## v0.5.8.5 Pi orphan deletion
 
 - Feature branch `fix/pi-orphan-delete-cleanup-20260908` landed through PR #15. Final feature SHA is `117babb246b43d265628f4e59e89dfad5341ec5c`; all feature/style commits use Codex author+committer. GitHub PR CI run `34199666325` passed `make check`.

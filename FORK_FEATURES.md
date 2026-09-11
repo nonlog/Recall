@@ -38,6 +38,13 @@ Before merging or rebasing a new upstream release:
   mean native data is already absent and an explicitly confirmed delete removes the stale
   Recall index only. Multiple matches, unavailable roots, traversal/file-read errors, or
   other incomplete scans fail closed instead of guessing.
+- Codex deletion validates and re-resolves rollout files only inside the configured
+  Codex `sessions` / `archived_sessions` roots. A missing rollout becomes safe stale-index
+  cleanup only when the trusted-root scan finds no match and `state_5.sqlite` also confirms
+  the thread id is absent. If `codex delete --force` exits nonzero, Recall rechecks both
+  native surfaces: an already-absent rollout is accepted, or a still-present unchanged
+  validated rollout may be removed directly only when Codex's registry is already absent.
+  Registry ambiguity, moved paths, duplicate rollouts, and incomplete scans fail closed.
 - Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
   transaction before native data is touched. SQLite lock/constraint/vector cleanup
   failures therefore happen first; native failure rolls the staged index change back.
