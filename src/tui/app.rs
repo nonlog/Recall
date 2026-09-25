@@ -2466,7 +2466,6 @@ mod tests {
         crate::db::schema::register_sqlite_vec();
         (app_with_sources(), Store::open_in_memory().unwrap())
     }
-    }
 
     fn codex_search_result() -> SearchResult {
         SearchResult {
