@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.2.1] (2026-09-25)
+
+### nonlog fork
+
+* Merge current upstream `main` through the Devin CLI adapter on top of Recall 0.6.2, including pointer handoff, manual TUI sync, anchored message retrieval, R2 remote sync, targeted single-session sync, and newer adapters.
+* Align the fork with upstream TUI shortcuts: `Ctrl+S` runs Sync and `Ctrl+P` opens Settings, while retaining `Del` Trash, `Ctrl+D` permanent delete, and bulk selection.
+* Preserve native-aware safe deletion, per-source branding, Windows database/Trash persistence, Skill Audit discovery, and bounded structured event summaries across the upstream refactor.
+* Preserve Codex, Claude Code, and Pi native/generated title behavior across the new adapter and sync-state architecture.
+* Keep Codex discovery governed by the configured sync window; LOG validation for the reported incomplete Codex list uses `sync_window=all` and compares Recall against the current native `codex resume --all` thread set.
+
 ## [0.5.8.7] (2026-09-11)
 
 ### nonlog fork
