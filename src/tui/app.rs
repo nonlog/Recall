@@ -35,7 +35,7 @@ use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::usage_state::{UsageState, UsageTab};
 use crate::tui::usage_worker::{UsageRequest, UsageResponse};
 use crate::tui::viewing_state::ViewingState;
-use crate::types::{MatchSource, Message, SearchResult, SemanticProgress};
+use crate::types::{MatchSource, Message, SearchResult, SemanticProgress, Session};
 
 const SEARCH_DEBOUNCE_MS: u64 = 250;
 
@@ -1403,7 +1403,7 @@ impl App {
 
     fn delete_targets(&self, origin: DeleteOrigin) -> Vec<Session> {
         match origin {
-            DeleteOrigin::Viewing => self.viewing_session.clone().into_iter().collect(),
+            DeleteOrigin::Viewing => self.viewing.session.clone().into_iter().collect(),
             DeleteOrigin::Search if !self.selected_session_ids.is_empty() => self
                 .results
                 .iter()
@@ -3211,7 +3211,7 @@ mod tests {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
-        app.viewing_session = Some(codex_search_result().session);
+        app.viewing.session = Some(codex_search_result().session);
         app.mode = AppMode::Viewing;
 
         app.handle_viewing_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &store);

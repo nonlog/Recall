@@ -5,7 +5,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::handoff;
 use crate::session_delete::DeleteMode;
 use crate::tui::app::App;
 use crate::tui::search_state::{FilterFocus, PanelFocus, ProjectPickerRow, SourcePickerRow};
