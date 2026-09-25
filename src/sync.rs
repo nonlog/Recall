@@ -498,10 +498,10 @@ impl SyncJob {
             if !path_matches_scope(&self.options.scope, stored, &mut self.repo_cache) {
                 continue;
             }
-            let source_path_update = observation
-                .source_file_path
-                .as_deref()
-                .filter(|source_file_path| stored.source_file_path.as_deref() != Some(*source_file_path));
+            let source_path_update =
+                observation.source_file_path.as_deref().filter(|source_file_path| {
+                    stored.source_file_path.as_deref() != Some(*source_file_path)
+                });
             if source_path_update.is_some() || observation.custom_title.is_some() {
                 self.store.update_session_fields(
                     source_id,

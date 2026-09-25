@@ -544,10 +544,9 @@ pub(crate) fn parse_conversation_jsonl(
         if matches!(msg_type, "custom-title" | "ai-title" | "title") {
             let title = match msg_type {
                 "custom-title" => v.get("customTitle").or_else(|| v.get("title")),
-                "ai-title" | "title" => v
-                    .get("aiTitle")
-                    .or_else(|| v.get("title"))
-                    .or_else(|| v.get("customTitle")),
+                "ai-title" | "title" => {
+                    v.get("aiTitle").or_else(|| v.get("title")).or_else(|| v.get("customTitle"))
+                }
                 _ => None,
             }
             .and_then(|t| t.as_str())

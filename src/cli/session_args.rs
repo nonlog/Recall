@@ -130,9 +130,15 @@ pub(crate) enum SessionCommands {
     Delete {
         #[command(flatten)]
         selector: SessionSelector,
-        #[arg(long, help = "Permanently delete native session data instead of moving it to Recall trash")]
+        #[arg(
+            long,
+            help = "Permanently delete native session data instead of moving it to Recall trash"
+        )]
         permanent: bool,
-        #[arg(long, help = "Delete only the Recall index entry and leave native session data untouched")]
+        #[arg(
+            long,
+            help = "Delete only the Recall index entry and leave native session data untouched"
+        )]
         index_only: bool,
         #[arg(long, help = "Show what would be deleted without changing anything")]
         dry_run: bool,
