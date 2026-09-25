@@ -111,20 +111,20 @@
           "protocol": 2,
           "targets": {
             "aarch64-apple-darwin": {
-              "sha256": "159104a505bf732e277da244b2221f8601e5aa2a9d255e257b09cbcb564a4ecb",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-aarch64-apple-darwin.tar.gz"
+              "sha256": "434d06a0c582f2c052910e03678b32937dc308be7d15acad450bfb8663a79d82",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-aarch64-apple-darwin.tar.gz"
             },
             "x86_64-apple-darwin": {
-              "sha256": "2bef5ab8e4605e5b2fc628f073689a47d07c4d037c77cd43e18ab90791be8b3a",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-apple-darwin.tar.gz"
+              "sha256": "24b5168db4af7d1eecd2b5fcbed728d2faff1012f7c095bfef909f4e80baa900",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-apple-darwin.tar.gz"
             },
             "x86_64-pc-windows-msvc": {
-              "sha256": "6b7c7885b45bc2ea4fb1cfe9de80eeb3f006558a7e642b5aecd7d1f8361e943c",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-pc-windows-msvc.zip"
+              "sha256": "c0ac9a72c9592cc4f7c09a1c08169bb188199d990c5d2911958c5eb64ad835cf",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-pc-windows-msvc.zip"
             },
             "x86_64-unknown-linux-gnu": {
-              "sha256": "ab967bc7557ccf04c05c742ddcf6651d2c91ce61ca1af678e068385cbe1f11ca",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+              "sha256": "19440e15322e6b82b62bad1972dd1710f0de5f34864320fa6818ff92dd6cfdd4",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
         }
