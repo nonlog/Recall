@@ -1,6 +1,7 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 12;
+const V12_SCHEMA_VERSION: i64 = 12;
+pub(crate) const SCHEMA_VERSION: i64 = 17;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -46,9 +47,209 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 11 {
         migrate_v11(conn)?;
     }
-    if version < SCHEMA_VERSION {
+    if version < V12_SCHEMA_VERSION || fts_needs_trigram_rebuild(conn)? {
         migrate_v12(conn)?;
     }
+    let version = read_schema_version(conn)?;
+    if version < 13 {
+        migrate_v13(conn)?;
+    }
+    if version < 14 {
+        migrate_v14(conn)?;
+    }
+    if version < 15 {
+        migrate_v15(conn)?;
+    }
+    if version < 16 {
+        migrate_v16(conn)?;
+    }
+    if version < 17 {
+        migrate_v17(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_v17(conn: &Connection) -> anyhow::Result<()> {
+    let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> anyhow::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        if read_schema_version(&tx)? >= 17 {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_batch(
+            "CREATE TABLE sessions_v17 (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                directory TEXT,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                entrypoint TEXT,
+                custom_title TEXT,
+                summary TEXT,
+                duration_minutes INTEGER,
+                source_file_path TEXT,
+                is_import INTEGER NOT NULL DEFAULT 0,
+                repo_remote TEXT,
+                repo_slug TEXT,
+                repo_name TEXT,
+                thread_role TEXT CHECK (thread_role IN ('primary', 'subagent')),
+                metadata_parser_version INTEGER
+            );
+            INSERT INTO sessions_v17
+            SELECT id, source, source_id, title, directory, started_at, updated_at,
+                   message_count, entrypoint, custom_title, summary, duration_minutes,
+                   source_file_path, is_import, repo_remote, repo_slug, repo_name,
+                   thread_role, metadata_parser_version FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_v17 RENAME TO sessions;
+            CREATE INDEX idx_sessions_source ON sessions(source, source_id);
+            CREATE INDEX idx_sessions_started_at ON sessions(started_at);
+            CREATE INDEX idx_sessions_directory ON sessions(directory);
+            CREATE INDEX idx_sessions_repo_remote ON sessions(repo_remote);
+            CREATE INDEX idx_sessions_repo_slug ON sessions(repo_slug);
+            CREATE INDEX idx_sessions_repo_name ON sessions(repo_name);",
+        )?;
+        for table in ["usage_session_state", "event_session_state"] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if exists {
+                tx.execute_batch(&format!(
+                    "CREATE TABLE {table}_v17 (
+                        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                        source TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        parser_version INTEGER NOT NULL,
+                        source_updated_at INTEGER,
+                        event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+                        synced_at INTEGER NOT NULL
+                    );
+                    INSERT INTO {table}_v17 SELECT * FROM {table};
+                    DROP TABLE {table};
+                    ALTER TABLE {table}_v17 RENAME TO {table};
+                    CREATE INDEX idx_{table}_source ON {table}(source, source_id);"
+                ))?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS native_bindings (
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+                confirmed INTEGER NOT NULL CHECK (confirmed IN (0, 1)),
+                PRIMARY KEY(source, source_id)
+            );
+            INSERT OR IGNORE INTO native_bindings
+                SELECT source, source_id, id, NOT is_import FROM sessions;
+            CREATE TABLE IF NOT EXISTS session_sync (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                sync_id TEXT NOT NULL UNIQUE,
+                current_revision TEXT,
+                alternative_versions INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sync_aliases (
+                sync_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_aliases_session ON sync_aliases(session_id);
+            CREATE TABLE IF NOT EXISTS sync_revisions (
+                digest TEXT PRIMARY KEY,
+                sync_id TEXT NOT NULL,
+                body BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_revisions_identity ON sync_revisions(sync_id);
+            CREATE TABLE IF NOT EXISTS sync_objects (
+                digest TEXT PRIMARY KEY,
+                body BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS hosts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0)
+            );
+            CREATE TABLE IF NOT EXISTS session_locations (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                host_id TEXT NOT NULL REFERENCES hosts(id),
+                directory TEXT,
+                source_file_path TEXT,
+                observed_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, host_id)
+            );
+            PRAGMA user_version = 17;",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "ALTER TABLE session_parent_links ADD COLUMN parent_sync_id TEXT",
+        )?;
+        let violation: Option<String> =
+            tx.query_row("PRAGMA foreign_key_check", [], |row| row.get(0)).optional()?;
+        anyhow::ensure!(violation.is_none(), "foreign key violation after identity migration");
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn.pragma_update(None, "foreign_keys", foreign_keys);
+    result?;
+    restored?;
+    Ok(())
+}
+
+fn migrate_v16(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("
+        CREATE TABLE IF NOT EXISTS file_history_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            index_id TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO file_history_state VALUES (1, lower(hex(randomblob(16))));
+        CREATE INDEX IF NOT EXISTS idx_event_files_remote_relative ON event_files(json_extract(evidence_json, '$.target.repo_remote'), json_extract(evidence_json, '$.target.repo_relative_path'), event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_files_root_relative ON event_files(json_extract(evidence_json, '$.target.repo_root'), json_extract(evidence_json, '$.target.repo_relative_path'), event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_files_absolute ON event_files(json_extract(evidence_json, '$.target.absolute_path'), event_id);
+        ")?;
+    if read_schema_version(&tx)? >= 15 {
+        tx.execute_batch("PRAGMA user_version = 16;")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v15(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    add_column_if_missing(
+        &tx,
+        "ALTER TABLE session_events ADD COLUMN command_evidence_status TEXT
+         CHECK (command_evidence_status IN ('complete', 'unsupported', 'limit_exceeded')
+                OR command_evidence_status IS NULL)",
+    )?;
+    if read_schema_version(&tx)? >= 14 {
+        tx.execute_batch("PRAGMA user_version = 15;")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v14(conn: &Connection) -> anyhow::Result<()> {
+    let version = read_schema_version(conn)?;
+    let version_update = if version >= 13 { "PRAGMA user_version = 14;" } else { "" };
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS event_files (
+             event_id INTEGER NOT NULL REFERENCES session_events(id) ON DELETE CASCADE,
+             position INTEGER NOT NULL,
+             path TEXT NOT NULL,
+             evidence_json TEXT NOT NULL,
+             PRIMARY KEY(event_id, position)
+         );
+         CREATE INDEX IF NOT EXISTS idx_event_files_path ON event_files(path);
+         {version_update}
+         COMMIT;",
+    ))?;
     Ok(())
 }
 
@@ -360,26 +561,56 @@ fn migrate_v11(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
-    if let Err(err) = conn.execute(stmt, []) {
-        let msg = err.to_string();
-        if !msg.contains("duplicate column name") {
-            return Err(err.into());
-        }
+fn fts_needs_trigram_rebuild(conn: &Connection) -> anyhow::Result<bool> {
+    let has_messages: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_messages == 0 {
+        return Ok(false);
     }
-    Ok(())
+    let has_flag = has_trigram_message_flag(conn)?;
+    let trigger_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('messages_trigram_ai', 'messages_trigram_ad')
+           AND instr(sql, 'trigram_indexed IS NULL') > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!has_flag || trigger_count != 2 || !has_trigram_fts(conn)?)
 }
 
-#[cfg(test)]
-pub(crate) fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
+pub(crate) fn has_trigram_message_flag(conn: &Connection) -> anyhow::Result<bool> {
+    let has_flag: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('messages') WHERE name = 'trigram_indexed'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(has_flag != 0)
 }
 
-pub(crate) const fn current_schema_version() -> i64 {
-    SCHEMA_VERSION
+pub(crate) fn has_trigram_fts(conn: &Connection) -> anyhow::Result<bool> {
+    let fts_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_trigram'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(fts_sql.is_some_and(|sql| sql.contains("trigram")))
 }
 
 fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
+    compact_legacy_event_summaries(conn)?;
+    let file_backed = conn.path().is_some_and(|path| !path.is_empty());
+    migrate_v12_with_lock(conn, file_backed, crate::utils::try_acquire_worker_lock)
+}
+
+fn compact_legacy_event_summaries(conn: &Connection) -> anyhow::Result<()> {
     let has_session_events: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_events'
@@ -394,13 +625,304 @@ fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
              WHERE summary IS NOT NULL AND length(summary) > 4096;",
         )?;
     }
-    conn.execute_batch("PRAGMA user_version = 12;")?;
     Ok(())
+}
+
+fn migrate_v12_with_lock<T>(
+    conn: &Connection,
+    file_backed: bool,
+    acquire_lock: impl FnOnce() -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<()> {
+    if !fts_needs_trigram_rebuild(conn)? {
+        if read_schema_version(conn)? < V12_SCHEMA_VERSION {
+            conn.execute_batch("PRAGMA user_version = 12;")?;
+        }
+        return Ok(());
+    }
+
+    let _lock = if file_backed {
+        let Some(lock) = acquire_lock()? else {
+            eprintln!(
+                "Search index upgrade deferred: background indexing is running; will retry on next launch."
+            );
+            return Ok(());
+        };
+        Some(lock)
+    } else {
+        None
+    };
+
+    if !fts_needs_trigram_rebuild(conn)? {
+        if read_schema_version(conn)? < V12_SCHEMA_VERSION {
+            conn.execute_batch("PRAGMA user_version = 12;")?;
+        }
+        return Ok(());
+    }
+
+    eprintln!("Upgrading search index (one-time; may take a minute on large databases)...");
+    let started = std::time::Instant::now();
+    let version = read_schema_version(conn)?;
+    let version_update =
+        if version < V12_SCHEMA_VERSION { "PRAGMA user_version = 12;" } else { "" };
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE messages ADD COLUMN trigram_indexed INTEGER
+         CHECK (trigram_indexed IN (0, 1))",
+    )?;
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(err) = rebuild_trigram_fts(conn, version_update) {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(err);
+    }
+    if file_backed {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        eprintln!("Search index upgraded in {:.0?}.", started.elapsed());
+    }
+    Ok(())
+}
+
+fn migrate_v13(conn: &Connection) -> anyhow::Result<()> {
+    let version = read_schema_version(conn)?;
+    for stmt in [
+        "ALTER TABLE session_events ADD COLUMN tool_call_id TEXT",
+        "ALTER TABLE session_events ADD COLUMN is_meta INTEGER
+         CHECK (is_meta IN (0, 1) OR is_meta IS NULL)",
+        "ALTER TABLE session_events ADD COLUMN visibility TEXT
+         CHECK (visibility IN ('visible', 'hidden', 'inactive') OR visibility IS NULL)",
+    ] {
+        add_column_if_missing(conn, stmt)?;
+    }
+    if version >= V12_SCHEMA_VERSION {
+        conn.execute_batch("PRAGMA user_version = 13;")?;
+    }
+    Ok(())
+}
+
+fn rebuild_trigram_fts(conn: &Connection, version_update: &str) -> anyhow::Result<()> {
+    backfill_trigram_flags(conn)?;
+    conn.execute_batch(&format!(
+        "
+        DROP TRIGGER IF EXISTS messages_trigram_ai;
+        DROP TRIGGER IF EXISTS messages_trigram_ad;
+        DROP TABLE IF EXISTS messages_fts_trigram;
+
+        CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
+            content,
+            content=messages,
+            content_rowid=id,
+            tokenize='trigram remove_diacritics 1'
+        );
+
+        CREATE TRIGGER messages_trigram_ai AFTER INSERT ON messages
+        WHEN new.trigram_indexed = 1
+          OR new.trigram_indexed IS NULL BEGIN
+            INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
+        END;
+
+        CREATE TRIGGER messages_trigram_ad AFTER DELETE ON messages
+        WHEN old.trigram_indexed = 1
+          OR old.trigram_indexed IS NULL BEGIN
+            INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content)
+            VALUES('delete', old.id, old.content);
+        END;
+
+        INSERT INTO messages_fts_trigram(rowid, content)
+        SELECT id, content FROM messages
+        WHERE trigram_indexed = 1;
+
+        {version_update}
+
+        COMMIT;
+        ",
+    ))?;
+    Ok(())
+}
+
+fn backfill_trigram_flags(conn: &Connection) -> anyhow::Result<()> {
+    let flags: Vec<(i64, bool)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, content FROM messages WHERE trigram_indexed IS NULL")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let needs = crate::utils::text_needs_trigram(row.get_ref(1)?.as_str()?);
+            Ok((id, needs))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut update = conn.prepare("UPDATE messages SET trigram_indexed = ?2 WHERE id = ?1")?;
+    for (id, needs) in flags {
+        update.execute(rusqlite::params![id, needs])?;
+    }
+    Ok(())
+}
+
+fn add_column_if_missing(conn: &Connection, stmt: &str) -> anyhow::Result<()> {
+    if let Err(err) = conn.execute(stmt, []) {
+        let msg = err.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+fn read_schema_version(conn: &Connection) -> anyhow::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(Into::into)
+}
+
+#[cfg(test)]
+pub(crate) fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
+    read_schema_version(conn)
+}
+
+pub(crate) const fn current_schema_version() -> i64 {
+    SCHEMA_VERSION
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::store::Store;
+    use crate::types::{Message, Role};
+
+    #[test]
+    fn remote_identity_migration_preserves_v16_data_and_a_restorable_backup() {
+        register_sqlite_vec();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("recall.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;").unwrap();
+        for migrate in [
+            migrate_v1,
+            migrate_v2,
+            migrate_v3,
+            migrate_v4,
+            migrate_v5,
+            migrate_v6,
+            migrate_v7,
+            migrate_v8,
+            migrate_v9,
+            migrate_v10,
+            migrate_v11,
+            migrate_v12,
+            migrate_v13,
+            migrate_v14,
+            migrate_v15,
+            migrate_v16,
+        ] {
+            migrate(&conn).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('native', 'codex', 'raw', 'Original', 1);
+             INSERT INTO sessions(id, source, source_id, title, started_at, is_import) VALUES ('legacy', 'codex', 'old', 'Imported', 1, 1);
+             INSERT INTO messages(id, session_id, role, content, seq) VALUES (1, 'native', 'user', 'migrationpreserved', 0);
+             INSERT INTO usage_events(session_id, source, source_id, event_key, event_seq, timestamp, input_tokens, token_source, created_at)
+                 VALUES ('native', 'codex', 'raw', 'u1', 0, 1, 37, 'observed', 1);
+             INSERT INTO usage_session_state(session_id, source, source_id, parser_version, synced_at) VALUES ('native', 'codex', 'raw', 4, 1);
+             INSERT INTO session_events(id, session_id, source, source_id, event_seq, kind, actor, attrs_json, created_at)
+                 VALUES (1, 'native', 'codex', 'raw', 0, 'tool_call', 'assistant', '{\"kept\":true}', 1);
+             INSERT INTO event_session_state(session_id, source, source_id, parser_version, synced_at) VALUES ('native', 'codex', 'raw', 5, 1);
+             INSERT INTO event_files(event_id, position, path, evidence_json) VALUES (1, 0, '/work/file', '{}');
+             INSERT INTO session_parent_links VALUES ('native', 'fork', 'codex', 'old');",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message_vec(message_id, embedding) VALUES (1, ?1)",
+            [serde_json::to_string(&vec![0.1_f32; 384]).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_at(&path).unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.get_messages("native").unwrap()[0].content, "migrationpreserved");
+        assert_eq!(store.list_usage_events_for_session("native").unwrap()[0].input_tokens, 37);
+        assert_eq!(store.session_topology("native").unwrap().parents[0].source_id, "old");
+        for table in [
+            "message_vec",
+            "usage_session_state",
+            "event_session_state",
+            "session_events",
+            "event_files",
+        ] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert!(store.has_native_binding("native").unwrap());
+        assert!(!store.has_native_binding("legacy").unwrap());
+        assert!(store.get_session_by_id("native").unwrap().unwrap().locations.is_empty());
+        assert!(store.get_session_by_id("legacy").unwrap().unwrap().locations.is_empty());
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'migrationpreserved'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let backups = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("recall-before-remote-")
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        let restored = root.path().join("restored.db");
+        backup.backup(rusqlite::DatabaseName::Main, &restored, None).unwrap();
+        let restored = Connection::open(restored).unwrap();
+        assert_eq!(schema_version(&restored).unwrap(), 16);
+        assert_eq!(
+            restored
+                .query_row("SELECT content FROM messages WHERE session_id = 'native'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "migrationpreserved"
+        );
+        assert!(restored.execute("INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('collision', 'codex', 'raw', 'Duplicate', 1)", []).is_err());
+    }
+
+    #[test]
+    fn v14_preserves_existing_events_and_is_idempotent() {
+        register_sqlite_vec();
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute_batch(
+            r#"ALTER TABLE session_events DROP COLUMN command_evidence_status;
+             DROP TABLE event_files;
+             PRAGMA user_version = 13;
+             INSERT INTO sessions(id, source, source_id, title, started_at) VALUES ('history', 'codex', 'native', 'History', 1);
+             INSERT INTO session_events(session_id, source, source_id, event_seq, kind, actor, attrs_json, created_at)
+             VALUES ('history', 'codex', 'native', 0, 'tool_call', 'assistant', '{"input":"preserved"}', 1);"#,
+        ).unwrap();
+        let legacy = store.list_session_events_for_session("history").unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].files.is_empty());
+        assert_eq!(legacy[0].command_evidence_status, None);
+        migrate_v14(&store.conn).unwrap();
+        assert_eq!(
+            store.list_session_events_for_session("history").unwrap()[0].command_evidence_status,
+            None
+        );
+        init(&store.conn).unwrap();
+        init(&store.conn).unwrap();
+        let payload: String = store
+            .conn
+            .query_row(
+                "SELECT attrs_json FROM session_events WHERE session_id = 'history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, r#"{"input":"preserved"}"#);
+        assert_eq!(
+            store.list_session_events_for_session("history").unwrap()[0].command_evidence_status,
+            None
+        );
+        assert!(store.list_session_events_for_session("history").unwrap()[0].files.is_empty());
+    }
 
     #[test]
     fn migrate_v6_adds_metadata_columns_to_existing_v5_db() {
@@ -415,6 +937,7 @@ mod tests {
             PRAGMA user_version = 5;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
 
         init(&conn).unwrap();
 
@@ -440,6 +963,8 @@ mod tests {
             PRAGMA user_version = 6;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
 
         init(&conn).unwrap();
 
@@ -464,6 +989,8 @@ mod tests {
             PRAGMA user_version = 7;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
 
         init(&conn).unwrap();
 
@@ -491,6 +1018,8 @@ mod tests {
             PRAGMA user_version = 8;",
         )
         .unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
 
         init(&conn).unwrap();
 
@@ -611,20 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v11_rejects_invalid_thread_role() {
-        register_sqlite_vec();
-        let conn = Connection::open_in_memory().unwrap();
-        init(&conn).unwrap();
-        let err = conn.execute(
-            "INSERT INTO sessions (id, source, source_id, title, started_at, thread_role)
-             VALUES ('s1', 'codex', 'c1', 't', 0, 'bogus')",
-            [],
-        );
-        assert!(err.is_err(), "thread_role CHECK must reject values outside primary/subagent");
-    }
-
-    #[test]
-    fn migrate_v12_compacts_oversized_event_summaries() {
+    fn init_adds_trigram_fts_even_when_user_version_is_ahead() {
         register_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
         migrate_v1(&conn).unwrap();
@@ -640,30 +1156,312 @@ mod tests {
         migrate_v11(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO sessions (id, source, source_id, title, started_at)
-             VALUES ('s1', 'codex', 'c1', 'existing', 0);",
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
+             PRAGMA user_version = 13;",
         )
         .unwrap();
-        let oversized = "x".repeat(8_192);
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
         conn.execute(
-            "INSERT INTO session_events (
-                session_id, source, source_id, event_seq, kind, actor, summary, parser_version, created_at
-             ) VALUES ('s1', 'codex', 'c1', 1, 'tool_result', 'tool', ?1, 1, 1)",
-            rusqlite::params![oversized],
+            "INSERT INTO messages (session_id, role, content, seq) VALUES ('s1', 'user', ?1, 0)",
+            [content],
         )
         .unwrap();
 
-        assert_eq!(schema_version(&conn).unwrap(), 11);
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "unicode61 cannot match a mid-clause CJK substring");
+
         init(&conn).unwrap();
 
-        let length: i64 = conn
+        let after: i64 = conn
             .query_row(
-                "SELECT length(summary) FROM session_events WHERE session_id = 's1'",
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "trigram rebuild must re-index existing rows for substring match");
+
+        init(&conn).unwrap();
+        let stable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stable, 1, "ensure pass must be idempotent on an already-trigram index");
+
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
+        let removed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(removed, 0, "trigram index must delete rows with their messages");
+    }
+
+    #[test]
+    fn init_recreates_missing_trigram_fts_and_reindexes_existing_messages() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);
+             INSERT INTO messages (session_id, role, content, seq)
+             VALUES ('s1', 'assistant', 'context cache', 1);",
+        )
+        .unwrap();
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, seq) VALUES ('s1', 'user', ?1, 0)",
+            [content],
+        )
+        .unwrap();
+        let old_write_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_write_hits, 1, "pre-v12 inserts must remain trigram searchable");
+        let old_latin_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH 'context'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(length, 4096);
+        assert_eq!(old_latin_hits, 1, "pre-v12 Latin inserts must remain trigram searchable");
+        conn.execute_batch("DROP TABLE messages_fts_trigram;").unwrap();
+
+        init(&conn).unwrap();
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "a missing FTS table must be recreated and reindexed on open");
+        let latin_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH 'context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latin_hits, 0, "rebuild must index only CJK legacy rows");
+    }
+
+    #[test]
+    fn migrate_v12_retries_after_worker_lock_deferral() {
+        register_sqlite_vec();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(db.path()).unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+
+        migrate_v12_with_lock(&conn, true, || Ok::<Option<()>, anyhow::Error>(None)).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 11);
+        assert!(!has_trigram_fts(&conn).unwrap());
+
+        migrate_v13(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 11);
+        let structured_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_events')
+                 WHERE name IN ('tool_call_id', 'is_meta', 'visibility')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(structured_columns, 3);
+
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'cursor', 'c1', 'usage audit', 0);",
+        )
+        .unwrap();
+        let store = Store { trigram_message_flag: has_trigram_message_flag(&conn).unwrap(), conn };
+        let content = "\u{6211}\u{611f}\u{89c9}\u{8fd9}\u{4e2a}\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}\u{9700}\u{8981}\u{590d}\u{67e5}";
+        let query = "\u{7edf}\u{8ba1}\u{7684}\u{4e0d}\u{51c6}\u{786e}";
+        store
+            .insert_messages(&[Message {
+                session_id: "s1".to_string(),
+                role: Role::User,
+                content: content.to_string(),
+                timestamp: None,
+                seq: 0,
+            }])
+            .unwrap();
+
+        migrate_v12_with_lock(&store.conn, true, || Ok::<Option<()>, anyhow::Error>(Some(())))
+            .unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), V12_SCHEMA_VERSION);
+        init(&store.conn).unwrap();
+        assert_eq!(schema_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert!(has_trigram_fts(&store.conn).unwrap());
+        let hits: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts_trigram
+                 WHERE messages_fts_trigram MATCH ?1",
+                [format!("\"{query}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "messages written during deferral must join the rebuilt index");
+    }
+
+    #[test]
+    fn migrate_v13_adds_structured_event_columns_to_existing_v12_db() {
+        type EventRow = (
+            i64,
+            Option<i64>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        migrate_v10(&conn).unwrap();
+        migrate_v11(&conn).unwrap();
+        migrate_v12(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, source, source_id, title, started_at)
+             VALUES ('s1', 'codex', 'source-1', 'existing', 1000);
+             INSERT INTO session_events (
+                session_id, source, source_id, event_seq, timestamp, kind, actor,
+                name, status, target, message_seq, summary, source_path,
+                source_event_id, attrs_json, parser_version, created_at
+             ) VALUES (
+                's1', 'codex', 'source-1', 7, 1234, 'file_write', 'assistant',
+                'apply_patch', 'completed', 'src/lib.rs', 3, 'updated file',
+                '/tmp/session.jsonl', 'line:7', '{\"path\":\"src/lib.rs\"}', 4, 2000
+             );",
+        )
+        .unwrap();
+        let before: EventRow = conn
+            .query_row(
+                "SELECT event_seq, timestamp, kind, actor, name, status, target,
+                        message_seq, summary, source_path, source_event_id, parser_version
+                 FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        init(&conn).unwrap();
+
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let after: EventRow = conn
+            .query_row(
+                "SELECT event_seq, timestamp, kind, actor, name, status, target,
+                        message_seq, summary, source_path, source_event_id, parser_version
+                 FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let structured: (Option<String>, Option<bool>, Option<String>) = conn
+            .query_row(
+                "SELECT tool_call_id, is_meta, visibility FROM session_events WHERE session_id = 's1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(structured, (None, None, None));
+        assert!(conn.execute("UPDATE session_events SET is_meta = 2", []).is_err());
+        assert!(conn.execute("UPDATE session_events SET visibility = 'unknown'", []).is_err());
+
+        init(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v11_rejects_invalid_thread_role() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let err = conn.execute(
+            "INSERT INTO sessions (id, source, source_id, title, started_at, thread_role)
+             VALUES ('s1', 'codex', 'c1', 't', 0, 'bogus')",
+            [],
+        );
+        assert!(err.is_err(), "thread_role CHECK must reject values outside primary/subagent");
     }
 
     #[test]

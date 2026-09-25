@@ -10,12 +10,13 @@ impl Store {
         time_range: TimeRange,
     ) -> Result<Vec<SkillAuditEventRow>> {
         let mut sql = String::from(
-            "SELECT e.session_id, e.source,
+            "SELECT e.session_id,
                     COALESCE(e.timestamp, s.updated_at, s.started_at) AS timestamp,
                     e.name, e.target, e.attrs_json
              FROM session_events e
              JOIN sessions s ON s.id = e.session_id
-             WHERE (LOWER(e.name) IN ('skill', 'use_skill')
+             WHERE e.kind != 'tool_result'
+               AND (LOWER(e.name) IN ('skill', 'use_skill')
                     OR REPLACE(e.target, char(92), '/') LIKE '%/skills/%/SKILL.md%'
                     OR REPLACE(e.target, char(92), '/') LIKE '%/skills/%/references/%')",
         );
@@ -56,11 +57,10 @@ impl Store {
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(SkillAuditEventRow {
                 session_id: row.get(0)?,
-                source: row.get(1)?,
-                timestamp: row.get(2)?,
-                name: row.get(3)?,
-                target: row.get(4)?,
-                attrs_json: row.get(5)?,
+                timestamp: row.get(1)?,
+                name: row.get(2)?,
+                target: row.get(3)?,
+                attrs_json: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

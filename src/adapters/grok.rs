@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -6,16 +6,22 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{self, EventContext};
 use crate::adapters::file_scan::{self, FileScanEntry, FileScanOptions};
 use crate::adapters::json_util::{json_i64, jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths::{self, resolve_home_dir};
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
+    InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
+    SyncScanOutput, SyncScanResult, SyncScanStats,
 };
-use crate::db::store::Store;
-use crate::types::{RawUsageEvent, Role};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
+};
 
-const USAGE_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 2;
+const METADATA_PARSER_VERSION: u32 = 2;
+const EVENT_PARSER_VERSION: u32 = 2;
 
 pub(crate) struct GrokAdapter;
 
@@ -33,10 +39,11 @@ impl SourceAdapter for GrokAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "grok".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("grok", &["--resume", source_id]))
+    }
+
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("grok", prompt))
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -50,30 +57,31 @@ impl SourceAdapter for GrokAdapter {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
             };
-            if let Some(raw) = parse_grok_session_for_entry(&entry, mtime_ms)? {
+            if let Some(raw) = parse_grok_session_for_entry(&entry, mtime_ms, true)? {
                 sessions.push(raw);
             }
         }
         Ok(sessions)
     }
 
-    fn scan_for_sync(
+    fn scan_for_sync_output(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
+        include_events: bool,
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
         let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            let result = SyncScanResult::default();
+            if !context.has_existing_sessions() {
+                return Ok(Some(SyncScanOutput { scan: result, reconcile: None }));
+            }
+            return Ok(Some(SyncScanOutput {
+                scan: result,
+                reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
+            }));
         };
-        Ok(Some(scan_for_sync_impl(&sessions_dir, store, since_ts)?))
-    }
-
-    fn prune(&self, store: &Store) -> anyhow::Result<()> {
-        let Some(sessions_dir) = resolve_grok_sessions_dir()? else {
-            return Ok(());
-        };
-        prune_impl(&sessions_dir, store)
+        Ok(Some(scan_for_sync_impl(&sessions_dir, context, since_ts, include_events, force)?))
     }
 }
 
@@ -104,58 +112,120 @@ struct PendingAgentMessage {
 }
 
 fn resolve_grok_sessions_dir() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(home) = paths::env_path_dir("GROK_HOME") {
+        let sessions = home.join("sessions");
+        if sessions.is_dir() {
+            return Ok(Some(sessions));
+        }
+        debug!("GROK_HOME/sessions not found, skipping Grok");
+        return Ok(None);
+    }
     resolve_home_dir(".grok/sessions", "~/.grok/sessions not found, skipping Grok")
 }
 
 fn scan_for_sync_impl(
     sessions_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
-) -> anyhow::Result<SyncScanResult> {
-    let (entries, _) = collect_grok_entries(sessions_dir);
-    file_scan::run_file_scan_with_options(
-        store,
-        "grok",
-        since_ts,
-        FileScanOptions {
-            usage_parser_version: Some(USAGE_PARSER_VERSION),
-            event_parser_version: None,
-            metadata_parser_version: None,
-        },
-        entries,
-        |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms),
-    )
-}
-
-fn prune_impl(sessions_dir: &Path, store: &Store) -> anyhow::Result<()> {
-    let (_, subagent_ids) = collect_grok_entries(sessions_dir);
-    if subagent_ids.is_empty() {
-        return Ok(());
-    }
-    let existing = store.session_meta_map("grok")?;
-    for source_id in &subagent_ids {
-        if existing.contains_key(source_id) {
-            store.delete_session_data("grok", source_id)?;
+    include_events: bool,
+    force: bool,
+) -> anyhow::Result<SyncScanOutput> {
+    let (entries, reconcile) = collect_grok_entries(sessions_dir);
+    let result = if force {
+        let mut sessions = Vec::new();
+        let mut stats = SyncScanStats::default();
+        for entry in entries {
+            stats.candidates += 1;
+            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+                stats.rejected_before_parse += 1;
+                continue;
+            };
+            stats.parsed += 1;
+            if let Some(raw) = parse_grok_session_for_entry(&entry, mtime_ms, include_events)? {
+                sessions.push(raw);
+            }
         }
-    }
-    Ok(())
+        SyncScanResult { sessions, stats, observations: Vec::new() }
+    } else {
+        file_scan::run_file_scan_with_options_and_snapshot(
+            context,
+            since_ts,
+            FileScanOptions {
+                usage_parser_version: Some(USAGE_PARSER_VERSION),
+                event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+                metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
+            },
+            entries,
+            grok_session_snapshot,
+            |entry, mtime_ms| parse_grok_session_for_entry(&entry, mtime_ms, include_events),
+        )?
+    };
+    Ok(SyncScanOutput { scan: result, reconcile: Some(reconcile) })
 }
 
-fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, Vec<String>) {
+#[derive(PartialEq)]
+struct GrokSessionSnapshot {
+    updates: Option<file_scan::FileMetadataSnapshot>,
+    chat_history: Option<file_scan::FileMetadataSnapshot>,
+    summary: Option<file_scan::FileMetadataSnapshot>,
+}
+
+fn grok_session_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<GrokSessionSnapshot>> {
+    let session_dir = entry.stat_target.parent()?;
+    let snapshot = GrokSessionSnapshot {
+        updates: file_scan::file_metadata_snapshot(&session_dir.join("updates.jsonl")),
+        chat_history: file_scan::file_metadata_snapshot(&session_dir.join("chat_history.jsonl")),
+        summary: file_scan::file_metadata_snapshot(&session_dir.join("summary.json")),
+    };
+    let effective_mtime_ms = [&snapshot.updates, &snapshot.chat_history, &snapshot.summary]
+        .into_iter()
+        .flatten()
+        .filter_map(file_scan::FileMetadataSnapshot::mtime_ms)
+        .max()?;
+    Some(file_scan::FileScanSnapshot::new(effective_mtime_ms, snapshot))
+}
+
+fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, ReconcilePlan) {
     let mut entries = Vec::new();
     let mut subagent_ids = Vec::new();
+    let mut issues = Vec::new();
 
     let workspace_dirs = match fs::read_dir(sessions_dir) {
         Ok(dirs) => dirs,
         Err(err) => {
             debug!("cannot read Grok sessions dir: {err}");
-            return (entries, subagent_ids);
+            return (
+                entries,
+                ReconcilePlan::UnavailableInventory(vec![InventoryIssue {
+                    path: sessions_dir.to_path_buf(),
+                    category: err.kind(),
+                }]),
+            );
         }
     };
 
-    for workspace_entry in workspace_dirs.flatten() {
+    for workspace_entry in workspace_dirs {
+        let workspace_entry = match workspace_entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(InventoryIssue {
+                    path: sessions_dir.to_path_buf(),
+                    category: err.kind(),
+                });
+                continue;
+            }
+        };
         let workspace_path = workspace_entry.path();
-        if !workspace_path.is_dir() {
+        let workspace_metadata = match fs::metadata(&workspace_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                issues.push(InventoryIssue { path: workspace_path, category: err.kind() });
+                continue;
+            }
+        };
+        if !workspace_metadata.is_dir() {
             continue;
         }
         let workspace_name =
@@ -165,40 +235,92 @@ fn collect_grok_entries(sessions_dir: &Path) -> (Vec<FileScanEntry>, Vec<String>
         }
 
         let fallback_directory = decode_grok_workspace_dir(workspace_name);
-
-        let session_dirs = match fs::read_dir(&workspace_path) {
-            Ok(dirs) => dirs,
-            Err(_) => continue,
-        };
-
-        for session_entry in session_dirs.flatten() {
-            let session_path = session_entry.path();
-            if !session_path.is_dir() {
-                continue;
-            }
-            let session_id = match session_path.file_name().and_then(|name| name.to_str()) {
-                Some(id) if is_grok_session_id(id) => id.to_string(),
-                _ => continue,
-            };
-
-            let updates_path = session_path.join("updates.jsonl");
-            if !updates_path.is_file() {
-                continue;
-            }
-
-            let (summary_directory, session_kind) = load_summary_probe(&session_path);
-            if matches!(session_kind.as_deref(), Some("subagent" | "subagent_resume")) {
-                subagent_ids.push(session_id);
-                continue;
-            }
-
-            let directory = summary_directory.or(fallback_directory.clone());
-
-            entries.push(FileScanEntry { session_id, stat_target: updates_path, directory });
-        }
+        collect_grok_workspace(
+            &workspace_path,
+            fallback_directory,
+            &mut entries,
+            &mut subagent_ids,
+            &mut issues,
+        );
     }
 
-    (entries, subagent_ids)
+    let reconcile = if issues.is_empty() {
+        ReconcilePlan::ExactTombstones(subagent_ids.into_iter().collect::<HashSet<_>>())
+    } else {
+        ReconcilePlan::PartialInventory(issues)
+    };
+    (entries, reconcile)
+}
+
+fn collect_grok_workspace(
+    workspace_path: &Path,
+    fallback_directory: Option<String>,
+    entries: &mut Vec<FileScanEntry>,
+    subagent_ids: &mut Vec<String>,
+    issues: &mut Vec<InventoryIssue>,
+) {
+    let session_dirs = match fs::read_dir(workspace_path) {
+        Ok(dirs) => dirs,
+        Err(err) => {
+            issues
+                .push(InventoryIssue { path: workspace_path.to_path_buf(), category: err.kind() });
+            return;
+        }
+    };
+
+    for session_entry in session_dirs {
+        let session_entry = match session_entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(InventoryIssue {
+                    path: workspace_path.to_path_buf(),
+                    category: err.kind(),
+                });
+                continue;
+            }
+        };
+        let session_path = session_entry.path();
+        let session_metadata = match fs::metadata(&session_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                issues.push(InventoryIssue { path: session_path, category: err.kind() });
+                continue;
+            }
+        };
+        if !session_metadata.is_dir() {
+            continue;
+        }
+        let session_id = match session_path.file_name().and_then(|name| name.to_str()) {
+            Some(id) if is_grok_session_id(id) => id.to_string(),
+            _ => continue,
+        };
+
+        let updates_path = session_path.join("updates.jsonl");
+        let chat_history_path = session_path.join("chat_history.jsonl");
+        let has_updates = match fs::metadata(&updates_path) {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => false,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                issues.push(InventoryIssue { path: updates_path.clone(), category: err.kind() });
+                continue;
+            }
+        };
+        let has_history = chat_history_path.is_file();
+        if !has_updates && !has_history {
+            continue;
+        }
+        let stat_target = if has_updates { updates_path } else { chat_history_path };
+
+        let (summary_directory, session_kind) = load_summary_probe(&session_path);
+        if matches!(session_kind.as_deref(), Some("subagent" | "subagent_resume")) {
+            subagent_ids.push(session_id);
+            continue;
+        }
+
+        let directory = summary_directory.or(fallback_directory.clone());
+        entries.push(FileScanEntry { session_id, stat_target, directory });
+    }
 }
 
 fn load_summary_probe(session_dir: &Path) -> (Option<String>, Option<String>) {
@@ -249,47 +371,73 @@ fn decode_grok_workspace_dir(encoded: &str) -> Option<String> {
 fn parse_grok_session_for_entry(
     entry: &FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let session_dir = entry
         .stat_target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("grok updates path has no parent"))?;
 
-    let summary = match load_grok_summary(session_dir, &entry.session_id) {
-        Ok(summary) => summary,
-        Err(err) => {
-            debug!("failed to read Grok summary for {}: {err}", entry.session_id);
-            return Ok(None);
-        }
+    let summary = load_grok_summary(session_dir, &entry.session_id).unwrap_or(GrokSummary {
+        session_id: entry.session_id.clone(),
+        directory: entry.directory.clone(),
+        started_at: 0,
+        updated_at: None,
+        current_model_id: None,
+    });
+
+    let updates_path = session_dir.join("updates.jsonl");
+    let directory = summary.directory.clone().or(entry.directory.clone());
+    let (mut messages, mut usage_events, mut session_events) = if updates_path.try_exists()? {
+        parse_grok_updates(&updates_path, directory.as_deref(), include_events)?
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
     };
 
-    let (messages, mut usage_events) = match parse_grok_updates(&entry.stat_target) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            debug!("failed to parse Grok updates {}: {err}", entry.stat_target.display());
-            return Ok(None);
-        }
-    };
-
+    let usage_source_path = updates_path.to_str().map(str::to_string);
+    let mut source_path = usage_source_path.clone();
     if messages.is_empty() {
+        let chat_history_path = session_dir.join("chat_history.jsonl");
+        if chat_history_path.is_file() {
+            let (history_messages, history_events) = parse_chat_history_fallback(
+                &chat_history_path,
+                directory.as_deref(),
+                include_events,
+            )?;
+            messages = history_messages;
+            for event in &mut session_events {
+                event.message_seq = None;
+            }
+            for mut event in history_events {
+                event.event_seq = session_events.len() as u32;
+                session_events.push(event);
+            }
+            source_path = chat_history_path.to_str().map(str::to_string);
+        }
+    }
+
+    if messages.is_empty() && session_events.is_empty() {
         return Ok(None);
     }
 
     let fallback_model = summary.current_model_id.clone().unwrap_or_else(|| "grok".to_string());
-    let source_path = entry.stat_target.to_str().map(str::to_string);
     for event in &mut usage_events {
         if event.model.is_empty() {
             event.model = fallback_model.clone();
         }
-        event.source_path = source_path.clone();
+        event.source_path = usage_source_path.clone();
     }
 
-    let started_at =
-        summary.started_at.max(messages.first().and_then(|message| message.timestamp).unwrap_or(0));
+    let first_timestamp = messages
+        .first()
+        .and_then(|message| message.timestamp)
+        .or_else(|| session_events.first().and_then(|event| event.timestamp));
+    let started_at = summary.started_at.max(first_timestamp.unwrap_or(0));
+    let started_at = if started_at == 0 { mtime_ms } else { started_at };
 
     let mut session = RawSession::search_only(
         summary.session_id,
-        summary.directory.or(entry.directory.clone()),
+        directory,
         started_at,
         summary.updated_at.or(Some(mtime_ms)),
         None,
@@ -297,6 +445,11 @@ fn parse_grok_session_for_entry(
     )
     .with_usage(usage_events, USAGE_PARSER_VERSION);
 
+    session.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+    session.refresh_session_on_metadata_backfill = true;
+    if include_events {
+        session = session.with_events(session_events, EVENT_PARSER_VERSION);
+    }
     session.updated_at = Some(mtime_ms);
     session.source_file_path = source_path;
     Ok(Some(session))
@@ -335,23 +488,155 @@ fn load_grok_summary(session_dir: &Path, fallback_id: &str) -> anyhow::Result<Gr
     Ok(GrokSummary { session_id, directory, started_at, updated_at, current_model_id })
 }
 
+fn parse_chat_history_fallback(
+    path: &Path,
+    cwd: Option<&str>,
+    include_events: bool,
+) -> anyhow::Result<(Vec<RawMessage>, Vec<RawSessionEvent>)> {
+    let file = fs::File::open(path)?;
+    let mut messages = Vec::new();
+    let mut session_events = Vec::new();
+    for item in jsonl_indexed(BufReader::new(file).lines()) {
+        let (line, val) = item?;
+        let msg_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+        match msg_type {
+            "user" => {
+                if val.get("synthetic_reason").is_some_and(|reason| !reason.is_null()) {
+                    continue;
+                }
+                let text = grok_history_text(val.get("content"));
+                let queries = extract_user_queries(&text);
+                let body = if queries.is_empty() { text } else { queries.join("\n\n") };
+                if !body.is_empty() {
+                    messages.push(RawMessage { role: Role::User, content: body, timestamp: None });
+                }
+            }
+            "assistant" => {
+                let text = grok_history_text(val.get("content"));
+                if !text.is_empty() {
+                    messages.push(RawMessage {
+                        role: Role::Assistant,
+                        content: text,
+                        timestamp: None,
+                    });
+                }
+                if include_events
+                    && let Some(calls) = val.get("tool_calls").and_then(Value::as_array)
+                {
+                    for (index, call) in calls.iter().enumerate() {
+                        let input = call.get("arguments").and_then(|value| {
+                            value.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        });
+                        let update = serde_json::json!({
+                            "sessionUpdate":"tool_call", "title":call.get("name"),
+                            "toolCallId":call.get("id"), "rawInput":input
+                        });
+                        session_events.push(parse_grok_tool_event(
+                            &val,
+                            &update,
+                            EventContext {
+                                event_seq: session_events.len() as u32,
+                                timestamp: None,
+                                source_path: path.to_str().map(str::to_string),
+                                source_event_id: Some(format!("history:{line}:tool:{index}")),
+                                message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                                parser_version: EVENT_PARSER_VERSION,
+                            },
+                            cwd,
+                        ));
+                    }
+                }
+            }
+            "tool_result" if include_events => {
+                let mut event = events::tool_result_event(
+                    EventContext {
+                        event_seq: session_events.len() as u32,
+                        timestamp: None,
+                        source_path: path.to_str().map(str::to_string),
+                        source_event_id: Some(format!("history:{line}")),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    },
+                    None,
+                    val.get("content").and_then(Value::as_str).map(str::to_string),
+                );
+                event.tool_call_id = val
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string);
+                event.attrs_json = Some(val.to_string());
+                session_events.push(event);
+            }
+            _ => {}
+        }
+    }
+    Ok((messages, session_events))
+}
+
+fn grok_history_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .or_else(|| item.get("text").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::Object(object)) => {
+            object.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+fn extract_user_queries(text: &str) -> Vec<String> {
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        rest = &rest[start + OPEN.len()..];
+        let Some(end) = rest.find(CLOSE) else {
+            break;
+        };
+        let body = rest[..end].trim();
+        if !body.is_empty() {
+            blocks.push(body.to_string());
+        }
+        rest = &rest[end + CLOSE.len()..];
+    }
+    blocks
+}
+
 fn parse_grok_updates(
     updates_path: &Path,
-) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>)> {
+    cwd: Option<&str>,
+    include_events: bool,
+) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>, Vec<RawSessionEvent>)> {
     let file = fs::File::open(updates_path)?;
-    parse_grok_updates_reader(BufReader::new(file))
+    parse_grok_updates_reader(BufReader::new(file), updates_path.to_str(), cwd, include_events)
 }
 
 fn parse_grok_updates_reader<R: BufRead>(
     reader: R,
-) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>)> {
+    source_path: Option<&str>,
+    cwd: Option<&str>,
+    include_events: bool,
+) -> anyhow::Result<(Vec<RawMessage>, Vec<RawUsageEvent>, Vec<RawSessionEvent>)> {
     let mut messages = Vec::new();
+    let mut session_events = Vec::new();
     let mut pending_agent: Option<PendingAgentMessage> = None;
     let mut prompts: Vec<PromptTokenState> = Vec::new();
     let mut prompt_index: HashMap<String, usize> = HashMap::new();
     let mut last_model: Option<String> = None;
     for item in jsonl_indexed(reader.lines()) {
-        let (_, doc) = item?;
+        let (line_index, doc) = item?;
 
         let params = match doc.get("params") {
             Some(params) => params,
@@ -363,7 +648,7 @@ fn parse_grok_updates_reader<R: BufRead>(
         };
         let session_update =
             update.get("sessionUpdate").and_then(|value| value.as_str()).unwrap_or("");
-        let timestamp_ms = json_i64(doc.get("timestamp")).map(|ts| ts * 1000);
+        let timestamp_ms = json_i64(doc.get("timestamp")).and_then(|ts| ts.checked_mul(1000));
         track_prompt_tokens(params, timestamp_ms, &mut prompts, &mut prompt_index, &mut last_model);
 
         match session_update {
@@ -390,24 +675,18 @@ fn parse_grok_updates_reader<R: BufRead>(
                     );
                 }
             }
-            "tool_call" => {
-                if let Some(content) = format_tool_call(update) {
-                    messages.push(RawMessage {
-                        role: Role::Assistant,
-                        content,
+            "tool_call" | "tool_call_update" => {
+                pending_agent = None;
+                if include_events {
+                    let context = EventContext {
+                        event_seq: session_events.len() as u32,
                         timestamp: timestamp_ms,
-                    });
-                }
-            }
-            "tool_call_update" => {
-                if update.get("status").and_then(|status| status.as_str()) == Some("completed")
-                    && let Some(content) = format_tool_call_result(update)
-                {
-                    messages.push(RawMessage {
-                        role: Role::Assistant,
-                        content,
-                        timestamp: timestamp_ms,
-                    });
+                        source_path: source_path.map(str::to_string),
+                        source_event_id: Some(line_index.to_string()),
+                        message_seq: messages.len().checked_sub(1).map(|seq| seq as u32),
+                        parser_version: EVENT_PARSER_VERSION,
+                    };
+                    session_events.push(parse_grok_tool_event(&doc, update, context, cwd));
                 }
             }
             "agent_thought_chunk" | "available_commands_update" => {}
@@ -415,7 +694,7 @@ fn parse_grok_updates_reader<R: BufRead>(
         }
     }
 
-    Ok((messages, prompt_usage_events(prompts)))
+    Ok((messages, prompt_usage_events(prompts), session_events))
 }
 
 fn track_prompt_tokens(
@@ -570,44 +849,109 @@ fn extract_update_chunk_text(content: Option<&Value>) -> String {
     String::new()
 }
 
-fn format_tool_call(update: &Value) -> Option<String> {
-    let title = update.get("title").and_then(|title| title.as_str()).unwrap_or("tool");
-    let raw_input = update
-        .get("rawInput")
-        .map(|input| serde_json::to_string(input).unwrap_or_default())
-        .unwrap_or_default();
-    if raw_input.is_empty() {
-        return Some(format!("[{title}]"));
+fn parse_grok_tool_event(
+    doc: &Value,
+    update: &Value,
+    context: EventContext,
+    cwd: Option<&str>,
+) -> RawSessionEvent {
+    let is_call = update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call");
+    let name = update.get("title").and_then(Value::as_str);
+    let input = update.get("rawInput");
+    let mut event = if is_call {
+        events::tool_call_event(context, name.unwrap_or("tool").to_string(), input)
+    } else {
+        events::tool_result_event(context, name.map(str::to_string), None)
+    };
+    event.status = update.get("status").and_then(Value::as_str).map(str::to_string);
+    event.tool_call_id = update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string);
+    event.attrs_json = Some(doc.to_string());
+    event.files = grok_file_evidence(update, cwd);
+    if is_call
+        && name == Some("run_terminal_command")
+        && let Some(command) = input.and_then(|input| input.get("command")).and_then(Value::as_str)
+    {
+        let (files, status) = events::shell_file_evidence(command, None);
+        event.files = files;
+        event.command_evidence_status = Some(status);
     }
-    Some(format!("[{title}] {raw_input}"))
+    if is_call {
+        event.kind = match name {
+            Some("read_file") => "file_read",
+            Some("search_replace" | "write") => "file_write",
+            Some("run_terminal_command") => "command",
+            _ => "tool_call",
+        }
+        .to_string();
+        event.target = if name == Some("run_terminal_command") {
+            input.and_then(|input| input.get("command")).and_then(Value::as_str).map(str::to_string)
+        } else {
+            event.files.first().map(|file| file.path.clone())
+        };
+    } else {
+        event.target = event.files.first().map(|file| file.path.clone());
+    }
+    event
 }
 
-fn format_tool_call_result(update: &Value) -> Option<String> {
-    let title = update.get("title").and_then(|title| title.as_str()).unwrap_or("tool");
-    let content = update
-        .get("content")
-        .and_then(|content| content.as_array())
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("content"))
-        .and_then(|content| content.get("text"))
-        .and_then(|text| text.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            let text = extract_update_text(update.get("content"));
-            (!text.is_empty()).then_some(text)
-        })?;
-
-    let mut out = format!("[{title}] -> ");
-    const MAX_CHARS: usize = 500;
-    if content.chars().count() > MAX_CHARS {
-        out.push_str(&content.chars().take(MAX_CHARS).collect::<String>());
-        out.push_str("...");
+fn grok_file_evidence(update: &Value, cwd: Option<&str>) -> Vec<FileEvidence> {
+    let mut files = Vec::new();
+    let is_call = update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call");
+    let kind = if is_call { FileEvidenceKind::Call } else { FileEvidenceKind::Observation };
+    let mut add = |path: Option<&str>, operation| {
+        if let Some(path) = path.filter(|path| !path.trim().is_empty()) {
+            let file = FileEvidence {
+                path: path.to_string(),
+                operation,
+                kind: kind.clone(),
+                cwd: cwd.map(str::to_string),
+                target: None,
+            };
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    };
+    if is_call {
+        let input = update.get("rawInput");
+        match update.get("title").and_then(Value::as_str) {
+            Some("read_file") => add(
+                input.and_then(|input| input.get("target_file")).and_then(Value::as_str),
+                FileOperation::Read,
+            ),
+            Some("search_replace" | "write") => add(
+                input.and_then(|input| input.get("file_path")).and_then(Value::as_str),
+                FileOperation::Write,
+            ),
+            _ => {}
+        }
     } else {
-        out.push_str(&content);
+        if let Some(output) = update.get("rawOutput") {
+            match output.get("type").and_then(Value::as_str) {
+                Some("ReadFile") => add(
+                    output.pointer("/FileContent/absolute_path").and_then(Value::as_str),
+                    FileOperation::Read,
+                ),
+                Some("SearchReplace") => add(
+                    output.pointer("/EditsApplied/absolute_path").and_then(Value::as_str),
+                    FileOperation::Write,
+                ),
+                _ => {}
+            }
+        }
+        if let Some(content) = update.get("content").and_then(Value::as_array) {
+            for item in content {
+                if item.get("type").and_then(Value::as_str) == Some("diff") {
+                    add(item.get("path").and_then(Value::as_str), FileOperation::Write);
+                }
+            }
+        }
     }
-    Some(out)
+    files
 }
 
 #[cfg(test)]
@@ -615,13 +959,11 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_grok_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -650,23 +992,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "grok".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -687,7 +1018,8 @@ mod tests {
 {"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}},"_meta":{"totalTokens":400,"promptId":"prompt-2","turnStartMs":2000}}}
 "#;
 
-        let (messages, usage_events) = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+        let (messages, usage_events, _) =
+            parse_grok_updates_reader(Cursor::new(jsonl), None, None, true).unwrap();
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, Role::User);
@@ -703,13 +1035,92 @@ mod tests {
     }
 
     #[test]
+    fn parse_grok_updates_preserves_native_edit_lifecycle() {
+        let jsonl = r#"{"timestamp":1788319322,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Document share inventory"}}}}
+{"timestamp":1788319323,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"edit-101","title":"search_replace","rawInput":{"file_path":"README.zh-CN.md","old_string":"share","new_string":"share\nlist"}}}}
+{"timestamp":1788319323,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"edit-101","kind":"edit","title":"Edit README.zh-CN.md","content":[{"type":"diff","path":"README.zh-CN.md","oldText":"share","newText":"share\nlist"}],"rawInput":{"variant":"SearchReplace","file_path":"README.zh-CN.md","old_string":"share","new_string":"share\nlist","replace_all":false}}}}
+{"timestamp":1788319324,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"edit-101","status":"completed","content":[{"type":"diff","path":"README.zh-CN.md","oldText":"share","newText":"share\nlist"}],"rawOutput":{"type":"SearchReplace","EditsApplied":{"absolute_path":"README.zh-CN.md","old_string":"share","new_string":"share\nlist","edits":{"details":[{"old_line":28,"new_line":28}]}}}}}}
+{"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"failed-edit","status":"failed","content":[{"type":"content","content":{"type":"text","text":"No match"}}]}}}
+{"timestamp":1788319325,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"read-102","title":"read_file","rawInput":{"target_file":"README.zh-CN.md"}}}}
+{"timestamp":1788319326,"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"read-102","status":"completed","rawOutput":{"type":"ReadFile","FileContent":{"absolute_path":"README.zh-CN.md","content":"share\nlist","total_lines":2}}}}}
+{"timestamp":1788319327,"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"shell-103","title":"run_terminal_command","rawInput":{"command":"git diff -- README.zh-CN.md"}}}}
+"#;
+        let (messages, _, events) = parse_grok_updates_reader(
+            Cursor::new(jsonl),
+            Some("/native/updates.jsonl"),
+            Some("/tmp/project"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(events.len(), 7);
+        for (index, event) in events[..3].iter().enumerate() {
+            assert_eq!(event.tool_call_id.as_deref(), Some("edit-101"));
+            assert_eq!(event.source_event_id, Some((index + 1).to_string()));
+            assert_eq!(event.source_path.as_deref(), Some("/native/updates.jsonl"));
+            assert_eq!(event.message_seq, Some(0));
+            assert_eq!(event.files.len(), 1);
+            assert_eq!(event.files[0].operation, FileOperation::Write);
+            assert_eq!(event.files[0].path, "README.zh-CN.md");
+            assert_eq!(event.files[0].cwd.as_deref(), Some("/tmp/project"));
+            assert!(event.files[0].target.is_none());
+            let original: Value =
+                serde_json::from_str(jsonl.lines().nth(index + 1).unwrap()).unwrap();
+            let preserved: Value =
+                serde_json::from_str(event.attrs_json.as_deref().unwrap()).unwrap();
+            assert_eq!(original, preserved);
+        }
+        assert_eq!(events[0].files[0].kind, FileEvidenceKind::Call);
+        assert_eq!(events[1].files[0].kind, FileEvidenceKind::Observation);
+        assert_eq!(events[2].files[0].kind, FileEvidenceKind::Observation);
+        assert_eq!(events[0].timestamp, Some(1_788_319_323_000));
+        assert_eq!(events[0].status, None);
+        assert_eq!(events[1].status, None);
+        assert_eq!(events[2].status.as_deref(), Some("completed"));
+        assert_eq!(events[3].status.as_deref(), Some("failed"));
+        assert_eq!(events[3].timestamp, None);
+        assert!(events[3].files.is_empty());
+        assert_eq!(events[4].files[0].operation, FileOperation::Read);
+        assert_eq!(events[5].files[0].kind, FileEvidenceKind::Observation);
+        assert_eq!(events[5].files[0].operation, FileOperation::Read);
+        assert_eq!(events[6].kind, "command");
+        assert_eq!(events[6].target.as_deref(), Some("git diff -- README.zh-CN.md"));
+        assert!(events[6].files.is_empty());
+        assert_eq!(
+            events[6].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Unsupported)
+        );
+        let (_, _, reads) = parse_grok_updates_reader(
+            Cursor::new(
+                jsonl.replace("git diff -- README.zh-CN.md", "git restore -- README.zh-CN.md"),
+            ),
+            Some("/native/updates.jsonl"),
+            Some("/tmp/project"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(reads[6].files[0].path, "README.zh-CN.md");
+        assert_eq!(reads[6].files[0].kind, FileEvidenceKind::Command);
+        assert_eq!(reads[6].files[0].cwd, None);
+        assert_eq!(
+            reads[6].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Unsupported)
+        );
+        let (messages, _, events) =
+            parse_grok_updates_reader(Cursor::new(jsonl), None, None, false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn parse_grok_updates_resyncs_after_compaction_shrink() {
         let jsonl = r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"a"}},"_meta":{"totalTokens":1000,"promptId":"prompt-a"}}}
 {"timestamp":20,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"b"}},"_meta":{"totalTokens":800,"promptId":"prompt-b"}}}
 {"timestamp":30,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"c"}},"_meta":{"totalTokens":900,"promptId":"prompt-c"}}}
 "#;
 
-        let (_, usage_events) = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+        let (_, usage_events, _) =
+            parse_grok_updates_reader(Cursor::new(jsonl), None, None, true).unwrap();
 
         assert_eq!(usage_events.len(), 2);
         assert_eq!(usage_events[0].event_key, "prompt:prompt-a");
@@ -726,13 +1137,98 @@ mod tests {
 {"timestamp":21,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}},"_meta":{"promptId":"prompt-2","turnStartMs":2000}}}
 "#;
 
-        let (messages, _) = parse_grok_updates_reader(Cursor::new(jsonl)).unwrap();
+        let (messages, _, _) =
+            parse_grok_updates_reader(Cursor::new(jsonl), None, None, true).unwrap();
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[1].content, "first response");
         assert_eq!(messages[1].timestamp, Some(11_000));
         assert_eq!(messages[3].content, "second");
+    }
+
+    #[test]
+    fn parse_grok_session_falls_back_to_chat_history_without_losing_usage_provenance() {
+        let root = temp_grok_root("history");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let session_dir = root.join("%2Ftmp").join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        let updates_path = session_dir.join("updates.jsonl");
+        fs::write(
+            &updates_path,
+            r#"{"timestamp":10,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}},"_meta":{"totalTokens":100,"promptId":"prompt-a"}}}
+"#,
+        )
+        .unwrap();
+        let chat_history_path = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat_history_path,
+            r#"{"type":"user","content":[{"type":"text","text":"<user_query>hello from history</user_query>"}]}
+{"type":"user","synthetic_reason":"env","content":"ignore"}
+{"type":"assistant","content":"hi","tool_calls":[{"id":"call-1","name":"search_replace","arguments":"{\"file_path\":\"/repo/a.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"}]}
+{"type":"tool_result","tool_call_id":"call-1","content":"edited"}
+"#,
+        )
+        .unwrap();
+        let session = parse_grok_session_for_entry(
+            &FileScanEntry {
+                session_id: session_id.to_string(),
+                stat_target: updates_path.clone(),
+                directory: None,
+            },
+            1,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(session.events[0].files[0].path, "/repo/a.rs");
+        assert_eq!(session.events[0].files[0].kind, FileEvidenceKind::Call);
+        assert!(session.events[1].files.is_empty());
+        assert!(session.events.iter().all(|event| event.tool_call_id.as_deref() == Some("call-1")
+            && event.status.is_none()
+            && event.message_seq == Some(1)));
+        let attrs: Value =
+            serde_json::from_str(session.events[0].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs["tool_calls"][0]["id"], "call-1");
+        let repeated_update = r#"{"timestamp":11,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","title":"search_replace","toolCallId":"call-1","rawOutput":{"partial":"working"}}}}
+"#;
+        let mut updates = fs::read_to_string(&updates_path).unwrap();
+        updates.push_str(repeated_update);
+        fs::write(&updates_path, updates).unwrap();
+        let combined = parse_grok_session_for_entry(
+            &FileScanEntry {
+                session_id: session_id.to_string(),
+                stat_target: updates_path.clone(),
+                directory: None,
+            },
+            2,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(combined.events.len(), 3);
+        assert_eq!(combined.events[0].actor, "tool");
+        assert_eq!(combined.events[2].actor, "tool");
+        let partial: Value =
+            serde_json::from_str(combined.events[0].attrs_json.as_deref().unwrap()).unwrap();
+        let terminal: Value =
+            serde_json::from_str(combined.events[2].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(partial["params"]["update"]["rawOutput"]["partial"], "working");
+        assert_eq!(terminal["type"], "tool_result");
+        assert_eq!(terminal["tool_call_id"], "call-1");
+        assert_eq!(combined.events[0].source_path.as_deref(), updates_path.to_str());
+        assert_eq!(combined.events[0].message_seq, None);
+        assert_eq!(combined.events[1].source_path.as_deref(), chat_history_path.to_str());
+        assert_eq!(combined.events[1].message_seq, Some(1));
+        assert_eq!(session.messages[0].content, "hello from history");
+        assert_eq!(session.messages[1].content, "hi");
+        assert_eq!(session.source_file_path.as_deref(), chat_history_path.to_str());
+        assert_eq!(session.usage_events.len(), 1);
+        assert_eq!(session.usage_events[0].source_path.as_deref(), updates_path.to_str());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -747,11 +1243,14 @@ mod tests {
             r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"019e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hey"}}}}"#,
         );
 
-        let (entries, subagent_ids) = collect_grok_entries(&root);
+        let (entries, reconcile) = collect_grok_entries(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, session_id);
         assert_eq!(entries[0].directory.as_deref(), Some("/tmp/from-summary"));
-        assert!(subagent_ids.is_empty());
+        assert!(matches!(
+            reconcile,
+            ReconcilePlan::ExactTombstones(ids) if ids.is_empty()
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -784,17 +1283,103 @@ mod tests {
             r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"229e9003-1ed9-70e3-803b-1e7f96a072eb","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"machinery"}}}}"#,
         );
 
-        let (entries, mut subagent_ids) = collect_grok_entries(&root);
+        let (entries, reconcile) = collect_grok_entries(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, normal_id);
-        subagent_ids.sort();
-        assert_eq!(subagent_ids, vec![subagent_id.to_string(), resume_id.to_string()]);
+        assert!(matches!(
+            reconcile,
+            ReconcilePlan::ExactTombstones(ids)
+                if ids == HashSet::from([subagent_id.to_string(), resume_id.to_string()])
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn prune_deletes_existing_subagent_session() {
+    fn unreadable_root_is_unavailable_without_reconcile_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let not_directory = root.path().join("sessions");
+        fs::write(&not_directory, "not a directory").unwrap();
+        let store = setup_store();
+
+        let result = scan_for_sync_impl(
+            &not_directory,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(result.reconcile, Some(ReconcilePlan::UnavailableInventory(_))));
+    }
+
+    #[test]
+    fn unreadable_nested_directory_is_partial_without_reconcile_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let not_directory = root.path().join("workspace");
+        fs::write(&not_directory, "not a directory").unwrap();
+        let mut entries = Vec::new();
+        let mut subagent_ids = Vec::new();
+        let mut issues = Vec::new();
+
+        collect_grok_workspace(&not_directory, None, &mut entries, &mut subagent_ids, &mut issues);
+
+        assert!(entries.is_empty());
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn parse_failure_preserves_existing_session() {
+        let root = temp_grok_root("parse-failure");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            "not json",
+        );
+        let store = setup_store();
+        store.insert_session(&make_existing_session(session_id, 1, 1)).unwrap();
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(result.scan.sessions.is_empty());
+        assert!(store.session_meta("grok", session_id).unwrap().is_some());
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids.is_empty()
+        ));
+
+        let session_dir = root.join("%2Ftmp%2Fproject").join(session_id);
+        fs::write(session_dir.join("updates.jsonl"), [0xff, b'\n']).unwrap();
+        fs::write(
+            session_dir.join("chat_history.jsonl"),
+            "{\"role\":\"user\",\"content\":\"fallback\"}\n",
+        )
+        .unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            true,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(store.session_meta("grok", session_id).unwrap().is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_scan_returns_exact_subagent_tombstone() {
         let root = temp_grok_root("subagent-delete");
         let normal_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
         let subagent_id = "119e9003-1ed9-70e3-803b-1e7f96a072eb";
@@ -815,12 +1400,22 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(subagent_id, 1, 1)).unwrap();
 
-        prune_impl(&root, &store).unwrap();
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
-        assert!(!store.session_meta_map("grok").unwrap().contains_key(subagent_id));
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, normal_id);
+        assert!(store.session_meta_map("grok").unwrap().contains_key(subagent_id));
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].source_id, normal_id);
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids == HashSet::from([subagent_id.to_string()])
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -840,22 +1435,151 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
-        assert_eq!(result.sessions.len(), 1, "missing usage state must trigger a backfill parse");
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.scan.sessions.len(),
+            1,
+            "missing usage state must trigger a backfill parse"
+        );
 
-        store
-            .persist_usage_events_for_existing_session(
-                "grok",
-                session_id,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
+        seed_empty_usage_state(&store, "grok", session_id, USAGE_PARSER_VERSION, Some(mtime));
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.scan.sessions.len(), 0);
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+
+        let backfilled = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(backfilled.scan.sessions.len(), 1);
+        assert_eq!(backfilled.scan.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        seed_empty_event_state(&store, "grok", session_id, EVENT_PARSER_VERSION, Some(mtime));
+        let refreshed = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(refreshed.scan.sessions.len(), 1);
+        assert!(refreshed.scan.sessions[0].refresh_session_on_metadata_backfill);
+        seed_empty_metadata_state(&store, "grok", session_id, METADATA_PARSER_VERSION);
+        let unchanged = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(unchanged.scan.sessions.is_empty());
+        assert_eq!(unchanged.scan.stats.skipped_sessions, 1);
+
+        let forced = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(forced.scan.sessions.len(), 1);
+        assert!(matches!(
+            forced.reconcile,
+            Some(ReconcilePlan::ExactTombstones(ids)) if ids.is_empty()
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_notices_chat_history_growth() {
+        let root = temp_grok_root("history-growth");
+        let session_id = "019e9003-1ed9-70e3-803b-1e7f96a072eb";
+        let updates_path = write_grok_session(
+            &root,
+            "%2Ftmp%2Fproject",
+            session_id,
+            r#"{"info":{"id":"019e9003-1ed9-70e3-803b-1e7f96a072eb","cwd":"/tmp/project"},"created_at":"2026-06-04T00:00:00Z"}"#,
+            "",
+        );
+        let session_dir = updates_path.parent().unwrap().to_path_buf();
+        let chat_history_path = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat_history_path,
+            "{\"type\":\"user\",\"prompt_index\":0,\"content\":\"hey\"}\n",
+        )
+        .unwrap();
+
+        let mtime = grok_session_snapshot(&FileScanEntry {
+            session_id: session_id.to_string(),
+            stat_target: updates_path.clone(),
+            directory: None,
+        })
+        .unwrap()
+        .effective_mtime_ms();
+        let store = setup_store();
+        store.insert_session(&make_existing_session(session_id, mtime, 1)).unwrap();
+        seed_empty_usage_state(&store, "grok", session_id, USAGE_PARSER_VERSION, Some(mtime));
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.scan.sessions.len(), 0);
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+
+        fs::write(
+            &chat_history_path,
+            "{\"type\":\"user\",\"prompt_index\":0,\"content\":\"hey\"}\n{\"type\":\"user\",\"prompt_index\":1,\"content\":\"again\"}\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&chat_history_path)
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis((mtime + 60_000) as u64),
             )
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
-        assert_eq!(result.sessions.len(), 0);
-        assert_eq!(result.stats.skipped_sessions, 1);
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "grok").unwrap(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.scan.sessions.len(),
+            1,
+            "appending to chat_history.jsonl must re-parse the session"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -879,8 +1603,9 @@ mod tests {
             directory: None,
         };
 
-        let session = parse_grok_session_for_entry(&entry, mtime).unwrap().unwrap();
+        let session = parse_grok_session_for_entry(&entry, mtime, true).unwrap().unwrap();
 
+        assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
         assert_eq!(session.usage_parser_version, Some(USAGE_PARSER_VERSION));
         assert_eq!(session.source_file_path.as_deref(), updates_path.to_str());
         assert_eq!(session.usage_events.len(), 1);

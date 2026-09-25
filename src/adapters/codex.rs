@@ -8,22 +8,29 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
-use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp, last_timestamp,
+use crate::adapters::invocation_probe::{
+    InvocationProbeBudget, ProviderInvocationProbe, is_discovery_tool, nonce_matches_input,
+    probe_recent_files,
 };
-use crate::db::store::Store;
-use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths::{self, resolve_home_dir};
+use crate::adapters::{
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
+    last_timestamp,
+};
+use crate::types::{
+    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
+    RawUsageEvent, Role, ThreadRole,
+};
 
 pub(crate) struct CodexAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 4;
-const EVENT_PARSER_VERSION: u32 = 2;
-const METADATA_PARSER_VERSION: u32 = 1;
+const USAGE_PARSER_VERSION: u32 = 6;
+const EVENT_PARSER_VERSION: u32 = 6;
+const METADATA_PARSER_VERSION: u32 = 2;
 
 type CodexNativeTitles = HashMap<String, String>;
 
@@ -36,10 +43,11 @@ impl SourceAdapter for CodexAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "codex".to_string(),
-            args: vec!["resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("codex", &["resume", source_id]))
+    }
+
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("codex", prompt))
     }
 
     fn delete_command(&self, source_id: &str) -> Option<ResumeCommand> {
@@ -81,14 +89,14 @@ impl SourceAdapter for CodexAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(codex_dir) = resolve_codex_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult::default()));
         };
-        let result = scan_for_sync_impl(&codex_dir, store, since_ts, include_events)?;
+        let result = scan_for_sync_impl(&codex_dir, context, since_ts, include_events)?;
         Ok(Some(result))
     }
 }
@@ -128,6 +136,13 @@ fn open_url_command(url: String) -> ResumeCommand {
 }
 
 pub(crate) fn resolve_codex_dir() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(dir) = paths::env_path_dir("CODEX_HOME") {
+        if dir.is_dir() {
+            return Ok(Some(dir));
+        }
+        debug!("CODEX_HOME not found, skipping Codex");
+        return Ok(None);
+    }
     resolve_home_dir(".codex", "~/.codex not found, skipping Codex")
 }
 
@@ -171,20 +186,6 @@ fn native_session_exists_under(codex_dir: &Path, source_id: &str) -> anyhow::Res
     if !table_exists {
         return Ok(None);
     }
-
-    let mut has_id = false;
-    let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column?.as_str() == "id" {
-            has_id = true;
-            break;
-        }
-    }
-    if !has_id {
-        return Ok(None);
-    }
-
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
         rusqlite::params![source_id],
@@ -193,9 +194,171 @@ fn native_session_exists_under(codex_dir: &Path, source_id: &str) -> anyhow::Res
     Ok(Some(exists))
 }
 
+pub(crate) fn probe_invocation_nonce(
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> anyhow::Result<ProviderInvocationProbe> {
+    let Some(codex_dir) = resolve_codex_dir()? else {
+        return Ok(ProviderInvocationProbe {
+            source_ids: Vec::new(),
+            files_read: 0,
+            bytes_read: 0,
+            complete: true,
+        });
+    };
+    Ok(probe_invocation_nonce_in(&codex_dir, nonce, budget))
+}
+
+fn probe_invocation_nonce_in(
+    codex_dir: &Path,
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> ProviderInvocationProbe {
+    let sessions_dir = codex_dir.join("sessions");
+    let archived_dir = codex_dir.join("archived_sessions");
+    probe_recent_files(
+        nonce,
+        collect_codex_entries(&[&sessions_dir, &archived_dir]),
+        budget,
+        codex_invocation_input,
+    )
+}
+
+fn codex_invocation_input(value: &Value, nonce: &str) -> anyhow::Result<bool> {
+    let Some(payload) = value.get("payload") else {
+        return Ok(false);
+    };
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("item_completed")
+    {
+        let Some(item) = payload.get("item") else {
+            return Ok(false);
+        };
+        return Ok(item.get("type").and_then(Value::as_str) == Some("McpToolCall")
+            && item.get("tool").and_then(Value::as_str).is_some_and(is_discovery_tool)
+            && item.get("arguments").is_some_and(|input| nonce_matches_input(input, nonce)));
+    }
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return Ok(false);
+    }
+    if !matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) {
+        return Ok(false);
+    }
+    let Some(name) = payload.get("name").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if payload.get("type").and_then(Value::as_str) == Some("custom_tool_call") && name == "exec" {
+        return Ok(payload
+            .get("input")
+            .and_then(Value::as_str)
+            .is_some_and(|input| codex_tool_wrapper_matches(input, nonce)));
+    }
+    if !is_discovery_tool(name) {
+        return Ok(false);
+    }
+    let Some(input) = payload.get("arguments").or_else(|| payload.get("input")) else {
+        return Ok(false);
+    };
+    match input {
+        Value::String(input) => {
+            let input: Value = serde_json::from_str(input)?;
+            Ok(nonce_matches_input(&input, nonce))
+        }
+        input => Ok(nonce_matches_input(input, nonce)),
+    }
+}
+
+fn codex_tool_wrapper_matches(input: &str, nonce: &str) -> bool {
+    let Some(tool_start) = input.find("tools.") else {
+        return false;
+    };
+    let tool = &input[tool_start + "tools.".len()..];
+    let name_end = tool
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(tool.len());
+    let name = &tool[..name_end];
+    if !is_discovery_tool(name) {
+        return false;
+    }
+    let Some(call) = tool[name_end..].trim_start().strip_prefix('(') else {
+        return false;
+    };
+    let Some(arguments) = call_arguments(call) else {
+        return false;
+    };
+    string_property_matches(arguments, "invocation_nonce", nonce)
+}
+
+fn call_arguments(input: &str) -> Option<&str> {
+    let mut depth = 1_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&input[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn string_property_matches(input: &str, property: &str, expected: &str) -> bool {
+    input.match_indices(property).any(|(start, _)| {
+        let property_end = start + property.len();
+        let before = input[..start].chars().next_back();
+        let after = input[property_end..].chars().next();
+        if before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            || after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return false;
+        }
+        let Some(value) = input[property_end..].trim_start().strip_prefix(':') else {
+            return false;
+        };
+        json_string(value.trim_start()).as_deref() == Some(expected)
+    })
+}
+
+fn json_string(input: &str) -> Option<String> {
+    if !input.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, character) in input.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return serde_json::from_str(&input[..=index]).ok();
+        }
+    }
+    None
+}
+
 fn scan_for_sync_impl(
     codex_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
@@ -204,8 +367,7 @@ fn scan_for_sync_impl(
     let archived_dir = codex_dir.join("archived_sessions");
     let entries = collect_codex_entries(&[&sessions_dir, &archived_dir]);
     let mut result = file_scan::run_file_scan_with_options(
-        store,
-        "codex",
+        context,
         since_ts,
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -225,13 +387,11 @@ fn scan_for_sync_impl(
             Ok(Some(session))
         },
     )?;
-
-    // Codex persists native thread names outside rollout JSONL mtimes. Refresh
-    // indexed sessions directly so renames and generated native titles appear
-    // without forcing an expensive transcript reparse.
-    refresh_codex_native_titles_in_store(store, &native_titles)?;
     for session in &mut result.sessions {
         apply_codex_native_title(session, &native_titles);
+    }
+    for observation in &mut result.observations {
+        observation.custom_title = native_titles.get(&observation.source_id).cloned();
     }
     Ok(result)
 }
@@ -276,11 +436,9 @@ fn load_codex_native_titles(codex_dir: &Path) -> CodexNativeTitles {
             else {
                 continue;
             };
-            if source_id.is_empty() {
-                continue;
+            if !source_id.is_empty() {
+                titles.insert(source_id.to_string(), title.to_string());
             }
-            // session_index.jsonl is append-only; later rename records win.
-            titles.insert(source_id.to_string(), title.to_string());
         }
     }
     titles
@@ -295,7 +453,6 @@ fn read_codex_state_names(conn: &Connection) -> anyhow::Result<CodexNativeTitles
     if !table_exists {
         return Ok(CodexNativeTitles::new());
     }
-
     let mut has_id = false;
     let mut has_name = false;
     let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
@@ -310,7 +467,6 @@ fn read_codex_state_names(conn: &Connection) -> anyhow::Result<CodexNativeTitles
     if !has_id || !has_name {
         return Ok(CodexNativeTitles::new());
     }
-
     let mut stmt =
         conn.prepare("SELECT id, name FROM threads WHERE name IS NOT NULL AND trim(name) <> ''")?;
     let rows =
@@ -331,25 +487,6 @@ fn apply_codex_native_title(session: &mut RawSession, titles: &CodexNativeTitles
     if let Some(title) = titles.get(&session.source_id) {
         session.custom_title = Some(title.clone());
     }
-}
-
-fn refresh_codex_native_titles_in_store(
-    store: &Store,
-    titles: &CodexNativeTitles,
-) -> anyhow::Result<()> {
-    for session in store.session_paths_for_source("codex")? {
-        if let Some(title) = titles.get(&session.source_id) {
-            store.update_session_fields(
-                "codex",
-                &session.source_id,
-                Some(title),
-                None,
-                None,
-                None,
-            )?;
-        }
-    }
-    Ok(())
 }
 
 fn collect_codex_entries(base_dirs: &[&Path]) -> Vec<FileScanEntry> {
@@ -479,6 +616,7 @@ pub(crate) fn parse_codex_session_with_options(
     let fallback_timestamp = file_scan::stat_mtime_ms(path).unwrap_or(0);
     let mut meta_id: Option<String> = None;
     let mut meta_cwd: Option<String> = None;
+    let mut event_cwd: Option<String> = None;
     let mut meta_timestamp: Option<i64> = None;
     let mut meta_topologies: Vec<CodexMetaTopology> = Vec::new();
     let mut messages = Vec::new();
@@ -491,6 +629,8 @@ pub(crate) fn parse_codex_session_with_options(
     let mut forked_child_waiting_for_turn_context = false;
     let mut forked_child_inherited_baseline: Option<CodexUsageTotals> = None;
     let mut forked_child_inherited_reported_total: Option<i64> = None;
+    let mut last_visible_message_seq: Option<u32> = None;
+    let mut user_dedup = CodexUserDedup::default();
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -535,6 +675,7 @@ pub(crate) fn parse_codex_session_with_options(
                 if let Some(payload) = payload {
                     meta_id = payload.get("id").and_then(|s| s.as_str()).map(String::from);
                     meta_cwd = payload.get("cwd").and_then(|s| s.as_str()).map(String::from);
+                    event_cwd.clone_from(&meta_cwd);
                     provider = payload
                         .get("model_provider")
                         .and_then(|s| s.as_str())
@@ -563,6 +704,11 @@ pub(crate) fn parse_codex_session_with_options(
                 }
             }
             "turn_context" => {
+                if let Some(cwd) =
+                    payload.and_then(|value| value.get("cwd")).and_then(Value::as_str)
+                {
+                    event_cwd = Some(cwd.into());
+                }
                 if let Some(payload) = payload
                     && let Some(model) = extract_codex_model(payload)
                 {
@@ -577,6 +723,21 @@ pub(crate) fn parse_codex_session_with_options(
             "event_msg" => {
                 if let Some(payload) = payload {
                     match payload_type {
+                        "item_completed" if include_events => {
+                            collect_codex_file_change(
+                                payload,
+                                events::EventContext {
+                                    event_seq: events.len() as u32,
+                                    timestamp: parse_timestamp(&v),
+                                    source_path: Some(source_path.clone()),
+                                    source_event_id: Some(line_index.to_string()),
+                                    message_seq: last_visible_message_seq,
+                                    parser_version: EVENT_PARSER_VERSION,
+                                },
+                                event_cwd.as_deref(),
+                                &mut events,
+                            );
+                        }
                         "token_count" => {
                             if let Some(info) = payload.get("info") {
                                 let total_usage = info
@@ -620,7 +781,13 @@ pub(crate) fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                push_codex_message(&mut messages, Role::User, text.to_string(), ts);
+                                last_visible_message_seq = push_codex_user(
+                                    &mut messages,
+                                    &mut user_dedup,
+                                    CodexUserStream::EventMsg,
+                                    text.to_string(),
+                                    ts,
+                                );
                             }
                         }
                         "agent_message" => {
@@ -628,7 +795,7 @@ pub(crate) fn parse_codex_session_with_options(
                                 && !text.is_empty()
                             {
                                 let ts = parse_timestamp(&v);
-                                push_codex_message(
+                                last_visible_message_seq = push_codex_message(
                                     &mut messages,
                                     Role::Assistant,
                                     text.to_string(),
@@ -641,36 +808,73 @@ pub(crate) fn parse_codex_session_with_options(
                 }
             }
             "response_item" => {
-                if let Some(payload) = v.get("payload")
-                    && payload.get("type").and_then(|t| t.as_str()) == Some("message")
-                    && payload.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                {
-                    let text = extract_content_array(payload.get("content"));
-                    let message_seq =
-                        if text.is_empty() { None } else { Some(messages.len() as u32) };
-                    if include_events {
-                        collect_codex_content_events(
-                            payload.get("content"),
-                            parse_timestamp(&v),
+                if let Some(payload) = v.get("payload") {
+                    let timestamp = parse_timestamp(&v);
+                    let payload_type = payload.get("type").and_then(|t| t.as_str());
+                    let role = payload.get("role").and_then(|r| r.as_str());
+                    if payload_type == Some("message") && role == Some("user") {
+                        let text = extract_content_array(payload.get("content"));
+                        if !text.is_empty() && !is_codex_injected_context(&text) {
+                            last_visible_message_seq = push_codex_user(
+                                &mut messages,
+                                &mut user_dedup,
+                                CodexUserStream::ResponseItem,
+                                text,
+                                timestamp,
+                            );
+                        }
+                    } else if payload_type == Some("message") && role == Some("assistant") {
+                        let text = extract_content_array(payload.get("content"));
+                        let message_seq = if text.is_empty() {
+                            None
+                        } else {
+                            push_codex_message(&mut messages, Role::Assistant, text, timestamp)
+                        };
+                        if include_events {
+                            collect_codex_content_events(
+                                payload.get("content"),
+                                events::EventContext {
+                                    event_seq: events.len() as u32,
+                                    timestamp,
+                                    source_path: Some(source_path.clone()),
+                                    source_event_id: Some(line_index.to_string()),
+                                    message_seq: last_visible_message_seq,
+                                    parser_version: EVENT_PARSER_VERSION,
+                                },
+                                message_seq,
+                                event_cwd.as_deref(),
+                                &mut events,
+                            );
+                        }
+                        if codex_content_has_visible_text(payload.get("content")) {
+                            last_visible_message_seq = message_seq;
+                        }
+                    } else if include_events
+                        && payload_type == Some("message")
+                        && matches!(role, Some("developer" | "system"))
+                    {
+                        collect_codex_meta_event(
+                            payload,
+                            timestamp,
                             &source_path,
                             line_index,
-                            message_seq,
+                            &mut events,
+                        );
+                    } else if include_events {
+                        collect_codex_response_item_event(
+                            payload,
+                            events::EventContext {
+                                event_seq: events.len() as u32,
+                                timestamp,
+                                source_path: Some(source_path.clone()),
+                                source_event_id: Some(line_index.to_string()),
+                                message_seq: last_visible_message_seq,
+                                parser_version: EVENT_PARSER_VERSION,
+                            },
+                            event_cwd.as_deref(),
                             &mut events,
                         );
                     }
-                    if !text.is_empty() {
-                        let ts = parse_timestamp(&v);
-                        push_codex_message(&mut messages, Role::Assistant, text, ts);
-                    }
-                }
-                if include_events && let Some(payload) = v.get("payload") {
-                    collect_codex_response_item_event(
-                        payload,
-                        parse_timestamp(&v),
-                        &source_path,
-                        line_index,
-                        &mut events,
-                    );
                 }
             }
             _ => {}
@@ -719,97 +923,149 @@ pub(crate) fn parse_codex_session_with_options(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_on_metadata_backfill: false,
     }))
+}
+
+fn collect_codex_file_change(
+    payload: &Value,
+    context: events::EventContext,
+    cwd: Option<&str>,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(item) = payload
+        .get("item")
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("FileChange"))
+    else {
+        return;
+    };
+    let mut event = events::tool_result_event(
+        context,
+        Some("FileChange".into()),
+        item.get("stdout").and_then(Value::as_str).map(str::to_string),
+    );
+    event.kind = "file_change".into();
+    event.status = item.get("status").and_then(Value::as_str).map(str::to_string);
+    event.attrs_json = Some(payload.to_string());
+    if let Some(changes) = item.get("changes").and_then(Value::as_object) {
+        for (path, change) in changes {
+            if path.trim().is_empty() {
+                continue;
+            }
+            let operation = match change.get("type").and_then(Value::as_str) {
+                Some("add" | "update") => FileOperation::Write,
+                Some("delete") => FileOperation::Delete,
+                _ => continue,
+            };
+            let destination = change
+                .get("move_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty());
+            event.files.push(FileEvidence {
+                path: path.clone(),
+                operation: if destination.is_some() { FileOperation::MoveFrom } else { operation },
+                kind: FileEvidenceKind::Observation,
+                cwd: cwd.map(str::to_string),
+                target: None,
+            });
+            if let Some(path) = destination {
+                event.files.push(FileEvidence {
+                    path: path.into(),
+                    operation: FileOperation::MoveTo,
+                    kind: FileEvidenceKind::Observation,
+                    cwd: cwd.map(str::to_string),
+                    target: None,
+                });
+            }
+        }
+    }
+    event.target = event.files.first().map(|file| file.path.clone());
+    events_out.push(event);
 }
 
 fn collect_codex_response_item_event(
     payload: &Value,
-    timestamp: Option<i64>,
-    source_path: &str,
-    line_index: usize,
+    context: events::EventContext,
+    cwd: Option<&str>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
-    let Some(payload_type) = payload.get("type").and_then(|t| t.as_str()) else {
+    let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
         return;
     };
-    let source_event_id = payload
-        .get("call_id")
-        .and_then(|id| id.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| line_index.to_string());
-
-    if payload_type.ends_with("_output") {
-        let mut event = events::tool_result_event(
-            events::EventContext {
-                event_seq: events_out.len() as u32,
-                timestamp,
-                source_path: Some(source_path.to_string()),
-                source_event_id: Some(source_event_id),
-                message_seq: None,
-                parser_version: EVENT_PARSER_VERSION,
-            },
-            payload.get("name").and_then(|name| name.as_str()).map(String::from),
+    let mut command_evidence_status = None;
+    let mut event = if payload_type.ends_with("_output") {
+        events::tool_result_event(
+            context,
+            payload.get("name").and_then(Value::as_str).map(String::from),
             codex_output_summary(payload),
-        );
-        event.status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
-        events_out.push(event);
-        return;
-    }
-
-    if payload_type.ends_with("_call") {
+        )
+    } else if payload_type.ends_with("_call") {
         let name = codex_call_name(payload_type, payload);
-        let status = payload.get("status").and_then(|status| status.as_str()).map(String::from);
-        if let Some(Value::String(text)) = codex_call_args(payload) {
-            let patch_targets = events::patch_file_targets(text);
-            if !patch_targets.is_empty() {
-                for target in patch_targets {
-                    let mut event = events::file_write_event(
-                        events::EventContext {
-                            event_seq: events_out.len() as u32,
-                            timestamp,
-                            source_path: Some(source_path.to_string()),
-                            source_event_id: Some(source_event_id.clone()),
-                            message_seq: None,
-                            parser_version: EVENT_PARSER_VERSION,
-                        },
-                        name.clone(),
-                        target,
-                    );
-                    event.status = status.clone();
-                    events_out.push(event);
-                }
-                return;
+        let input = codex_call_args(payload);
+        let decoded =
+            input.and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok());
+        let args = decoded.as_ref().or(input);
+        let effective_cwd = args
+            .and_then(|args| args.get("workdir").or_else(|| args.get("cwd")))
+            .and_then(Value::as_str)
+            .or(cwd);
+        let files = if matches!(
+            name.as_str(),
+            "exec" | "functions.exec" | "exec_command" | "functions.exec_command"
+        ) {
+            let (files, status) = events::command_file_evidence(&name, args, cwd);
+            command_evidence_status = Some(status);
+            files
+        } else if matches!(name.as_str(), "apply_patch" | "functions.apply_patch") {
+            args.and_then(Value::as_str).map(events::patch_file_evidence).unwrap_or_default()
+        } else {
+            let operation = match name.as_str() {
+                "read_file" => Some(FileOperation::Read),
+                "write_file" | "edit_file" => Some(FileOperation::Write),
+                _ => None,
+            };
+            operation
+                .zip(
+                    args.and_then(|args| args.get("path").or_else(|| args.get("file_path")))
+                        .and_then(Value::as_str),
+                )
+                .filter(|(_, path)| !path.trim().is_empty())
+                .map(|(operation, path)| vec![FileEvidence::call(path.into(), operation, None)])
+                .unwrap_or_default()
+        };
+        let mut event = if matches!(name.as_str(), "apply_patch" | "functions.apply_patch")
+            && !files.is_empty()
+        {
+            events::file_write_event(context, name, files[0].path.clone())
+        } else if let Some(text) = args.and_then(Value::as_str) {
+            events::tool_call_event_from_text(context, name, Some(text))
+        } else {
+            events::tool_call_event(context, name, args)
+        };
+        event.files = files;
+        for file in &mut event.files {
+            if file.kind != FileEvidenceKind::Command {
+                file.cwd = effective_cwd.map(str::to_string);
             }
         }
-        let mut event = match codex_call_args(payload) {
-            Some(Value::String(text)) => events::tool_call_event_from_text(
-                events::EventContext {
-                    event_seq: events_out.len() as u32,
-                    timestamp,
-                    source_path: Some(source_path.to_string()),
-                    source_event_id: Some(source_event_id.clone()),
-                    message_seq: None,
-                    parser_version: EVENT_PARSER_VERSION,
-                },
-                name,
-                Some(text),
-            ),
-            args => events::tool_call_event(
-                events::EventContext {
-                    event_seq: events_out.len() as u32,
-                    timestamp,
-                    source_path: Some(source_path.to_string()),
-                    source_event_id: Some(source_event_id),
-                    message_seq: None,
-                    parser_version: EVENT_PARSER_VERSION,
-                },
-                name,
-                args,
-            ),
-        };
-        event.status = status;
-        events_out.push(event);
-    }
+        event
+    } else {
+        return;
+    };
+    event.status = payload.get("status").and_then(Value::as_str).map(String::from);
+    event.command_evidence_status = command_evidence_status;
+    event.tool_call_id = codex_tool_call_id(payload);
+    event.attrs_json = Some(payload.to_string());
+    events_out.push(event);
+}
+
+fn codex_tool_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
 }
 
 fn codex_call_name(payload_type: &str, payload: &Value) -> String {
@@ -842,51 +1098,101 @@ fn codex_value_summary(value: &Value) -> String {
 
 fn collect_codex_content_events(
     content: Option<&Value>,
-    timestamp: Option<i64>,
-    source_path: &str,
-    line_index: usize,
-    message_seq: Option<u32>,
+    mut context: events::EventContext,
+    current_message_seq: Option<u32>,
+    cwd: Option<&str>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
-    let Some(Value::Array(arr)) = content else {
+    let Some(Value::Array(items)) = content else {
         return;
     };
-    for (item_index, item) in arr.iter().enumerate() {
-        match item.get("type").and_then(|t| t.as_str()) {
-            Some("function_call") => {
-                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-                let args = item.get("arguments").and_then(|a| a.as_str());
-                events_out.push(events::tool_call_event_from_text(
-                    events::EventContext {
-                        event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
-                        message_seq,
-                        parser_version: EVENT_PARSER_VERSION,
-                    },
-                    name,
-                    args,
-                ));
+    for (item_index, item) in items.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text" | "output_text") => {
+                if item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
+                    context.message_seq = current_message_seq;
+                }
             }
-            Some("function_call_output") => {
-                let output = item.get("output").and_then(|o| o.as_str()).map(String::from);
-                events_out.push(events::tool_result_event(
+            Some(kind) if kind.ends_with("_call") || kind.ends_with("_output") => {
+                collect_codex_response_item_event(
+                    item,
                     events::EventContext {
                         event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
-                        message_seq,
-                        parser_version: EVENT_PARSER_VERSION,
+                        timestamp: context.timestamp,
+                        source_path: context.source_path.clone(),
+                        source_event_id: context
+                            .source_event_id
+                            .as_ref()
+                            .map(|id| format!("{id}:{item_index}")),
+                        message_seq: context.message_seq,
+                        parser_version: context.parser_version,
                     },
-                    None,
-                    output,
-                ));
+                    cwd,
+                    events_out,
+                );
             }
             _ => {}
         }
     }
+}
+
+fn codex_content_has_visible_text(content: Option<&Value>) -> bool {
+    let Some(Value::Array(items)) = content else {
+        return false;
+    };
+    items.iter().any(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("text" | "output_text" | "input_text")
+        ) && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+    })
+}
+
+fn collect_codex_meta_event(
+    payload: &Value,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let Some(actor) = payload.get("role").and_then(Value::as_str) else {
+        return;
+    };
+    let summary = codex_visible_content(payload.get("content"));
+    if summary.is_empty() {
+        return;
+    }
+    events_out.push(RawSessionEvent {
+        summary: Some(events::bounded_summary(summary)),
+        is_meta: Some(true),
+        ..events::EventContext {
+            event_seq: events_out.len() as u32,
+            timestamp,
+            source_path: Some(source_path.to_string()),
+            source_event_id: Some(line_index.to_string()),
+            message_seq: None,
+            parser_version: EVENT_PARSER_VERSION,
+        }
+        .event("message", actor)
+    });
+}
+
+fn codex_visible_content(content: Option<&Value>) -> String {
+    let Some(Value::Array(items)) = content else {
+        return String::new();
+    };
+    items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("text" | "output_text" | "input_text")
+            )
+        })
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn extract_content_array(content: Option<&Value>) -> String {
@@ -895,7 +1201,7 @@ fn extract_content_array(content: Option<&Value>) -> String {
             let mut parts = Vec::new();
             for item in arr {
                 match item.get("type").and_then(|t| t.as_str()) {
-                    Some("text" | "output_text") => {
+                    Some("text" | "output_text" | "input_text") => {
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                             parts.push(text.to_string());
                         }
@@ -1078,8 +1384,8 @@ fn extract_codex_usage_event(
 
     let cache_read_tokens = tokens.cached.min(tokens.input).max(0);
     let input_tokens = tokens.input.saturating_sub(cache_read_tokens).max(0);
-    let output_tokens = tokens.output.max(0);
     let reasoning_tokens = tokens.reasoning.max(0);
+    let output_tokens = tokens.output.saturating_sub(reasoning_tokens).max(0);
     if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 && reasoning_tokens == 0 {
         return None;
     }
@@ -1144,18 +1450,69 @@ fn parse_timestamp(v: &Value) -> Option<i64> {
     rfc3339_ms(v.get("timestamp"))
 }
 
+const CODEX_INJECTED_CONTEXT_PREFIXES: &[&str] =
+    &["# AGENTS.md instructions", "<environment_context>", "<user_instructions>", "<INSTRUCTIONS>"];
+
+fn is_codex_injected_context(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        CODEX_INJECTED_CONTEXT_PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexUserStream {
+    EventMsg,
+    ResponseItem,
+}
+
+#[derive(Default)]
+struct CodexUserDedup {
+    last_seq: Option<u32>,
+    streams_seen: u8,
+}
+
+fn push_codex_user(
+    messages: &mut Vec<RawMessage>,
+    dedup: &mut CodexUserDedup,
+    stream: CodexUserStream,
+    content: String,
+    timestamp: Option<i64>,
+) -> Option<u32> {
+    let stream_bit = match stream {
+        CodexUserStream::EventMsg => 1,
+        CodexUserStream::ResponseItem => 2,
+    };
+    if let Some(seq) = dedup.last_seq
+        && seq as usize + 1 == messages.len()
+        && messages
+            .get(seq as usize)
+            .is_some_and(|message| message.role == Role::User && message.content == content)
+        && dedup.streams_seen & stream_bit == 0
+    {
+        dedup.streams_seen |= stream_bit;
+        return Some(seq);
+    }
+    let seq = push_codex_message(messages, Role::User, content.clone(), timestamp);
+    dedup.last_seq = seq;
+    dedup.streams_seen = stream_bit;
+    seq
+}
+
 fn push_codex_message(
     messages: &mut Vec<RawMessage>,
     role: Role,
     content: String,
     timestamp: Option<i64>,
-) {
+) -> Option<u32> {
     if role == Role::Assistant
         && messages.last().is_some_and(|m| m.role == Role::Assistant && m.content == content)
     {
-        return;
+        return messages.len().checked_sub(1).map(|seq| seq as u32);
     }
+    let seq = messages.len() as u32;
     messages.push(RawMessage { role, content, timestamp });
+    Some(seq)
 }
 
 #[cfg(test)]
@@ -1163,13 +1520,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     #[test]
     fn codex_app_command_opens_thread_deeplink() {
@@ -1191,80 +1546,6 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
-    }
-
-    fn write_codex_state_names(root: &Path, rows: &[(&str, Option<&str>)]) {
-        let conn = Connection::open(root.join("state_5.sqlite")).unwrap();
-        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);").unwrap();
-        for (id, name) in rows {
-            conn.execute(
-                "INSERT INTO threads (id, name) VALUES (?1, ?2)",
-                rusqlite::params![id, name],
-            )
-            .unwrap();
-        }
-    }
-
-    fn write_codex_session_index(root: &Path, rows: &[(&str, &str)]) {
-        let mut file = fs::File::create(root.join("session_index.jsonl")).unwrap();
-        for (id, thread_name) in rows {
-            let value = serde_json::json!({
-                "id": id,
-                "thread_name": thread_name,
-                "updated_at": "2026-09-06T00:00:00Z"
-            });
-            writeln!(file, "{value}").unwrap();
-        }
-    }
-
-    #[test]
-    fn codex_native_state_presence_is_queryable() {
-        let root = temp_codex_root("native-state");
-        let present = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let absent = "019a4c01-e8f4-7270-bdab-7f19273b237f";
-        write_codex_state_names(&root, &[(present, Some("Present"))]);
-
-        assert_eq!(native_session_exists_under(&root, present).unwrap(), Some(true));
-        assert_eq!(native_session_exists_under(&root, absent).unwrap(), Some(false));
-        fs::remove_file(root.join("state_5.sqlite")).unwrap();
-        assert_eq!(native_session_exists_under(&root, present).unwrap(), None);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn native_titles_merge_state_and_latest_session_index_name() {
-        let root = temp_codex_root("native-titles");
-        let state_only = "019a4c01-e8f4-7270-bdab-7f19273b237e";
-        let renamed = "01a055bf-e77a-7d01-8516-913eca321720";
-        write_codex_state_names(
-            &root,
-            &[(state_only, Some("State title")), (renamed, Some("Old state title"))],
-        );
-        write_codex_session_index(
-            &root,
-            &[(renamed, "选择4G DTU开发工具"), (renamed, "选择4G DTU开发工具 (2)")],
-        );
-
-        let titles = load_codex_native_titles(&root);
-        assert_eq!(titles.get(state_only).map(String::as_str), Some("State title"));
-        assert_eq!(titles.get(renamed).map(String::as_str), Some("选择4G DTU开发工具 (2)"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn refresh_native_titles_updates_existing_untitled_session() {
-        let source_id = "01a055bf-e77a-7d01-8516-913eca321720";
-        let store = setup_store();
-        let mut session = make_existing_session(source_id, 1, 1);
-        session.title = "Untitled".to_string();
-        store.insert_session(&session).unwrap();
-
-        let titles = HashMap::from([(source_id.to_string(), "选择4G DTU开发工具 (2)".to_string())]);
-        refresh_codex_native_titles_in_store(&store, &titles).unwrap();
-
-        let stored = store.list_recent_sessions(1).unwrap().pop().unwrap();
-        assert_eq!(stored.title, "选择4G DTU开发工具 (2)");
-        assert_eq!(stored.custom_title.as_deref(), Some("选择4G DTU开发工具 (2)"));
     }
 
     fn write_codex_rollout(sessions_dir: &Path, session_uuid: &str, text: &str) -> PathBuf {
@@ -1386,28 +1667,84 @@ mod tests {
         writeln!(f, "{tool_result}").unwrap();
         writeln!(f, "{custom_call}").unwrap();
         writeln!(f, "{custom_result}").unwrap();
+        let turn = serde_json::json!({"type":"turn_context","payload":{"cwd":"/target/repo"}});
+        let mut moved_call = custom_call.clone();
+        moved_call["payload"]["call_id"] = "call_target".into();
+        let legacy = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[
+            {"type":"function_call","name":"read_file","call_id":"legacy","arguments":{"path":"src/lib.rs","workdir":"/explicit/repo"}},
+            {"type":"function_call_output","call_id":"legacy","status":"failed","output":"permission denied"}
+        ]}});
+        let wrapped = serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"functions.exec","call_id":"wrapper","input":format!("await tools.apply_patch({:?})", custom_call["payload"]["input"].as_str().unwrap())}});
+        for value in [turn, moved_call, legacy, wrapped] {
+            writeln!(f, "{value}").unwrap();
+        }
 
+        let observation = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":uuid,"item":{"type":"FileChange","id":"native-change","status":"completed","changes":{
+            "/target/repo/old.rs":{"type":"update","move_path":"/target/repo/new.rs","unified_diff":"@@\n-old\n+new"},
+            "/target/repo/removed.rs":{"type":"delete","content":"old content"}
+        }}}});
+        writeln!(f, "{observation}").unwrap();
         let raw = parse_codex_session(&path).unwrap().unwrap();
 
-        assert_eq!(raw.events.len(), 5);
+        assert_eq!(raw.events.len(), 9);
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].name.as_deref(), Some("exec_command"));
         assert_eq!(raw.events[0].target.as_deref(), Some("sed -n '1,220p' CLAUDE.md"));
-        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("call_123"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_123"));
         assert_eq!(raw.events[1].kind, "tool_result");
-        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("call_123"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("2"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("call_123"));
         assert_eq!(raw.events[2].kind, "file_write");
         assert_eq!(raw.events[2].name.as_deref(), Some("apply_patch"));
         assert_eq!(raw.events[2].status.as_deref(), Some("completed"));
         assert_eq!(raw.events[2].target.as_deref(), Some("src/lib.rs"));
-        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("call_patch"));
-        assert_eq!(raw.events[3].kind, "file_write");
-        assert_eq!(raw.events[3].name.as_deref(), Some("apply_patch"));
-        assert_eq!(raw.events[3].target.as_deref(), Some("docs/new.md"));
-        assert_eq!(raw.events[3].event_seq, 3);
-        assert_eq!(raw.events[4].kind, "tool_result");
-        assert_eq!(raw.events[4].source_event_id.as_deref(), Some("call_patch"));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("call_patch"));
+        assert_eq!(
+            raw.events[2].files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["src/lib.rs", "docs/new.md"]
+        );
+        assert!(raw.events[2].files.iter().all(|file| file.cwd.as_deref() == Some("/tmp/foo")));
+        assert_eq!(raw.events[3].kind, "tool_result");
+        assert_eq!(raw.events[3].source_event_id.as_deref(), Some("4"));
+        assert_eq!(raw.events[3].tool_call_id.as_deref(), Some("call_patch"));
+        let attrs: Value =
+            serde_json::from_str(raw.events[2].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs, custom_call["payload"]);
+        let attrs: Value =
+            serde_json::from_str(raw.events[3].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs, custom_result["payload"]);
 
+        assert_eq!(raw.directory.as_deref(), Some("/tmp/foo"));
+        assert_eq!(raw.events[4].files[0].cwd.as_deref(), Some("/target/repo"));
+        assert_eq!(raw.events[5].files[0].cwd.as_deref(), Some("/explicit/repo"));
+        assert_eq!(raw.events[5].source_event_id.as_deref(), Some("7:0"));
+        assert_eq!(raw.events[6].tool_call_id.as_deref(), Some("legacy"));
+        assert_eq!(raw.events[6].status.as_deref(), Some("failed"));
+        assert_eq!(raw.events[7].files.len(), 2);
+        assert!(
+            raw.events[7]
+                .files
+                .iter()
+                .all(|file| file.kind == FileEvidenceKind::Command && file.cwd.is_none())
+        );
+        assert_eq!(
+            raw.events[7].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Unsupported)
+        );
+        assert_eq!(raw.events[7].tool_call_id.as_deref(), Some("wrapper"));
+        assert_eq!(raw.events[8].kind, "file_change");
+        assert!(raw.events[8].tool_call_id.is_none());
+        assert_eq!(
+            raw.events[8].files.iter().map(|file| file.operation.clone()).collect::<Vec<_>>(),
+            [FileOperation::MoveFrom, FileOperation::MoveTo, FileOperation::Delete]
+        );
+        assert!(raw.events[8].files.iter().all(|file| file.kind == FileEvidenceKind::Observation));
+        assert_eq!(
+            serde_json::from_str::<Value>(raw.events[8].attrs_json.as_deref().unwrap()).unwrap(),
+            observation["payload"]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1489,6 +1826,360 @@ mod tests {
         assert!(raw.messages.is_empty());
         assert_eq!(raw.events[0].kind, "command");
         assert_eq!(raw.events[0].message_seq, None);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1:0"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_empty"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_indexes_response_item_users_and_dedups_event_msg() {
+        let root = temp_codex_root("response-user");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2399";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "payload": {"id": uuid, "cwd": "/tmp/foo"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fix the parser"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {"type": "user_message", "message": "fix the parser"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        assert_eq!(raw.messages.len(), 2);
+        assert_eq!(raw.messages[0].role, Role::User);
+        assert_eq!(raw.messages[0].content, "fix the parser");
+        assert_eq!(raw.messages[1].content, "ok");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_drops_injected_context_response_items() {
+        let root = temp_codex_root("injected-context");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2401";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let injected = [
+            "# AGENTS.md instructions for /tmp/foo\n\nalways run make check",
+            "<environment_context>\n  <cwd>/tmp/foo</cwd>\n</environment_context>",
+            "<user_instructions>\nbe terse\n</user_instructions>",
+            "wrapper\n<environment_context>\n  <cwd>/tmp/foo</cwd>\n</environment_context>",
+        ];
+        let mut lines = vec![serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {"id": uuid, "cwd": "/tmp/foo"}
+        })];
+        for text in injected {
+            lines.push(serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }
+            }));
+        }
+        lines.push(serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-04-13T10:00:02Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "fix the parser"}]
+            }
+        }));
+        let body = lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(&path, body).unwrap();
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        let users: Vec<&str> = raw
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["fix the parser"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_keeps_repeated_user_turns() {
+        let root = temp_codex_root("repeat-user");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2400";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let mut lines = vec![serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-04-13T10:00:00Z",
+            "payload": {"id": uuid, "cwd": "/tmp/foo"}
+        })];
+        for turn in 0..3 {
+            lines.push(serde_json::json!({
+                "type": "response_item",
+                "timestamp": format!("2026-04-13T10:0{turn}:01Z"),
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            }));
+            lines.push(serde_json::json!({
+                "type": "event_msg",
+                "timestamp": format!("2026-04-13T10:0{turn}:01Z"),
+                "payload": {"type": "user_message", "message": "continue"}
+            }));
+            lines.push(serde_json::json!({
+                "type": "response_item",
+                "timestamp": format!("2026-04-13T10:0{turn}:02Z"),
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("step {turn}")}]
+                }
+            }));
+        }
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        let users: Vec<&str> = raw
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["continue", "continue", "continue"]);
+        assert_eq!(raw.messages.len(), 6);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_keeps_same_text_from_separate_stream_turns() {
+        let root = temp_codex_root("separate-stream-turns");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2402";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "payload": {"id": uuid, "cwd": "/tmp/foo"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {"type": "user_message", "message": "continue"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "first"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:01:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:01:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "second"}]
+                }
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+        let users: Vec<&str> = raw
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, vec!["continue", "continue"]);
+        assert_eq!(raw.messages.len(), 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_codex_session_preserves_event_relationships_and_source_order_anchors() {
+        let root = temp_codex_root("event-relationships");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b2395";
+        let path = sessions_dir.join(format!("rollout-2026-04-13T10-00-00-{uuid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "payload": {"id": uuid, "cwd": "/tmp/foo"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}",
+                    "call_id": "call_start"
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "payload": {"type": "user_message", "message": "Inspect the repository"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:03Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_start",
+                    "output": "/tmp/foo"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:04Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "function_call",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}",
+                            "call_id": "call_before"
+                        },
+                        {"type": "output_text", "text": "I found the manifest."},
+                        {
+                            "type": "function_call",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/lib.rs\"}",
+                            "call_id": "call_after"
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_after",
+                            "output": "library body"
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:05Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"git status\"}"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:06Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"git diff\"}",
+                    "call_id": "   "
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-04-13T10:00:07Z",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "汉".repeat(5000)}]
+                }
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+
+        let raw = parse_codex_session(&path).unwrap().unwrap();
+
+        assert_eq!(raw.messages.len(), 2);
+        assert_eq!(raw.usage_events.len(), 0);
+        assert_eq!(raw.events.len(), 8);
+        assert_eq!(raw.events[0].message_seq, None);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call_start"));
+        assert_eq!(raw.events[1].message_seq, Some(0));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("call_start"));
+        assert_eq!(raw.events[2].message_seq, Some(0));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("4:0"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("call_before"));
+        assert_eq!(raw.events[3].message_seq, Some(1));
+        assert_eq!(raw.events[3].tool_call_id.as_deref(), Some("call_after"));
+        assert_eq!(raw.events[4].message_seq, Some(1));
+        assert_eq!(raw.events[4].tool_call_id.as_deref(), Some("call_after"));
+        assert_eq!(raw.events[5].source_event_id.as_deref(), Some("5"));
+        assert_eq!(raw.events[5].tool_call_id, None);
+        assert_eq!(raw.events[6].source_event_id.as_deref(), Some("6"));
+        assert_eq!(raw.events[6].tool_call_id, None);
+        assert_eq!(raw.events[7].kind, "message");
+        assert_eq!(raw.events[7].actor, "developer");
+        assert_eq!(raw.events[7].message_seq, None);
+        assert_eq!(raw.events[7].is_meta, Some(true));
+        assert_eq!(raw.events[7].visibility, None);
+        let summary = raw.events[7].summary.as_deref().unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= 4099);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1575,13 +2266,16 @@ mod tests {
         assert_eq!(raw.events[0].name.as_deref(), Some("web_search"));
         assert_eq!(raw.events[0].target.as_deref(), Some("rust sqlite json_extract"));
         assert_eq!(raw.events[0].status.as_deref(), Some("completed"));
-        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("web_123"));
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("1"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("web_123"));
         assert_eq!(raw.events[1].kind, "search");
         assert_eq!(raw.events[1].name.as_deref(), Some("tool_search"));
         assert_eq!(raw.events[1].target.as_deref(), Some("serena initial_instructions"));
-        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("tool_search_123"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("2"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("tool_search_123"));
         assert_eq!(raw.events[2].kind, "tool_result");
-        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("tool_search_123"));
+        assert_eq!(raw.events[2].source_event_id.as_deref(), Some("3"));
+        assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("tool_search_123"));
         assert!(raw.events[2].summary.as_deref().unwrap_or("").contains("mcp__serena"));
 
         let _ = fs::remove_dir_all(&root);
@@ -1734,23 +2428,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "codex".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -1789,7 +2472,7 @@ mod tests {
         assert_eq!(raw.usage_events[0].provider, "openai");
         assert_eq!(raw.usage_events[0].input_tokens, 8);
         assert_eq!(raw.usage_events[0].cache_read_tokens, 2);
-        assert_eq!(raw.usage_events[0].output_tokens, 3);
+        assert_eq!(raw.usage_events[0].output_tokens, 2);
         assert_eq!(raw.usage_events[0].reasoning_tokens, 1);
         assert_eq!(raw.usage_events[0].token_source, crate::types::TokenSource::Derived);
 
@@ -1845,7 +2528,7 @@ mod tests {
         assert_eq!(raw.usage_events[0].provider, "openai");
         assert_eq!(raw.usage_events[0].input_tokens, 500);
         assert_eq!(raw.usage_events[0].cache_read_tokens, 1000);
-        assert_eq!(raw.usage_events[0].output_tokens, 200);
+        assert_eq!(raw.usage_events[0].output_tokens, 150);
         assert_eq!(raw.usage_events[0].reasoning_tokens, 50);
 
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
@@ -2021,39 +2704,51 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "codex",
-                uuid,
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
+        seed_empty_event_state(&store, "codex", uuid, EVENT_PARSER_VERSION, Some(mtime));
+        seed_empty_metadata_state(&store, "codex", uuid, METADATA_PARSER_VERSION);
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_reparses_unchanged_session_with_stale_event_parser() {
+        let root = temp_codex_root("event-parser-backfill");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019a4c01-e8f4-7270-bdab-7f19273b237d";
+        let path = write_codex_rollout(&sessions_dir, uuid, "hello");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
+        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
+        seed_empty_event_state(&store, "codex", uuid, EVENT_PARSER_VERSION - 1, Some(mtime));
+        seed_empty_metadata_state(&store, "codex", uuid, METADATA_PARSER_VERSION);
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(result.sessions[0].messages.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "hello");
+        assert!(result.sessions[0].usage_events.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2068,17 +2763,15 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "codex",
-                uuid,
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, "codex", uuid, USAGE_PARSER_VERSION, Some(mtime));
 
-        let result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
 
@@ -2093,10 +2786,22 @@ mod tests {
         write_codex_event_only_rollout(&sessions_dir, uuid);
         let store = setup_store();
 
-        let usage_result = scan_for_sync_impl(&root, &store, None, false).unwrap();
+        let usage_result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(usage_result.sessions.is_empty());
 
-        let full_result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let full_result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(full_result.sessions.len(), 1);
         assert!(full_result.sessions[0].messages.is_empty());
         assert!(full_result.sessions[0].usage_events.is_empty());
@@ -2116,7 +2821,13 @@ mod tests {
         let store = setup_store();
         store.insert_session(&make_existing_session(uuid, actual_mtime - 1_000, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -2143,7 +2854,13 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, good_uuid);
 
@@ -2159,11 +2876,134 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "codex").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, uuid);
         assert_eq!(result.sessions[0].source_file_path.as_deref(), path.to_str());
         assert_eq!(result.stats.skipped_sessions, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_accepts_only_discovery_tool_input_and_deduplicates_a_session() {
+        let root = temp_codex_root("invocation-probe");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019c9c4f-a462-7cc1-99a5-4ab521648c91";
+        let path = write_codex_rollout(&sessions_dir, uuid, "normal nonce-codex reference");
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "mcp__recall__search_sessions",
+                "arguments": serde_json::json!({
+                    "query": "history",
+                    "invocation_nonce": "nonce-codex"
+                }).to_string()
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{call}").unwrap();
+        writeln!(file, "{call}").unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "server": "recall",
+                        "tool": "search_sessions",
+                        "arguments": {
+                            "query": "history",
+                            "invocation_nonce": "nonce-codex"
+                        }
+                    }
+                }
+            })
+        )
+        .unwrap();
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-codex", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids, vec![uuid.to_string()]);
+
+        let normal = probe_invocation_nonce_in(
+            &root,
+            "normal nonce-codex reference",
+            InvocationProbeBudget::default(),
+        );
+        assert!(normal.complete);
+        assert!(normal.source_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_rejects_cross_session_nonce_reuse() {
+        let root = temp_codex_root("invocation-probe-multiple");
+        let sessions_dir = root.join("sessions");
+        for uuid in ["019c9c4f-a462-7cc1-99a5-4ab521648c91", "019c9c4f-a462-7cc1-99a5-4ab521648c92"]
+        {
+            let path = write_codex_rollout(&sessions_dir, uuid, "ordinary");
+            let call = serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "mcp__recall__list_recent_sessions",
+                    "input": {"invocation_nonce": "nonce-shared"}
+                }
+            });
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(file, "{call}").unwrap();
+        }
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-shared", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_accepts_codex_tool_wrapper_before_completion_event() {
+        let root = temp_codex_root("invocation-probe-wrapper");
+        let sessions_dir = root.join("sessions");
+        let uuid = "019c9c4f-a462-7cc1-99a5-4ab521648c91";
+        let path = write_codex_rollout(&sessions_dir, uuid, "ordinary");
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "const r = await tools.mcp__recall__search_sessions({\n  query: \"history\",\n  invocation_nonce: \"nonce-wrapper\"\n});\ntext(r);"
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{call}").unwrap();
+
+        let result =
+            probe_invocation_nonce_in(&root, "nonce-wrapper", InvocationProbeBudget::default());
+        assert!(result.complete);
+        assert_eq!(result.source_ids, vec![uuid.to_string()]);
+        assert!(!codex_tool_wrapper_matches(
+            "const r = await tools.exec_command({cmd: `tools.mcp__recall__search_sessions({invocation_nonce: \\\"nonce-wrapper\\\"})`});",
+            "nonce-wrapper"
+        ));
+        assert!(!codex_tool_wrapper_matches(
+            "const r = await tools.mcp__recall__search_sessions({query: \"history\"}); text(\"nonce-wrapper\");",
+            "nonce-wrapper"
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }

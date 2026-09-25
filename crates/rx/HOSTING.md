@@ -15,7 +15,7 @@ Handshake (no request environment set):
 
 ```
 $ rx host
-{"protocol":{"major":1,"minor":0},"version":"0.5.7","harnesses":["claude","codex","opencode","pi","dsh","kimi"]}
+{"protocol":{"major":1,"minor":1},"version":"0.6.1","harnesses":["claude","codex","opencode","pi","dsh","kimi"]}
 ```
 
 Launch: `rx host -- <native harness args>` with two environment variables:
@@ -30,11 +30,10 @@ Launch: `rx host -- <native harness args>` with two environment variables:
   "gateway": {
     "provider_id": "tokener",
     "name": "Tokener",
-    "endpoint": "https://api.tokener.dev/v1",
+    "endpoint": "https://api.tokener.ai/v1",
     "credential_env": "TOKENER_API_KEY"
   },
   "state_dir": "/abs/path/owned/by/host",
-  "permission_policy": "standard",
   "install_policy": "prompt"
 }
 ```
@@ -43,13 +42,13 @@ Rules the request must satisfy — rx rejects violations instead of guessing:
 
 - Unknown fields are rejected (`deny_unknown_fields`). Never add fields
   without a protocol version bump on the rx side.
-- `state_dir` must be absolute. rx scopes each harness's runtime state
-  under it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
-  `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`) so hosted runs never touch the
-  user's own harness configuration.
+- `state_dir` must be absolute. rx keeps its own runtime state (catalog
+  cache) under it. Harness homes are never redirected: hosted sessions see
+  the user's own harness configuration (skills, agents, settings), exactly
+  like a native launch. Protocol minor 1 marks this semantic; before it,
+  rx scoped harness homes under `state_dir`.
 - `harness` is optional; when omitted, rx shows its interactive picker.
-- `install_policy` is `prompt` or `deny`; `permission_policy` is
-  `standard`.
+- `install_policy` is `prompt` or `deny`.
 - The endpoint must be an HTTP(S) URL; `credential_env` must be a valid
   environment variable name.
 
@@ -61,7 +60,17 @@ What rx guarantees in return:
   reimplement or pre-filter these — pass native args through verbatim and
   let rx be the authority.
 - Discovery/installation of the harness binary uses the user-owned harness
-  home; hosted state is runtime-only, never an installation root.
+  home; hosted state is rx-internal runtime state only, never an
+  installation root.
+- `rx host` plans what `rx` / `rxc` plan. For the same harness, native
+  args and environment, a hosted launch gets the same launch-scoped
+  injection (flags and child environment) as a native one, max-permission
+  injection included; `RX_NO_YOLO` and a user-supplied permission flag
+  disable it exactly as they do natively. The request has no permission
+  knob because the host makes no permission decision. User harness
+  configuration stays visible and is never rewritten beyond marker-owned
+  catalog entries; the gateway route is enforced by injection precedence
+  plus the route guards above.
 - The key is read from the environment and injected into the launch plan;
   it never appears in argv.
 

@@ -8,12 +8,15 @@ repository = "https://github.com/samzong/Recall"
 publish = false
 
 [workspace]
-members = [".", "crates/rx", "extensions/recall-probe", "extensions/recall-reflect", "extensions/recall-powercontext"]
+members = [".", "crates/rx", "extensions/recall-probe", "extensions/recall-reflect", "extensions/recall-powercontext", "extensions/recall-r2", "extensions/recall-publish"]
 default-members = ["."]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.8"
+version = "0.6.2"
+
+[workspace.metadata.release]
+pre-release-commit-message = "chore(release): bump to v{{version}}"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -24,8 +27,8 @@ rmcp = { version = "3.1.4", default-features = false, features = [
     "schemars",
     "transport-io",
 ] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "time"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "time", "process"] }
 sqlite-vec = "0.1"
 hf-hub = { version = "0.5", features = ["ureq"] }
 ureq = "3"
@@ -73,6 +76,8 @@ bench = []
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
+panic = "abort"
 strip = true
 
 # Benchmarks are compiled with the release profile; thin LTO keeps build times

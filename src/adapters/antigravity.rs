@@ -7,13 +7,16 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
+use crate::adapters::events::{
+    EventContext, shell_file_evidence, tool_call_event, tool_result_event,
+};
 use crate::adapters::file_scan::{self, FileScanEntry};
 use crate::adapters::paths::resolve_home_dir;
-use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-};
-use crate::db::store::Store;
-use crate::types::Role;
+use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
+use crate::types::{FileEvidence, FileOperation, Role};
+
+const EVENT_PARSER_VERSION: u32 = 1;
 
 const TRANSCRIPT_RELATIVE_PATH: &[&str] = &[".system_generated", "logs", "transcript.jsonl"];
 
@@ -29,10 +32,11 @@ impl SourceAdapter for AntigravityAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "agy".to_string(),
-            args: vec!["--conversation".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("agy", &["--conversation", source_id]))
+    }
+
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(ResumeCommand { program: "agy".to_string(), args: vec!["-i".to_string(), prompt] })
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
@@ -42,10 +46,15 @@ impl SourceAdapter for AntigravityAdapter {
 
         let mut sessions = Vec::new();
         for entry in collect_antigravity_entries(&cli_dir)? {
-            let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+            let Some(snapshot) = antigravity_snapshot(&entry) else {
                 continue;
             };
-            if let Some(raw) = parse_antigravity_session_for_entry(entry, mtime_ms)? {
+            if let Some(raw) = parse_antigravity_session_for_entry(
+                entry.clone(),
+                snapshot.effective_mtime_ms(),
+                true,
+            )? && antigravity_snapshot(&entry).as_ref() == Some(&snapshot)
+            {
                 sessions.push(raw);
             }
         }
@@ -54,14 +63,14 @@ impl SourceAdapter for AntigravityAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
-        _include_events: bool,
+        include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(cli_dir) = resolve_antigravity_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult::default()));
         };
-        Ok(Some(scan_for_sync_impl(&cli_dir, store, since_ts)?))
+        Ok(Some(scan_for_sync_impl(&cli_dir, context, since_ts, include_events)?))
     }
 }
 
@@ -74,17 +83,29 @@ fn resolve_antigravity_dir() -> anyhow::Result<Option<PathBuf>> {
 
 fn scan_for_sync_impl(
     cli_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
+    include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
     let entries = collect_antigravity_entries(cli_dir)?;
-    file_scan::run_file_scan(
-        store,
-        "antigravity-cli",
+    file_scan::run_file_scan_with_options_and_snapshot(
+        context,
         since_ts,
+        file_scan::FileScanOptions {
+            event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
+            ..Default::default()
+        },
         entries,
-        parse_antigravity_session_for_entry,
+        antigravity_snapshot,
+        |entry, mtime| parse_antigravity_session_for_entry(entry, mtime, include_events),
     )
+}
+
+fn antigravity_snapshot(
+    entry: &FileScanEntry,
+) -> Option<file_scan::FileScanSnapshot<file_scan::FileMetadataSnapshot>> {
+    let fingerprint = file_scan::file_metadata_snapshot(&entry.stat_target)?;
+    Some(file_scan::FileScanSnapshot::new(fingerprint.mtime_ms()?, fingerprint))
 }
 
 fn collect_antigravity_entries(cli_dir: &Path) -> anyhow::Result<Vec<FileScanEntry>> {
@@ -162,9 +183,15 @@ fn load_history_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, Str
 fn parse_antigravity_session_for_entry(
     entry: FileScanEntry,
     mtime_ms: i64,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let source_file_path = entry.stat_target.to_str().map(str::to_string);
-    let mut raw = match parse_antigravity_transcript(&entry.stat_target, &entry.session_id) {
+    let mut raw = match parse_antigravity_transcript(
+        &entry.stat_target,
+        &entry.session_id,
+        entry.directory.as_deref(),
+        include_events,
+    ) {
         Ok(Some(raw)) => raw,
         Ok(None) => return Ok(None),
         Err(e) => {
@@ -181,19 +208,25 @@ fn parse_antigravity_session_for_entry(
 fn parse_antigravity_transcript(
     path: &Path,
     fallback_id: &str,
+    cwd: Option<&str>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
-    parse_antigravity_transcript_reader(reader, fallback_id)
+    parse_antigravity_transcript_reader(reader, fallback_id, path.to_str(), cwd, include_events)
 }
 
 fn parse_antigravity_transcript_reader<R: BufRead>(
     reader: R,
     fallback_id: &str,
+    source_path: Option<&str>,
+    cwd: Option<&str>,
+    include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
     let mut messages = Vec::new();
+    let mut events = Vec::new();
 
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
@@ -204,14 +237,100 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if v.get("status").and_then(|status| status.as_str()) != Some("DONE") {
-            continue;
-        }
-
         let source = v.get("source").and_then(|source| source.as_str()).unwrap_or("");
         let event_type = v.get("type").and_then(|event_type| event_type.as_str()).unwrap_or("");
         let timestamp = parse_created_at(&v);
 
+        if include_events {
+            let context = |event_seq, part_index| EventContext {
+                event_seq,
+                timestamp,
+                source_path: source_path.map(str::to_string),
+                source_event_id: Some(format!("line:{line_index}:part:{part_index}")),
+                message_seq: messages
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|index| u32::try_from(index).ok()),
+                parser_version: EVENT_PARSER_VERSION,
+            };
+            if source == "MODEL" && event_type == "PLANNER_RESPONSE" {
+                for (index, call) in
+                    v.get("tool_calls").and_then(Value::as_array).into_iter().flatten().enumerate()
+                {
+                    let Some(name) = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    let args = call.get("args");
+                    let mut event = tool_call_event(
+                        context(events.len() as u32, index),
+                        name.to_string(),
+                        args,
+                    );
+                    event.kind = "tool_call".to_string();
+                    event.target = None;
+                    let file = match name {
+                        "replace_file_content" => Some(("TargetFile", FileOperation::Write)),
+                        "view_file" => Some(("AbsolutePath", FileOperation::Read)),
+                        _ => None,
+                    };
+                    if let Some((field, operation)) = file {
+                        if let Some(path) = args
+                            .and_then(|args| args.get(field))
+                            .and_then(Value::as_str)
+                            .filter(|path| !path.trim().is_empty())
+                        {
+                            event.kind = if operation == FileOperation::Read {
+                                "file_read"
+                            } else {
+                                "file_write"
+                            }
+                            .to_string();
+                            event.target = Some(path.to_string());
+                            event.files.push(FileEvidence::call(
+                                path.to_string(),
+                                operation,
+                                cwd.map(str::to_string),
+                            ));
+                        }
+                    } else if name == "run_command" {
+                        event.kind = "command".to_string();
+                        event.target = args
+                            .and_then(|args| args.get("CommandLine"))
+                            .and_then(Value::as_str)
+                            .filter(|command| !command.trim().is_empty())
+                            .map(str::to_string);
+                        if let Some(command) = event.target.as_deref() {
+                            let command_cwd = args
+                                .and_then(|args| args.get("Cwd"))
+                                .and_then(Value::as_str)
+                                .filter(|cwd| !cwd.trim().is_empty());
+                            let (files, status) = shell_file_evidence(command, command_cwd);
+                            event.files = files;
+                            event.command_evidence_status = Some(status);
+                        }
+                    }
+                    event.attrs_json = Some(v.to_string());
+                    events.push(event);
+                }
+            } else if source == "MODEL" && event_type == "GENERIC" {
+                let mut event = tool_result_event(
+                    context(events.len() as u32, 0),
+                    Some(event_type.to_string()),
+                    v.get("content").and_then(Value::as_str).map(str::to_string),
+                );
+                event.kind = "native_record".to_string();
+                event.actor = "assistant".to_string();
+                event.attrs_json = Some(v.to_string());
+                events.push(event);
+            }
+        }
+        if v.get("status").and_then(Value::as_str) != Some("DONE") {
+            continue;
+        }
         match (source, event_type) {
             (_, "USER_INPUT") => {
                 let content =
@@ -236,20 +355,24 @@ fn parse_antigravity_transcript_reader<R: BufRead>(
         }
     }
 
-    if messages.is_empty() {
+    if messages.is_empty() && events.is_empty() {
         return Ok(None);
     }
 
-    let started_at = messages.first().and_then(|message| message.timestamp).unwrap_or(0);
+    let started_at = crate::adapters::first_timestamp(None, &messages, &[], &events).unwrap_or(0);
 
-    Ok(Some(RawSession::search_only(
+    let mut session = RawSession::search_only(
         fallback_id.to_string(),
         None,
         started_at,
         messages.last().and_then(|message| message.timestamp),
         None,
         messages,
-    )))
+    );
+    if include_events {
+        session = session.with_events(events, EVENT_PARSER_VERSION);
+    }
+    Ok(Some(session))
 }
 
 fn extract_user_request(content: &str) -> String {
@@ -272,16 +395,12 @@ fn parse_created_at(v: &Value) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::FileEvidenceKind;
     use std::io::Cursor;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{seed_empty_event_state, store as setup_store};
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_antigravity_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -304,40 +423,109 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "antigravity-cli".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
     #[test]
     fn parse_antigravity_transcript_extracts_user_and_assistant_text() {
         let jsonl = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-20T06:03:19Z","content":"<USER_REQUEST>\nAnalyze this project\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nignored\n</ADDITIONAL_METADATA>"}
-{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-20T06:03:19Z","tool_calls":[{"name":"list_dir"}]}
-{"step_index":3,"source":"MODEL","type":"LIST_DIRECTORY","status":"DONE","created_at":"2026-05-20T06:03:21Z","content":"tool output should not be indexed"}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-20T06:03:19Z","tool_calls":[{"name":"replace_file_content","args":{"TargetFile":"/work/project/src/auth.rs","TargetContent":"old","ReplacementContent":"new"}},{"name":"view_file","args":{"AbsolutePath":"/work/project/src/auth.rs"}}]}
+{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-05-20T06:03:21Z","content":"tool output should not be indexed","truncated_fields":["content"]}
 {"step_index":15,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-20T06:03:30Z","content":"This project is a local agent configuration hub."}
 "#;
-        let session = parse_antigravity_transcript_reader(Cursor::new(jsonl), "agy-session")
-            .unwrap()
-            .unwrap();
+        let session = parse_antigravity_transcript_reader(
+            Cursor::new(jsonl),
+            "agy-session",
+            Some("/tmp/transcript.jsonl"),
+            Some("/work/project"),
+            true,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(session.source_id, "agy-session");
         assert_eq!(session.started_at, 1_779_256_999_000);
         assert_eq!(session.updated_at, Some(1_779_257_010_000));
+        assert_eq!(session.events.len(), 3);
+        assert_eq!(session.events[0].files[0].operation, FileOperation::Write);
+        assert_eq!(session.events[0].files[0].cwd.as_deref(), Some("/work/project"));
+        assert_eq!(session.events[1].files[0].operation, FileOperation::Read);
+        assert_eq!(session.events[0].source_event_id.as_deref(), Some("line:1:part:0"));
+        assert_eq!(session.events[0].message_seq, Some(0));
+        assert!(
+            session
+                .events
+                .iter()
+                .all(|event| event.status.is_none() && event.tool_call_id.is_none())
+        );
+        assert_eq!(session.events[2].kind, "native_record");
+        assert!(session.events[2].files.is_empty());
+        assert!(session.events[2].attrs_json.as_deref().unwrap().contains("truncated_fields"));
+        let tool_only = jsonl.lines().nth(1).unwrap().replace("DONE", "RUNNING");
+        let pending = parse_antigravity_transcript_reader(
+            Cursor::new(&tool_only),
+            "pending",
+            None,
+            None,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(pending.messages.is_empty());
+        assert_eq!(pending.events.len(), 2);
+        assert!(pending.events[0].message_seq.is_none());
+        for cwd in [Some("/work/elsewhere"), None] {
+            let command = serde_json::json!({"source":"MODEL","type":"PLANNER_RESPONSE","status":"RUNNING","tool_calls":[{"name":"run_command","args":{"CommandLine":"git restore -- src/auth.rs","Cwd":cwd}}]});
+            let command = parse_antigravity_transcript_reader(
+                Cursor::new(command.to_string()),
+                "commands",
+                None,
+                Some("/not-command-cwd"),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(command.messages.is_empty());
+            assert_eq!(command.events[0].kind, "command");
+            assert_eq!(command.events[0].files[0].path, "src/auth.rs");
+            assert_eq!(command.events[0].files[0].cwd.as_deref(), cwd);
+            assert_eq!(command.events[0].files[0].kind, FileEvidenceKind::Command);
+            assert_eq!(
+                command.events[0].command_evidence_status,
+                Some(if cwd.is_some() {
+                    crate::types::CommandEvidenceStatus::Complete
+                } else {
+                    crate::types::CommandEvidenceStatus::Unsupported
+                })
+            );
+        }
+        assert!(
+            parse_antigravity_transcript_reader(
+                Cursor::new([0xff, b'\n']),
+                "broken",
+                None,
+                None,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            parse_antigravity_transcript_reader(
+                Cursor::new(tool_only),
+                "pending",
+                None,
+                None,
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[0].content, "Analyze this project");
@@ -379,15 +567,49 @@ mod tests {
         let mtime = file_scan::stat_mtime_ms(&transcript).unwrap();
         let store = setup_store();
 
-        let fresh = scan_for_sync_impl(&root, &store, None).unwrap();
+        let fresh = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(fresh.sessions[0].source_file_path.as_deref(), transcript.to_str());
 
         store.insert_session(&make_existing_session(conversation_id, mtime, 1)).unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+        for version in [None, Some(EVENT_PARSER_VERSION - 1), Some(EVENT_PARSER_VERSION)] {
+            if let Some(version) = version {
+                seed_empty_event_state(
+                    &store,
+                    "antigravity-cli",
+                    conversation_id,
+                    version,
+                    Some(mtime),
+                );
+            }
+            let result = scan_for_sync_impl(
+                &root,
+                &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), usize::from(version != Some(EVENT_PARSER_VERSION)));
+            if let Some(session) = result.sessions.first() {
+                assert_eq!(session.event_parser_version, Some(EVENT_PARSER_VERSION));
+            }
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

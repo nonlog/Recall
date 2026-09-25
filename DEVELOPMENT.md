@@ -184,7 +184,7 @@ make run                    # TUI filter should include MT
 
 ## CI
 
-CI runs `make check` — the same single command you run locally. There is no separate CI-only logic.
+CI runs `make check` — the same single command you run locally. `release-cache.yml` warms the per-target release caches on a periodic schedule or by manual dispatch. Exact cache hits skip rebuilding the binaries, and tag-triggered release runs restore caches saved from `main`.
 
 ```
 make check = cargo audit → cargo fmt --check → cargo clippy --workspace --all-targets --features bench -- -D warnings → cargo test --workspace
@@ -252,12 +252,13 @@ current application release boundary, not a package metadata bug.
 ```bash
 cargo install cargo-release
 cargo install cargo-audit --locked --version 0.22.2
-git config core.hooksPath .githooks   # enables auto DCO signoff
+git config core.hooksPath .githooks   # enables repository commit hooks
 ```
 
 The `.githooks/prepare-commit-msg` hook appends `Signed-off-by` to every
 commit, so both hand-written and `cargo-release`-driven commits satisfy the
-project's DCO convention.
+project's DCO convention. The `.githooks/commit-msg` hook rejects a core
+version bump unless its subject is `chore(release): bump to v{{version}}`.
 
 ### Cut a release
 
@@ -268,6 +269,8 @@ make release-patch EXECUTE=1    # apply: bump, commit, tag, push
 
 `release-minor` and `release-major` work the same way. The tag name is
 `v{{version}}` and the commit subject is `chore(release): bump to v{{version}}`.
+Tag-triggered release runs enforce the same subject before publishing. Manual
+dispatch remains available to rebuild or reattach assets for historical tags.
 
 ### First release after a stale baseline
 

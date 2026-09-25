@@ -6,15 +6,18 @@ pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod db;
 pub(crate) mod embedding;
+pub(crate) mod event_evidence;
 pub(crate) mod export;
 pub(crate) mod extension;
 pub(crate) mod handoff;
+pub(crate) mod host;
 pub(crate) mod import;
 pub(crate) mod info;
 pub(crate) mod mcp;
 pub(crate) mod mcp_host;
 pub(crate) mod project_scope;
 pub(crate) mod query;
+pub(crate) mod remote;
 pub(crate) mod repo_identity;
 pub(crate) mod semantic;
 pub(crate) mod session;
@@ -24,6 +27,7 @@ pub(crate) mod share;
 pub(crate) mod share_init;
 pub(crate) mod skill_audit;
 pub(crate) mod sync;
+pub(crate) mod sync_progress;
 pub(crate) mod transcript;
 pub(crate) mod tui;
 pub(crate) mod types;
@@ -38,6 +42,13 @@ mod integration;
 
 pub fn init() {
     db::schema::register_sqlite_vec();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(sync_progress::ProgressAwareStderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
 }
 
 pub fn run() -> anyhow::Result<()> {

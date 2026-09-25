@@ -1,4 +1,9 @@
-use std::collections::HashMap;
+mod file_history;
+pub(crate) use file_history::{
+    FileHistoryCoverage, FileHistoryEvidence, FileHistoryQuery, FileHistoryTarget,
+};
+
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Local, TimeZone};
 use rusqlite::Connection;
@@ -21,6 +26,7 @@ pub(crate) struct SearchFilters {
     pub(crate) time_range: TimeRange,
     pub(crate) scope: ProjectScope,
     pub(crate) thread_role: Option<ThreadRoleFilter>,
+    pub(crate) excluded_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,9 +47,12 @@ pub(crate) struct SessionEventHit {
     pub(crate) event_seq: u32,
     pub(crate) summary: Option<String>,
     pub(crate) timestamp: Option<i64>,
+    pub(crate) visibility: Option<crate::types::EvidenceVisibility>,
+    pub(crate) is_meta: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RepoFilter {
     Remote(String),
     Slug(String),
@@ -118,9 +127,100 @@ struct Hit {
     snippet: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct MessageHit {
+    pub(crate) session_id: String,
+    pub(crate) source_session_id: String,
+    pub(crate) source: String,
+    pub(crate) title: String,
+    pub(crate) seq: u32,
+    pub(crate) role: String,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) excerpt: String,
+    pub(crate) locations: Vec<crate::host::Location>,
+    pub(crate) alternative_versions: u32,
+}
+
 impl<'a> SearchEngine<'a> {
     pub(crate) fn new(conn: &'a Connection) -> Self {
         Self { conn }
+    }
+
+    pub(crate) fn search_messages(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageHit>> {
+        anyhow::ensure!((1..=50).contains(&limit), "limit must be between 1 and 50");
+        let tokens = tokenize_query(query);
+        let trigram = crate::db::schema::has_trigram_fts(self.conn)?;
+        let queries = [
+            ("messages_fts", unicode61_fts5_query(&tokens, trigram)),
+            (
+                "messages_fts_trigram",
+                if trigram { trigram_fts5_query(&tokens) } else { String::new() },
+            ),
+        ];
+        let mut hits: HashMap<i64, (MessageHit, f64)> = HashMap::new();
+        for (table, query) in queries {
+            if query.is_empty() {
+                continue;
+            }
+            let mut sql = format!(
+                "SELECT m.id, m.session_id, s.source_id, s.source, s.title, m.seq, m.role,
+                        m.timestamp, snippet({table}, 0, char(1), char(2), '…', 48)
+                 FROM {table} JOIN messages m ON m.id = {table}.rowid
+                 JOIN sessions s ON s.id = m.session_id WHERE {table} MATCH ?1"
+            );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(query)];
+            let mut param_idx = 2;
+            apply_filters(&mut sql, &mut params, &mut param_idx, filters);
+            if let Some(id) = session_id {
+                sql.push_str(&format!(" AND m.session_id = ?{param_idx}"));
+                params.push(Box::new(id.to_string()));
+            }
+            sql.push_str(&format!(
+                " ORDER BY {table}.rank, m.session_id, m.seq, m.id LIMIT {limit}"
+            ));
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    MessageHit {
+                        session_id: row.get(1)?,
+                        source_session_id: row.get(2)?,
+                        source: row.get(3)?,
+                        title: row.get::<_, String>(4)?.chars().take(200).collect(),
+                        seq: row.get(5)?,
+                        role: row.get(6)?,
+                        timestamp: row.get(7)?,
+                        excerpt: message_excerpt(&row.get::<_, String>(8)?),
+                        locations: crate::host::locations(self.conn, &row.get::<_, String>(1)?)?,
+                        alternative_versions: super::remote_store::alternative_versions(
+                            self.conn,
+                            &row.get::<_, String>(1)?,
+                        )?,
+                    },
+                ))
+            })?;
+            for (rank, row) in rows.enumerate() {
+                let (id, hit) = row?;
+                hits.entry(id).or_insert((hit, 0.0)).1 += 1.0 / (60 + rank) as f64;
+            }
+        }
+        let mut hits: Vec<_> = hits.into_iter().collect();
+        hits.sort_by(|a, b| {
+            b.1.1
+                .total_cmp(&a.1.1)
+                .then_with(|| a.1.0.session_id.cmp(&b.1.0.session_id))
+                .then_with(|| a.1.0.seq.cmp(&b.1.0.seq))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(hits.into_iter().take(limit).map(|(_, (hit, _))| hit).collect())
     }
 
     pub(crate) fn hybrid_search(
@@ -146,7 +246,7 @@ impl<'a> SearchEngine<'a> {
     ) -> anyhow::Result<Vec<SessionEventHit>> {
         let session_cols = qualified_session_columns();
         let mut sql = format!(
-            "SELECT {session_cols}, e.kind, e.name, e.target, e.event_seq, e.summary, e.timestamp
+            "SELECT {session_cols}, e.kind, e.name, e.target, e.event_seq, e.summary, e.timestamp, e.visibility, e.is_meta
              FROM session_events e
              JOIN sessions s ON s.id = e.session_id
              WHERE 1=1"
@@ -172,6 +272,7 @@ impl<'a> SearchEngine<'a> {
             time_range: TimeRange::All,
             scope: query.scope.clone(),
             thread_role: None,
+            excluded_session_id: None,
         };
         apply_filters(&mut sql, &mut params, &mut param_idx, &filters);
 
@@ -186,13 +287,18 @@ impl<'a> SearchEngine<'a> {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(SessionEventHit {
-                session: session_from_row(row)?,
+                session: session_from_row(row, self.conn)?,
                 kind: row.get(17)?,
                 name: row.get(18)?,
                 target: row.get(19)?,
                 event_seq: row.get(20)?,
                 summary: row.get(21)?,
                 timestamp: row.get(22)?,
+                visibility: row
+                    .get::<_, Option<String>>(23)?
+                    .as_deref()
+                    .and_then(crate::types::EvidenceVisibility::parse),
+                is_meta: row.get(24)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -249,17 +355,50 @@ impl<'a> SearchEngine<'a> {
         filters: &SearchFilters,
         limit: Option<usize>,
     ) -> anyhow::Result<Vec<Hit>> {
-        let match_query = fts5_query(query);
-        if match_query.is_empty() {
+        let tokens = tokenize_query(query);
+        if tokens.is_empty() {
             return Ok(vec![]);
         }
-        let mut sql = String::from(
+        let queries = if crate::db::schema::has_trigram_fts(self.conn)? {
+            vec![
+                ("messages_fts_trigram", trigram_fts5_query(&tokens)),
+                ("messages_fts", unicode61_fts5_query(&tokens, true)),
+            ]
+        } else {
+            vec![("messages_fts", unicode61_fts5_query(&tokens, false))]
+        };
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        for (table, match_query) in queries {
+            if match_query.is_empty() {
+                continue;
+            }
+            for hit in self.fts_table_search(table, match_query, filters, limit)? {
+                if seen.insert(hit.session_id.clone()) {
+                    hits.push(hit);
+                }
+            }
+        }
+        if let Some(limit) = limit {
+            hits.truncate(limit);
+        }
+        Ok(hits)
+    }
+
+    fn fts_table_search(
+        &self,
+        table: &'static str,
+        match_query: String,
+        filters: &SearchFilters,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<Hit>> {
+        let mut sql = format!(
             "SELECT m.session_id, SUBSTR(m.content, 1, 200) AS snip,
-                    MIN(messages_fts.rank) AS best_rank
-             FROM messages_fts
-             JOIN messages m ON m.id = messages_fts.rowid
+                    MIN({table}.rank) AS best_rank
+             FROM {table}
+             JOIN messages m ON m.id = {table}.rowid
              JOIN sessions s ON s.id = m.session_id
-             WHERE messages_fts MATCH ?1",
+             WHERE {table} MATCH ?1",
         );
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_query)];
@@ -294,7 +433,19 @@ impl<'a> SearchEngine<'a> {
         requested_k: usize,
     ) -> anyhow::Result<Vec<Hit>> {
         let blob = f32_slice_to_bytes(embedding);
-        let fetch_k = requested_k.clamp(1, SQLITE_VEC_MAX_K) as i64;
+        let excluded_vectors = match filters.excluded_session_id.as_deref() {
+            Some(session_id) => self.conn.query_row(
+                "SELECT COUNT(*)
+                 FROM message_vec mv
+                 JOIN messages m ON m.id = mv.message_id
+                 WHERE m.session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, usize>(0),
+            )?,
+            None => 0,
+        };
+        let fetch_k =
+            requested_k.saturating_add(excluded_vectors).clamp(1, SQLITE_VEC_MAX_K) as i64;
 
         let mut sql = String::from(
             "SELECT m.session_id, MIN(mv.distance) AS best_distance
@@ -341,7 +492,7 @@ impl<'a> SearchEngine<'a> {
             let params: Vec<&dyn rusqlite::types::ToSql> =
                 ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params.as_slice(), session_from_row)?;
+            let rows = stmt.query_map(params.as_slice(), |row| session_from_row(row, self.conn))?;
 
             for row in rows {
                 let session = row?;
@@ -400,6 +551,11 @@ fn apply_filters(
     if let Some(thread_role) = filters.thread_role {
         sql.push_str(thread_role.sql_predicate());
     }
+    if let Some(excluded_session_id) = filters.excluded_session_id.as_deref() {
+        sql.push_str(&format!(" AND s.id != ?{}", *param_idx));
+        params.push(Box::new(excluded_session_id.to_string()));
+        *param_idx += 1;
+    }
 }
 
 fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, MatchSource)> {
@@ -434,7 +590,18 @@ fn rrf_merge(fts_hits: &[Hit], vec_hits: &[Hit], k: u32) -> Vec<(String, f64, Ma
     results
 }
 
-const FTS_PREFIX_MIN_CHARS: usize = 2;
+const FTS_TRIGRAM_MIN_CHARS: usize = 3;
+
+fn message_excerpt(marked: &str) -> String {
+    let hit = marked.find('\u{1}').map_or(0, |position| marked[..position].chars().count());
+    let start = hit.saturating_sub(160);
+    let mut excerpt: String =
+        marked.chars().filter(|c| !matches!(c, '\u{1}' | '\u{2}')).skip(start).take(400).collect();
+    if start > 0 {
+        excerpt.insert(0, '…');
+    }
+    excerpt
+}
 
 fn tokenize_query(query: &str) -> Vec<String> {
     query
@@ -460,205 +627,32 @@ fn fts5_term(token: &str, prefix: bool) -> String {
     term
 }
 
-fn fts5_query(query: &str) -> String {
-    let tokens = tokenize_query(query);
+fn trigram_fts5_query(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .filter(|token| token_uses_trigram(token))
+        .map(|token| fts5_term(token, false))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn unicode61_fts5_query(tokens: &[String], trigram_available: bool) -> String {
     let last = tokens.len().saturating_sub(1);
     tokens
         .iter()
         .enumerate()
+        .filter(|(_, token)| !trigram_available || !token_uses_trigram(token))
         .map(|(index, token)| {
-            let prefix = index == last && token.chars().count() >= FTS_PREFIX_MIN_CHARS;
+            let prefix = index == last && token.chars().count() >= 2;
             fts5_term(token, prefix)
         })
         .collect::<Vec<_>>()
         .join(" OR ")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{SearchEngine, SessionEventQuery, fts5_query, tokenize_query};
-    use crate::db::schema;
-    use crate::db::store::Store;
-    use crate::project_scope::ProjectScope;
-    use crate::types::{RawSessionEvent, Session};
-
-    #[test]
-    fn tokenize_query_strips_punctuation_and_case() {
-        assert_eq!(
-            tokenize_query("context power café Codex "),
-            vec!["context", "power", "café", "codex"]
-        );
-        assert_eq!(tokenize_query("bug OR 1=1 --"), vec!["bug", "or", "11"]);
-    }
-
-    #[test]
-    fn fts5_query_quotes_terms_and_prefixes_last_token() {
-        assert_eq!(
-            fts5_query("context power café Codex "),
-            r#""context" OR "power" OR "café" OR "codex"*"#
-        );
-        assert_eq!(fts5_query("a"), r#""a""#);
-        assert_eq!(fts5_query("AND OR NOT"), r#""and" OR "or" OR "not"*"#);
-    }
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
-
-    fn session(id: &str, source: &str, directory: &str) -> Session {
-        Session {
-            id: id.to_string(),
-            source: source.to_string(),
-            source_id: format!("src-{id}"),
-            title: id.to_string(),
-            directory: Some(directory.to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 1_000,
-            updated_at: Some(1_000),
-            message_count: 0,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-        }
-    }
-
-    fn event(seq: u32, kind: &str, target: &str, timestamp: i64) -> RawSessionEvent {
-        RawSessionEvent {
-            event_seq: seq,
-            timestamp: Some(timestamp),
-            kind: kind.to_string(),
-            actor: "assistant".to_string(),
-            name: Some(kind.to_string()),
-            status: None,
-            target: Some(target.to_string()),
-            message_seq: Some(1),
-            summary: Some(format!("{kind} {target}")),
-            source_path: None,
-            source_event_id: None,
-            attrs_json: Some(r#"{"secret":"nope"}"#.to_string()),
-            parser_version: 1,
-        }
-    }
-
-    fn seed_events() -> Store {
-        let store = setup_store();
-        store.insert_session(&session("s1", "codex", "/tmp/demo")).unwrap();
-        store.insert_session(&session("s2", "claude-code", "/tmp/demo")).unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "codex",
-                "src-s1",
-                &[
-                    event(0, "file_write", "/tmp/demo/src/db/schema.rs", 5_000),
-                    event(1, "command", "/tmp/demo/src/db/schema.rs", 6_000),
-                    event(2, "file_write", "old_schema.rs", 4_000),
-                ],
-                1,
-                None,
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "claude-code",
-                "src-s2",
-                &[event(0, "file_read", "src/db/schema.rs", 8_000)],
-                1,
-                None,
-            )
-            .unwrap();
-        store
-    }
-
-    fn query_events(
-        store: &Store,
-        target: &str,
-        kinds: Option<&[String]>,
-    ) -> Vec<super::SessionEventHit> {
-        SearchEngine::new(&store.conn)
-            .list_session_events(&SessionEventQuery {
-                kinds,
-                target,
-                sources: None,
-                scope: &ProjectScope::Global,
-                limit: 50,
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn list_session_events_matches_exact_or_separator_suffix() {
-        let store = seed_events();
-        let kinds = vec!["file_write".to_string(), "file_read".to_string()];
-        let hits = query_events(&store, "src/db/schema.rs", Some(&kinds));
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].session.id, "s2");
-        assert_eq!(hits[0].target.as_deref(), Some("src/db/schema.rs"));
-        assert_eq!(hits[1].session.id, "s1");
-        assert_eq!(hits[1].target.as_deref(), Some("/tmp/demo/src/db/schema.rs"));
-        assert!(hits.iter().all(|hit| hit.kind != "command"));
-
-        let bare = query_events(&store, "schema.rs", Some(&kinds));
-        assert_eq!(bare.len(), 2);
-        assert!(bare.iter().all(|hit| {
-            hit.target.as_deref().is_some_and(|target| {
-                target == "schema.rs"
-                    || target.ends_with("/schema.rs")
-                    || target.ends_with("\\schema.rs")
-            })
-        }));
-
-        let no_substring = query_events(&store, "schema.rs", None);
-        assert!(no_substring.iter().all(|hit| hit.target.as_deref() != Some("old_schema.rs")));
-    }
-
-    #[test]
-    fn list_session_events_matches_relative_target_from_absolute_path() {
-        let store = seed_events();
-        let hits = query_events(&store, "/abs/elsewhere/src/db/schema.rs", None);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].session.id, "s2");
-        assert_eq!(hits[0].target.as_deref(), Some("src/db/schema.rs"));
-    }
-
-    #[test]
-    fn list_session_events_orders_newest_event_first() {
-        let store = seed_events();
-        let hits = query_events(&store, "schema.rs", None);
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].timestamp, Some(8_000));
-        assert_eq!(hits[1].timestamp, Some(6_000));
-        assert_eq!(hits[1].kind, "command");
-        assert_eq!(hits[2].timestamp, Some(5_000));
-    }
-
-    #[test]
-    fn list_session_events_ranks_timestampless_events_by_session_activity() {
-        let store = seed_events();
-        let mut recent = session("s3", "cursor", "/tmp/demo");
-        recent.updated_at = Some(9_000);
-        store.insert_session(&recent).unwrap();
-        let mut no_timestamp = event(0, "file_write", "src/db/schema.rs", 0);
-        no_timestamp.timestamp = None;
-        store
-            .persist_session_events_for_existing_session(
-                "cursor",
-                "src-s3",
-                &[no_timestamp],
-                1,
-                None,
-            )
-            .unwrap();
-
-        let hits = query_events(&store, "schema.rs", None);
-        assert_eq!(hits.len(), 4);
-        assert_eq!(hits[0].session.id, "s3");
-        assert_eq!(hits[0].timestamp, None);
-        assert_eq!(hits[1].timestamp, Some(8_000));
-    }
+fn token_uses_trigram(token: &str) -> bool {
+    token.chars().count() >= FTS_TRIGRAM_MIN_CHARS && crate::utils::text_needs_trigram(token)
 }
+
+#[cfg(test)]
+mod tests;

@@ -5,7 +5,7 @@ pub(crate) enum Role {
 }
 
 impl Role {
-    pub(crate) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -132,6 +132,7 @@ pub(crate) struct SessionTopology {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Session {
     pub(crate) id: String,
     pub(crate) source: String,
@@ -150,6 +151,8 @@ pub(crate) struct Session {
     pub(crate) duration_minutes: Option<u32>,
     pub(crate) source_file_path: Option<String>,
     pub(crate) is_import: bool,
+    pub(crate) locations: Vec<crate::host::Location>,
+    pub(crate) alternative_versions: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +162,60 @@ pub(crate) struct Message {
     pub(crate) content: String,
     pub(crate) timestamp: Option<i64>,
     pub(crate) seq: u32,
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn session(id: &str) -> Session {
+        Session {
+            id: id.into(),
+            source: "codex".into(),
+            source_id: id.into(),
+            title: id.into(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn message(session_id: &str, role: Role, content: &str, seq: u32) -> Message {
+        Message {
+            session_id: session_id.into(),
+            role,
+            content: content.into(),
+            timestamp: None,
+            seq,
+        }
+    }
+
+    pub(crate) fn usage_event(key: &str) -> RawUsageEvent {
+        RawUsageEvent {
+            event_key: key.into(),
+            event_seq: 0,
+            message_seq: None,
+            timestamp: 0,
+            model: "test".into(),
+            provider: "test".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            token_source: TokenSource::Observed,
+            parser_version: 1,
+            source_path: None,
+            raw_usage_json: None,
+        }
+    }
+
+    pub(crate) fn session_event(kind: &str) -> RawSessionEvent {
+        RawSessionEvent {
+            kind: kind.into(),
+            actor: "assistant".into(),
+            parser_version: 1,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,22 +237,142 @@ pub(crate) struct RawUsageEvent {
     pub(crate) raw_usage_json: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RawSessionEvent {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EvidenceVisibility {
+    Visible,
+    Hidden,
+    Inactive,
+}
+
+impl EvidenceVisibility {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::Inactive => "inactive",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "visible" => Some(Self::Visible),
+            "hidden" => Some(Self::Hidden),
+            "inactive" => Some(Self::Inactive),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandEvidenceStatus {
+    Complete,
+    Unsupported,
+    LimitExceeded,
+}
+
+impl CommandEvidenceStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Unsupported => "unsupported",
+            Self::LimitExceeded => "limit_exceeded",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "complete" => Some(Self::Complete),
+            "unsupported" => Some(Self::Unsupported),
+            "limit_exceeded" => Some(Self::LimitExceeded),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileEvidenceKind {
+    Call,
+    Observation,
+    Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileOperation {
+    Read,
+    Write,
+    Delete,
+    MoveFrom,
+    MoveTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileEvidence {
+    pub(crate) path: String,
+    pub(crate) operation: FileOperation,
+    pub(crate) kind: FileEvidenceKind,
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[serde(default)]
+    pub(crate) target: Option<FileTarget>,
+}
+
+impl FileEvidence {
+    pub(crate) fn call(path: String, operation: FileOperation, cwd: Option<String>) -> Self {
+        Self { path, operation, kind: FileEvidenceKind::Call, cwd, target: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileTarget {
+    pub(crate) absolute_path: String,
+    pub(crate) repo_root: Option<String>,
+    pub(crate) repo_relative_path: Option<String>,
+    pub(crate) repo_remote: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(Default))]
+pub(crate) struct ImportEvent {
+    #[serde(default)]
+    pub(crate) command_evidence_status: Option<crate::types::CommandEvidenceStatus>,
+    #[serde(default)]
+    pub(crate) files: Vec<crate::types::FileEvidence>,
     pub(crate) event_seq: u32,
+    #[serde(default)]
     pub(crate) timestamp: Option<i64>,
     pub(crate) kind: String,
     pub(crate) actor: String,
+    #[serde(default)]
     pub(crate) name: Option<String>,
+    #[serde(default)]
     pub(crate) status: Option<String>,
+    #[serde(default)]
     pub(crate) target: Option<String>,
+    #[serde(default)]
     pub(crate) message_seq: Option<u32>,
+    #[serde(default)]
     pub(crate) summary: Option<String>,
+    #[serde(default)]
     pub(crate) source_path: Option<String>,
+    #[serde(default)]
     pub(crate) source_event_id: Option<String>,
+    #[serde(default)]
+    pub(crate) tool_call_id: Option<String>,
+    #[serde(default)]
+    pub(crate) is_meta: Option<bool>,
+    #[serde(default)]
+    pub(crate) visibility: Option<EvidenceVisibility>,
+    #[serde(default)]
     pub(crate) attrs_json: Option<String>,
+    #[serde(default)]
     pub(crate) parser_version: u32,
 }
+
+pub(crate) type RawSessionEvent = ImportEvent;
 
 #[derive(Debug, Clone)]
 pub(crate) struct UsageEventRecord {
@@ -215,24 +392,9 @@ pub(crate) struct UsageEventRecord {
     pub(crate) token_source: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SessionEventRecord {
-    pub(crate) event_seq: u32,
-    pub(crate) timestamp: Option<i64>,
-    pub(crate) kind: String,
-    pub(crate) actor: String,
-    pub(crate) name: Option<String>,
-    pub(crate) status: Option<String>,
-    pub(crate) target: Option<String>,
-    pub(crate) message_seq: Option<u32>,
-    pub(crate) summary: Option<String>,
-    pub(crate) source_path: Option<String>,
-    pub(crate) source_event_id: Option<String>,
-    pub(crate) attrs_json: Option<String>,
-    pub(crate) parser_version: u32,
-}
+pub(crate) type SessionEventRecord = RawSessionEvent;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SessionUsageEventRecord {
     pub(crate) event_key: String,
     pub(crate) event_seq: u32,
@@ -272,8 +434,6 @@ pub(crate) struct SemanticProgress {
     pub(crate) processing_sessions: u64,
     pub(crate) failed_sessions: u64,
     pub(crate) pending_sessions: u64,
-    #[allow(dead_code)] // populated for future status-bar detail
-    pub(crate) current_session_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +446,5 @@ pub(crate) struct SemanticSessionJob {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BackgroundJobStatus {
     pub(crate) phase: Option<String>,
-    #[allow(dead_code)] // loaded from background_jobs.detail
     pub(crate) detail: Option<String>,
 }

@@ -46,7 +46,7 @@ struct ImportRecord {
     #[serde(default)]
     usage_events: Vec<ImportUsageEvent>,
     #[serde(default)]
-    events: Vec<ImportEvent>,
+    events: Vec<RawSessionEvent>,
 }
 
 #[derive(Deserialize)]
@@ -126,33 +126,6 @@ struct ImportUsageEvent {
     raw_usage_json: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ImportEvent {
-    event_seq: u32,
-    #[serde(default)]
-    timestamp: Option<i64>,
-    kind: String,
-    actor: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    target: Option<String>,
-    #[serde(default)]
-    message_seq: Option<u32>,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    source_path: Option<String>,
-    #[serde(default)]
-    source_event_id: Option<String>,
-    #[serde(default)]
-    attrs_json: Option<String>,
-    #[serde(default)]
-    parser_version: u32,
-}
-
 pub(crate) fn import_jsonl<R: BufRead>(
     store: &Store,
     dry_run: bool,
@@ -173,7 +146,7 @@ pub(crate) fn import_jsonl<R: BufRead>(
         if record.record_type != RECORD_TYPE {
             bail!("line {line_no}: unsupported record_type '{}'", record.record_type);
         }
-        if !matches!(record.schema_version, 2..=5) {
+        if !matches!(record.schema_version, 2..=7) {
             bail!("line {line_no}: unsupported schema_version {}", record.schema_version);
         }
 
@@ -198,8 +171,62 @@ pub(crate) fn import_jsonl<R: BufRead>(
     Ok(summary)
 }
 
+pub(crate) struct DecodedSession {
+    pub(crate) session: Session,
+    pub(crate) messages: Vec<Message>,
+    pub(crate) usage_events: Vec<RawUsageEvent>,
+    pub(crate) events: Vec<RawSessionEvent>,
+    pub(crate) topology: crate::types::SessionTopology,
+}
+
+pub(crate) fn decode_remote(
+    value: serde_json::Value,
+    session_uuid: String,
+) -> Result<DecodedSession> {
+    for field in ["messages", "usage_events", "events"] {
+        anyhow::ensure!(value[field].is_array(), "remote record must include {field}");
+    }
+    anyhow::ensure!(
+        value["session"]["message_count"].as_u64()
+            == value["messages"].as_array().map(|messages| messages.len() as u64),
+        "remote message count mismatch"
+    );
+    let record: ImportRecord = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        record.schema_version == crate::export::RECORD_SCHEMA_VERSION
+            && record.record_type == RECORD_TYPE,
+        "unsupported remote session record"
+    );
+    let parent_count = record.session.topology.parents.len();
+    let data = decode_record(record, session_uuid, 0)?;
+    anyhow::ensure!(data.topology.parents.len() == parent_count, "invalid remote topology");
+    let sequences: HashSet<_> = data.messages.iter().map(|message| message.seq).collect();
+    anyhow::ensure!(sequences.len() == data.messages.len(), "duplicate remote message sequence");
+    Ok(data)
+}
+
 fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result<()> {
-    let session_uuid = uuid::Uuid::new_v4().to_string();
+    let data = decode_record(record, uuid::Uuid::new_v4().to_string(), line_no)?;
+    store.persist_session_with_usage_and_events_with_topology(
+        &data.session,
+        &data.messages,
+        &data.usage_events,
+        None,
+        &data.events,
+        None,
+        &SessionTopologyWrite {
+            thread_role: data.topology.thread_role,
+            parents: &data.topology.parents,
+            parser_version: None,
+        },
+    )
+}
+
+fn decode_record(
+    record: ImportRecord,
+    session_uuid: String,
+    line_no: usize,
+) -> Result<DecodedSession> {
     let s = record.session;
 
     let session = Session {
@@ -220,6 +247,8 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         duration_minutes: s.duration_minutes,
         source_file_path: s.source_file_path,
         is_import: true,
+        locations: Vec::new(),
+        alternative_versions: 0,
     };
 
     let messages = record
@@ -267,29 +296,6 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let events: Vec<RawSessionEvent> = record
-        .events
-        .into_iter()
-        .map(|e| RawSessionEvent {
-            event_seq: e.event_seq,
-            timestamp: e.timestamp,
-            kind: e.kind,
-            actor: e.actor,
-            name: e.name,
-            status: e.status,
-            target: e.target,
-            message_seq: e.message_seq,
-            summary: e.summary,
-            source_path: e.source_path,
-            source_event_id: e.source_event_id,
-            attrs_json: e.attrs_json,
-            parser_version: e.parser_version,
-        })
-        .collect();
-
-    // Persist topology without a metadata parser version so a later local sync of
-    // the same source still backfills from source. Missing/invalid values default
-    // to unknown role and no parents, keeping v2-v4 imports safe.
     let thread_role = s.topology.thread_role.and_then(|role| role.parse().ok());
     let parents: Vec<ParentLink> = s
         .topology
@@ -303,17 +309,13 @@ fn persist_record(store: &Store, record: ImportRecord, line_no: usize) -> Result
             })
         })
         .collect();
-    let topology = SessionTopologyWrite { thread_role, parents: &parents, parser_version: None };
-
-    store.persist_session_with_usage_and_events_with_topology(
-        &session,
-        &messages,
-        &usage_events,
-        None,
-        &events,
-        None,
-        &topology,
-    )
+    Ok(DecodedSession {
+        session,
+        messages,
+        usage_events,
+        events: record.events,
+        topology: crate::types::SessionTopology { thread_role, parents },
+    })
 }
 
 #[cfg(test)]
@@ -323,7 +325,7 @@ mod tests {
     use crate::db::search::TimeRange;
     use crate::export::{ExportIncludes, ExportOptions, write_jsonl};
     use crate::project_scope::ProjectScope;
-    use crate::types::{ParentRelation, ThreadRole};
+    use crate::types::{EvidenceVisibility, ParentRelation, ThreadRole};
 
     fn setup() -> Store {
         schema::register_sqlite_vec();
@@ -349,6 +351,8 @@ mod tests {
             duration_minutes: Some(7),
             source_file_path: Some("/home/origin/.codex/sessions/a.jsonl".to_string()),
             is_import: false,
+            locations: Vec::new(),
+            alternative_versions: 0,
         }
     }
 
@@ -393,17 +397,42 @@ mod tests {
 
     fn full_event() -> RawSessionEvent {
         RawSessionEvent {
+            command_evidence_status: Some(crate::types::CommandEvidenceStatus::Unsupported),
+            files: vec![
+                crate::types::FileEvidence {
+                    path: "src/alpha.rs".into(),
+                    operation: crate::types::FileOperation::Write,
+                    kind: crate::types::FileEvidenceKind::Call,
+                    cwd: Some("/workspace/project".into()),
+                    target: Some(crate::types::FileTarget {
+                        absolute_path: "/workspace/project/src/alpha.rs".into(),
+                        repo_root: Some("/workspace/project".into()),
+                        repo_relative_path: Some("src/alpha.rs".into()),
+                        repo_remote: Some("github.com/fixture/project".into()),
+                    }),
+                },
+                crate::types::FileEvidence {
+                    path: "src/β.rs".into(),
+                    operation: crate::types::FileOperation::Delete,
+                    kind: crate::types::FileEvidenceKind::Call,
+                    cwd: None,
+                    target: None,
+                },
+            ],
             event_seq: 0,
             timestamp: Some(1_200),
-            kind: "tool".to_string(),
+            kind: "file_write".to_string(),
             actor: "assistant".to_string(),
-            name: Some("Shell".to_string()),
+            name: Some("apply_patch".to_string()),
             status: Some("ok".to_string()),
-            target: Some("ls".to_string()),
+            target: Some("src/alpha.rs".to_string()),
             message_seq: Some(0),
-            summary: Some("ran ls".to_string()),
+            summary: Some("updated alpha and removed beta".to_string()),
             source_path: Some("/home/origin/raw.jsonl".to_string()),
             source_event_id: Some("ev-1".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+            is_meta: Some(false),
+            visibility: Some(EvidenceVisibility::Visible),
             attrs_json: Some("{\"exit_code\":0}".to_string()),
             parser_version: 5,
         }
@@ -476,9 +505,71 @@ mod tests {
         let reexported = export_all(&b);
         let mut orig: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
         let mut copy: serde_json::Value = serde_json::from_str(reexported.trim()).unwrap();
+        assert_eq!(orig["events"][0]["command_evidence_status"], "unsupported");
         orig["session"]["id"] = serde_json::Value::Null;
         copy["session"]["id"] = serde_json::Value::Null;
         assert_eq!(orig, copy, "export -> import -> export must be lossless");
+        let mut legacy: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
+        legacy["events"][0].as_object_mut().unwrap().remove("command_evidence_status");
+        let legacy_store = setup();
+        import_jsonl(&legacy_store, false, legacy.to_string().as_bytes()).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_str(export_all(&legacy_store).trim()).unwrap();
+        assert_eq!(restored["events"][0]["command_evidence_status"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn event_replacement_preserves_files_on_failure_and_removes_old_associations() {
+        let store = setup();
+        persist_full(&store, "codex", "src-1", "Files");
+        let before = export_all(&store);
+        let first_id: i64 =
+            store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        let mut invalid_replacement = full_event();
+        invalid_replacement.command_evidence_status =
+            Some(crate::types::CommandEvidenceStatus::Complete);
+        assert!(
+            store
+                .persist_session_events_for_existing_session(
+                    "codex",
+                    "src-1",
+                    &[invalid_replacement.clone(), invalid_replacement],
+                    6,
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(export_all(&store), before);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 2);
+        let mut replacement = full_event();
+        replacement.files.remove(0);
+        replacement.command_evidence_status =
+            Some(crate::types::CommandEvidenceStatus::LimitExceeded);
+        store
+            .persist_session_events_for_existing_session(
+                "codex",
+                "src-1",
+                &[replacement.clone()],
+                6,
+                None,
+            )
+            .unwrap();
+        let next_id: i64 =
+            store.conn.query_row("SELECT id FROM session_events", [], |row| row.get(0)).unwrap();
+        assert!(next_id > first_id);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 1);
+        let session_id: String =
+            store.conn.query_row("SELECT id FROM sessions", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            store.list_session_events_for_session(&session_id).unwrap()[0].files,
+            replacement.files
+        );
+        assert_eq!(
+            store.list_session_events_for_session(&session_id).unwrap()[0].command_evidence_status,
+            replacement.command_evidence_status
+        );
+        store.conn.execute("DELETE FROM sessions", []).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_files"), 0);
     }
 
     #[test]
@@ -606,6 +697,10 @@ mod tests {
         let bad_type = r#"{"schema_version":3,"record_type":"snapshot","session":{"source":"codex","source_id":"x","title":"t","started_at":0}}"#;
         let err = import_jsonl(&store, false, bad_type.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("record_type"), "unexpected error: {err}");
+
+        let bad_visibility = r#"{"schema_version":6,"record_type":"session","session":{"source":"codex","source_id":"x","title":"t","started_at":0},"events":[{"event_seq":0,"kind":"tool","actor":"assistant","visibility":"unknown"}]}"#;
+        let err = import_jsonl(&store, false, bad_visibility.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "unexpected error: {err}");
     }
 
     #[test]
@@ -620,6 +715,31 @@ mod tests {
             .query_row("SELECT parser_version FROM usage_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(parser_version, 0, "missing v3 fields must default to 0");
+        let events = store
+            .list_session_events_for_session(
+                &store.get_session_by_source_id("codex", "v2-1").unwrap().unwrap().id,
+            )
+            .unwrap();
+        assert_eq!(events[0].tool_call_id, None);
+        assert_eq!(events[0].is_meta, None);
+        assert_eq!(events[0].visibility, None);
+    }
+
+    #[test]
+    fn accepts_schema_version_5_without_v6_event_fields() {
+        let store = setup();
+        let v5 = r#"{"schema_version":5,"record_type":"session","session":{"source":"claude-code","source_id":"v5-1","title":"V5","started_at":100},"events":[{"event_seq":0,"timestamp":101,"kind":"tool_result","actor":"tool","source_event_id":"2:0","parser_version":3}]}"#;
+        let summary = import_jsonl(&store, false, v5.as_bytes()).unwrap();
+        assert_eq!(summary, ImportSummary { total: 1, imported: 1, skipped: 0 });
+
+        let session = store.get_session_by_source_id("claude-code", "v5-1").unwrap().unwrap();
+        let events = store.list_session_events_for_session(&session.id).unwrap();
+        assert_eq!(events[0].command_evidence_status, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_event_id.as_deref(), Some("2:0"));
+        assert_eq!(events[0].tool_call_id, None);
+        assert_eq!(events[0].is_meta, None);
+        assert_eq!(events[0].visibility, None);
     }
 
     #[test]

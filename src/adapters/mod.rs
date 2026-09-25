@@ -1,3 +1,4 @@
+pub(crate) mod amp;
 pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod cline;
@@ -7,27 +8,37 @@ pub(crate) mod copilot_chat;
 pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
+pub(crate) mod devin;
+pub(crate) mod droid;
 pub(crate) mod events;
 pub(crate) mod file_scan;
 pub(crate) mod gemini;
 pub(crate) mod goose;
 pub(crate) mod grok;
+pub(crate) mod invocation_probe;
 pub(crate) mod json_util;
 pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod mimo_code;
+pub(crate) mod minimax_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
+pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
+mod pi_session;
 pub(crate) mod qwen;
 pub(crate) mod roo;
 pub(crate) mod sync_state;
 pub(crate) mod usage;
 pub(crate) mod zcode;
 
-use crate::db::store::Store;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::PathBuf;
+
+use crate::db::store::{IndexedSessionMeta, ParserStateMeta, SessionPath};
 use crate::types::{ParentLink, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
 
 pub(crate) trait SourceAdapter {
@@ -39,14 +50,25 @@ pub(crate) trait SourceAdapter {
     }
     fn scan_for_sync(
         &self,
-        _store: &Store,
+        _context: &AdapterSyncContext,
         _since_ts: Option<i64>,
         _include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         Ok(None)
     }
-    fn prune(&self, _store: &Store) -> anyhow::Result<()> {
-        Ok(())
+    fn scan_for_sync_output(
+        &self,
+        context: &AdapterSyncContext,
+        since_ts: Option<i64>,
+        include_events: bool,
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        if force {
+            return Ok(None);
+        }
+        Ok(self
+            .scan_for_sync(context, since_ts, include_events)?
+            .map(|scan| SyncScanOutput { scan, reconcile: None }))
     }
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand>;
     fn delete_command(&self, _source_id: &str) -> Option<ResumeCommand> {
@@ -54,6 +76,139 @@ pub(crate) trait SourceAdapter {
     }
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
         None
+    }
+    fn start_command(&self, _prompt: String) -> Option<ResumeCommand> {
+        None
+    }
+}
+
+pub(crate) struct AdapterSyncContext {
+    source: String,
+    target_source_id: Option<String>,
+    session_meta: HashMap<String, IndexedSessionMeta>,
+    session_paths: HashMap<String, SessionPath>,
+    imported_ids: HashSet<String>,
+    usage_state: HashMap<String, ParserStateMeta>,
+    event_state: HashMap<String, ParserStateMeta>,
+    metadata_state: HashMap<String, ParserStateMeta>,
+}
+
+pub(crate) struct AdapterSyncContextParts {
+    pub(crate) session_meta: HashMap<String, IndexedSessionMeta>,
+    pub(crate) session_paths: HashMap<String, SessionPath>,
+    pub(crate) imported_ids: HashSet<String>,
+    pub(crate) usage_state: HashMap<String, ParserStateMeta>,
+    pub(crate) event_state: HashMap<String, ParserStateMeta>,
+    pub(crate) metadata_state: HashMap<String, ParserStateMeta>,
+}
+
+impl AdapterSyncContext {
+    pub(crate) fn new(
+        source: String,
+        session_meta: HashMap<String, IndexedSessionMeta>,
+        session_paths: HashMap<String, SessionPath>,
+        imported_ids: HashSet<String>,
+        usage_state: HashMap<String, ParserStateMeta>,
+        event_state: HashMap<String, ParserStateMeta>,
+        metadata_state: HashMap<String, ParserStateMeta>,
+    ) -> Self {
+        Self {
+            source,
+            target_source_id: None,
+            session_meta,
+            session_paths,
+            imported_ids,
+            usage_state,
+            event_state,
+            metadata_state,
+        }
+    }
+
+    pub(crate) fn restricted_to(mut self, target_source_id: &str) -> Self {
+        self.session_meta.retain(|id, _| id == target_source_id);
+        self.session_paths.retain(|id, _| id == target_source_id);
+        self.imported_ids.retain(|id| id == target_source_id);
+        self.usage_state.retain(|id, _| id == target_source_id);
+        self.event_state.retain(|id, _| id == target_source_id);
+        self.metadata_state.retain(|id, _| id == target_source_id);
+        self.target_source_id = Some(target_source_id.to_string());
+        self
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn target_source_id(&self) -> Option<&str> {
+        self.target_source_id.as_deref()
+    }
+
+    pub(crate) fn session_meta(&self) -> &HashMap<String, IndexedSessionMeta> {
+        &self.session_meta
+    }
+
+    pub(crate) fn session_paths(&self) -> impl Iterator<Item = &SessionPath> {
+        self.session_paths.values()
+    }
+
+    pub(crate) fn has_existing_sessions(&self) -> bool {
+        !self.session_meta.is_empty()
+    }
+
+    pub(crate) fn usage_state(&self) -> &HashMap<String, ParserStateMeta> {
+        &self.usage_state
+    }
+
+    pub(crate) fn event_state(&self) -> &HashMap<String, ParserStateMeta> {
+        &self.event_state
+    }
+
+    pub(crate) fn metadata_state(&self) -> &HashMap<String, ParserStateMeta> {
+        &self.metadata_state
+    }
+
+    pub(crate) fn into_parts(self) -> AdapterSyncContextParts {
+        AdapterSyncContextParts {
+            session_meta: self.session_meta,
+            session_paths: self.session_paths,
+            imported_ids: self.imported_ids,
+            usage_state: self.usage_state,
+            event_state: self.event_state,
+            metadata_state: self.metadata_state,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(source: &str) -> Self {
+        Self::new(
+            source.to_string(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_store_for_test(
+        store: &crate::db::store::Store,
+        source: &str,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::new(
+            source.to_string(),
+            store.session_meta_map(source)?,
+            store
+                .session_paths_for_source(source)?
+                .into_iter()
+                .map(|path| (path.source_id.clone(), path))
+                .collect(),
+            store.imported_source_ids(source)?,
+            store.usage_state_meta_map(source)?,
+            store.event_state_meta_map(source)?,
+            store.metadata_state_meta_map(source)?,
+        ))
     }
 }
 
@@ -75,6 +230,7 @@ pub(crate) struct RawSession {
     pub(crate) thread_role: Option<ThreadRole>,
     pub(crate) parent_links: Vec<ParentLink>,
     pub(crate) metadata_parser_version: Option<u32>,
+    pub(crate) refresh_session_on_metadata_backfill: bool,
 }
 
 impl RawSession {
@@ -104,6 +260,7 @@ impl RawSession {
             thread_role: None,
             parent_links: Vec::new(),
             metadata_parser_version: None,
+            refresh_session_on_metadata_backfill: false,
         }
     }
 
@@ -156,6 +313,7 @@ pub(crate) fn last_timestamp(
 pub(crate) struct SyncScanStats {
     pub(crate) skipped_sessions: u32,
     pub(crate) filtered_sessions: u32,
+    pub(crate) unstable_sessions: u32,
     /// Every session the adapter considered, before any filtering. The three
     /// counters below partition it, so `candidates - skipped - filtered -
     /// parsed` is the number an adapter dropped without accounting for it.
@@ -167,9 +325,50 @@ pub(crate) struct SyncScanStats {
     pub(crate) parsed: u32,
 }
 
+#[derive(Default)]
 pub(crate) struct SyncScanResult {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) stats: SyncScanStats,
+    pub(crate) observations: Vec<SourceObservation>,
+}
+
+impl SyncScanResult {
+    pub(crate) fn absorb(&mut self, other: SyncScanResult) {
+        self.sessions.extend(other.sessions);
+        self.observations.extend(other.observations);
+        self.stats.skipped_sessions += other.stats.skipped_sessions;
+        self.stats.filtered_sessions += other.stats.filtered_sessions;
+        self.stats.unstable_sessions += other.stats.unstable_sessions;
+        self.stats.candidates += other.stats.candidates;
+        self.stats.rejected_before_parse += other.stats.rejected_before_parse;
+        self.stats.parsed += other.stats.parsed;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceObservation {
+    pub(crate) source_id: String,
+    pub(crate) source_file_path: Option<String>,
+    pub(crate) custom_title: Option<String>,
+}
+
+pub(crate) struct SyncScanOutput {
+    pub(crate) scan: SyncScanResult,
+    pub(crate) reconcile: Option<ReconcilePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryIssue {
+    pub(crate) path: PathBuf,
+    pub(crate) category: io::ErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReconcilePlan {
+    CompleteLiveSet(HashSet<String>),
+    ExactTombstones(HashSet<String>),
+    PartialInventory(Vec<InventoryIssue>),
+    UnavailableInventory(Vec<InventoryIssue>),
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +378,13 @@ pub(crate) struct ResumeCommand {
 }
 
 impl ResumeCommand {
+    pub(crate) fn new(program: &str, args: &[&str]) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+
     pub(crate) fn display(&self) -> String {
         let mut out = self.program.clone();
         for arg in &self.args {
@@ -187,6 +393,10 @@ impl ResumeCommand {
         }
         out
     }
+}
+
+pub(crate) fn prompt_start(program: &str, prompt: String) -> ResumeCommand {
+    ResumeCommand { program: program.to_string(), args: vec![prompt] }
 }
 
 pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
@@ -211,8 +421,13 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(kilo::KiloCodeAdapter),
         Box::new(crush::CrushAdapter),
         Box::new(mimo_code::MimoCodeAdapter),
+        Box::new(minimax_code::MinimaxCodeAdapter),
         Box::new(zcode::ZcodeAdapter),
         Box::new(goose::GooseAdapter),
+        Box::new(droid::DroidAdapter),
+        Box::new(amp::AmpAdapter),
+        Box::new(openhands::OpenHandsAdapter),
+        Box::new(devin::DevinAdapter),
     ]
 }
 
@@ -243,8 +458,24 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "kilo-code"
             | "crush"
             | "mimo-code"
+            | "minimax-code"
             | "zcode"
             | "goose"
+            | "openhands"
+            | "kimi-code"
+            | "grok"
+            | "copilot-chat"
+            | "amp"
+            | "droid"
+            | "deepseek-harness"
+            | "antigravity-cli"
+            | "kiro-cli"
+            | "cline"
+            | "roo"
+            | "qwen-code"
+            | "gemini-cli"
+            | "pi"
+            | "omp"
     )
 }
 
@@ -264,4 +495,80 @@ pub(crate) fn dashboard_source_labels() -> Vec<(String, String)> {
         .filter(|adapter| adapter_supports_usage_dashboard(adapter.as_ref(), true))
         .map(|adapter| (adapter.id().to_string(), adapter.label().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_adapters;
+
+    #[test]
+    fn all_adapters_includes_amp() {
+        let ids: Vec<_> = all_adapters().iter().map(|adapter| adapter.id().to_string()).collect();
+        assert!(ids.iter().any(|id| id == "amp"), "amp missing from all_adapters()");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::db::store::{SessionTopologyWrite, Store};
+
+    pub(crate) fn store() -> crate::db::store::Store {
+        crate::db::schema::register_sqlite_vec();
+        crate::db::store::Store::open_in_memory().unwrap()
+    }
+
+    pub(crate) fn seed_empty_usage_state(
+        store: &Store,
+        source: &str,
+        source_id: &str,
+        parser_version: u32,
+        updated_at: Option<i64>,
+    ) {
+        store
+            .persist_usage_events_for_existing_session(
+                source,
+                source_id,
+                &[],
+                parser_version,
+                updated_at,
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn seed_empty_event_state(
+        store: &Store,
+        source: &str,
+        source_id: &str,
+        parser_version: u32,
+        updated_at: Option<i64>,
+    ) {
+        store
+            .persist_session_events_for_existing_session(
+                source,
+                source_id,
+                &[],
+                parser_version,
+                updated_at,
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn seed_empty_metadata_state(
+        store: &Store,
+        source: &str,
+        source_id: &str,
+        parser_version: u32,
+    ) {
+        store
+            .persist_topology_for_existing_session(
+                source,
+                source_id,
+                &SessionTopologyWrite {
+                    thread_role: None,
+                    parents: &[],
+                    parser_version: Some(parser_version),
+                },
+            )
+            .unwrap();
+    }
 }

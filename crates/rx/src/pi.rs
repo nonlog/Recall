@@ -1,18 +1,22 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::args;
 use crate::catalog;
+use crate::catalog::openai_base;
 use crate::config::Paths;
-use crate::launch::{EnvLookup, openai_base};
+use crate::file_io;
+use crate::launch::EnvLookup;
 use crate::opencode;
 use crate::provider::{Provider, Setup};
+use crate::residue::Residue;
+
+const MARKER_VERSION: u32 = 1;
 
 const PI_ENV_CLEAR: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -22,10 +26,7 @@ const PI_ENV_CLEAR: &[&str] = &[
     "GEMINI_API_KEY",
 ];
 
-pub(crate) fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
-    // PI_CODING_AGENT_DIR is authoritative for pi's configuration location
-    // (see src/adapters/pi.rs); providers must land where the launched
-    // process will actually read them.
+fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
     if let Some(dir) = env
         .get("PI_CODING_AGENT_DIR")
         .map(|value| value.trim().to_string())
@@ -52,10 +53,6 @@ pub(crate) fn global_agent_dir(env: &EnvLookup) -> Result<PathBuf> {
     Ok(home.join(".pi").join("agent"))
 }
 
-pub(crate) fn recall_pi_dir(paths: &Paths) -> PathBuf {
-    paths.dir.join("pi")
-}
-
 pub(crate) fn prepare(
     provider_id: &str,
     provider: &Provider,
@@ -72,20 +69,16 @@ pub(crate) fn prepare(
         }
         return Ok(());
     }
-    let recall_dir = recall_pi_dir(paths);
-    fs::create_dir_all(&recall_dir)
-        .with_context(|| format!("failed to create {}", recall_dir.display()))?;
-    write_json_atomic(&recall_dir.join(format!("{provider_id}-provider.json")), &document)?;
     let agent_dir = global_agent_dir(env)?;
-    fs::create_dir_all(&agent_dir)
-        .with_context(|| format!("failed to create {}", agent_dir.display()))?;
     merge_provider(&agent_dir.join("models.json"), provider_id, document)
 }
 
 pub(crate) fn env_set(env_key: &str, key: &str) -> Vec<(String, String)> {
     let mut env_set = vec![(env_key.to_string(), key.to_string())];
     for name in PI_ENV_CLEAR {
-        env_set.push(((*name).to_string(), String::new()));
+        if *name != env_key {
+            env_set.push(((*name).to_string(), String::new()));
+        }
     }
     env_set
 }
@@ -96,31 +89,19 @@ pub(crate) fn args(
     passthrough: &[OsString],
 ) -> Vec<OsString> {
     let mut args = Vec::new();
-    if !user_sets_models_flag(passthrough) {
+    if !args::has_flags(passthrough, &["--models"]) {
         args.push(OsString::from("--models"));
         args.push(OsString::from(format!("{provider_id}/*")));
     }
     if let Some(model) = model.filter(|_| !user_sets_model(passthrough)) {
         args.push(OsString::from("--model"));
         args.push(OsString::from(opencode::prefixed_model(provider_id, model)));
-    } else if !user_sets_provider(passthrough) {
+    } else if !args::has_flags(passthrough, &["--provider"]) {
         args.push(OsString::from("--provider"));
         args.push(OsString::from(provider_id));
     }
     args.extend(passthrough.iter().cloned());
     args
-}
-
-fn user_sets_models_flag(passthrough: &[OsString]) -> bool {
-    args::before_double_dash(passthrough)
-        .iter()
-        .any(|arg| arg == "--models" || args::os_prefix(arg, "--models="))
-}
-
-fn user_sets_provider(passthrough: &[OsString]) -> bool {
-    args::before_double_dash(passthrough)
-        .iter()
-        .any(|arg| arg == "--provider" || args::os_prefix(arg, "--provider="))
 }
 
 fn generated_provider(
@@ -149,62 +130,103 @@ fn generated_provider(
 }
 
 pub(crate) fn merge_provider(models_path: &Path, provider_id: &str, provider: Value) -> Result<()> {
-    let _lock = exclusive_sidecar(models_path)?;
-    let mut document = if models_path.is_file() {
-        let body = fs::read_to_string(models_path)
-            .with_context(|| format!("failed to read {}", models_path.display()))?;
-        serde_json::from_str(&body).with_context(|| {
-            format!("failed to parse {}; fix or remove the file and retry", models_path.display())
-        })?
-    } else {
-        json!({ "providers": {} })
+    let _lock = file_io::lock(&file_io::appended(models_path, ".rx.lock"))?;
+    let mut document = read_models(models_path)?;
+    let providers = providers_mut(&mut document, models_path)?;
+    providers.insert(provider_id.to_string(), provider.clone());
+    let marker_path = marker_path(models_path);
+    let mut marker = read_marker(&marker_path)?;
+    marker.providers.insert(provider_id.to_string(), provider);
+    file_io::write(models_path, &serde_json::to_vec_pretty(&document)?)?;
+    file_io::write(&marker_path, &serde_json::to_vec_pretty(&marker)?)
+}
+
+pub(crate) fn purge(provider_id: &str, env: &EnvLookup) -> Result<Residue> {
+    let models_path = global_agent_dir(env)?.join("models.json");
+    if !models_path.is_file() {
+        return Ok(Residue::Absent);
+    }
+    let _lock = file_io::lock(&file_io::appended(&models_path, ".rx.lock"))?;
+    let marker_path = marker_path(&models_path);
+    let mut marker = read_marker(&marker_path)?;
+    let Some(owned) = marker.providers.remove(provider_id) else {
+        return Ok(unowned(&models_path, provider_id));
     };
+    let mut document = read_models(&models_path)?;
+    let providers = providers_mut(&mut document, &models_path)?;
+    if providers.get(provider_id) != Some(&owned) {
+        return Ok(Residue::Modified(models_path));
+    }
+    providers.remove(provider_id);
+    if providers.is_empty() {
+        document.as_object_mut().expect("models root is an object").remove("providers");
+    }
+    file_io::write(&models_path, &serde_json::to_vec_pretty(&document)?)?;
+    if marker.providers.is_empty() {
+        file_io::remove(&marker_path)?;
+    } else {
+        file_io::write(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+    }
+    Ok(Residue::Removed)
+}
+
+fn unowned(models_path: &Path, provider_id: &str) -> Residue {
+    match read_models(models_path) {
+        Ok(document) if document.pointer(&format!("/providers/{provider_id}")).is_some() => {
+            Residue::Unowned(models_path.to_path_buf())
+        }
+        _ => Residue::Absent,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OwnedProviders {
+    version: u32,
+    providers: BTreeMap<String, Value>,
+}
+
+fn marker_path(models_path: &Path) -> PathBuf {
+    file_io::appended(models_path, ".rx-catalog.json")
+}
+
+fn read_marker(path: &Path) -> Result<OwnedProviders> {
+    let Some(contents) = file_io::read_optional(path)? else {
+        return Ok(OwnedProviders { version: MARKER_VERSION, providers: BTreeMap::new() });
+    };
+    let marker: OwnedProviders = serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if marker.version != MARKER_VERSION {
+        bail!("unsupported Pi catalog marker version {}", marker.version);
+    }
+    Ok(marker)
+}
+
+fn read_models(models_path: &Path) -> Result<Value> {
+    let Some(contents) = file_io::read_optional(models_path)? else {
+        return Ok(json!({ "providers": {} }));
+    };
+    serde_json::from_slice(&contents).with_context(|| {
+        format!("failed to parse {}; fix or remove the file and retry", models_path.display())
+    })
+}
+
+fn providers_mut<'a>(
+    document: &'a mut Value,
+    models_path: &Path,
+) -> Result<&'a mut serde_json::Map<String, Value>> {
     let Some(root) = document.as_object_mut() else {
         bail!(
             "{} root is not a JSON object; fix or remove the file and retry",
             models_path.display()
         );
     };
-    if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
-        providers.insert(provider_id.to_string(), provider);
-    } else {
-        root.insert("providers".to_string(), json!({ provider_id: provider }));
-    }
-    write_json_atomic(models_path, &document)
-}
-
-fn exclusive_sidecar(path: &Path) -> Result<fs::File> {
-    let parent = path.parent().context("json file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".rx.lock");
-    let lock_path = PathBuf::from(lock_path);
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    lock.lock_exclusive().with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(lock)
-}
-
-fn write_json_atomic(path: &Path, document: &Value) -> Result<()> {
-    let parent = path.parent().context("json file has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let payload = serde_json::to_string_pretty(document).context("failed to serialize json")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temporary {}", path.display()))?;
-    temp.write_all(payload.as_bytes())
-        .with_context(|| format!("failed to write temporary {}", path.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync temporary {}", path.display()))?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    root.entry("providers").or_insert_with(|| json!({})).as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} providers is not a JSON object; fix or remove the file and retry",
+            models_path.display()
+        )
+    })
 }
 
 fn user_sets_model(passthrough: &[OsString]) -> bool {

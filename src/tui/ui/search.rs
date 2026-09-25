@@ -90,10 +90,8 @@ pub(super) fn render_filters(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn render_filter_picker(f: &mut Frame, app: &App) {
-    if app.filters_editing_source {
-        super::popups::render_source_picker(f, app);
-    } else if app.filters_editing_project {
-        super::popups::render_project_picker(f, app);
+    if app.filters.editing.is_some() {
+        super::popups::render_filter_picker(f, app);
     } else {
         render_filter_overview(f, app);
     }
@@ -118,25 +116,25 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
         "Source",
         &app.draft_source_filter_label(),
         "Enter",
-        app.filter_focus == FilterFocus::Source,
+        app.filters.focus == FilterFocus::Source,
     ));
     lines.push(filter_overview_line(
         "Project",
         &app.draft_project_filter_label(),
         "Enter",
-        app.filter_focus == FilterFocus::Project,
+        app.filters.focus == FilterFocus::Project,
     ));
     lines.push(filter_overview_line(
         "Time Range",
         app.draft_time_filter_label(),
         "←/→",
-        app.filter_focus == FilterFocus::Time,
+        app.filters.focus == FilterFocus::Time,
     ));
     lines.push(filter_overview_line(
         "Query Sort",
         app.draft_sort_label(),
         "←/→",
-        app.filter_focus == FilterFocus::Sort,
+        app.filters.focus == FilterFocus::Sort,
     ));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -242,6 +240,22 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                     if selected { selected_text_style } else { Style::default().fg(brand.color) },
                 ),
                 Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "[{}] {}",
+                        crate::host::label(&s.locations).chars().take(18).collect::<String>(),
+                        if s.alternative_versions > 0 {
+                            format!("+{} versions ", s.alternative_versions)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    if selected {
+                        selected_text_style
+                    } else {
+                        Style::default().fg(THEME.text_muted)
+                    },
+                ),
                 Span::styled(
                     title,
                     if selected { selected_text_style } else { Style::default().fg(THEME.text) },

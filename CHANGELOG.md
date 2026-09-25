@@ -70,6 +70,131 @@
 * Restore the upstream bottom shortcut bar and show the complete shortcut reference in Ctrl+S Settings.
 
 
+## [0.6.2](https://github.com/samzong/Recall/compare/v0.6.1...v0.6.2) (2026-09-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **rx:** give hosted launches native permission injection ([#266](https://github.com/samzong/Recall/issues/266))
+
+
+## [0.6.1](https://github.com/samzong/Recall/compare/v0.6.0...v0.6.1) (2026-09-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **rx:** stop redirecting harness homes in hosted mode ([#257](https://github.com/samzong/Recall/issues/257))
+
+
+### Features
+
+* **adapters:** add MiniMax Code session adapter ([#263](https://github.com/samzong/Recall/issues/263))
+* **publish:** add the session publishing extension ([#264](https://github.com/samzong/Recall/issues/264))
+
+
+### Fixes
+
+* **rx:** drop --legacy-peer-deps from dsh install ([#258](https://github.com/samzong/Recall/issues/258))
+* **rx:** isolate dsh launch overlay per provider ([#259](https://github.com/samzong/Recall/issues/259))
+* **rx:** cascade-clean rx-owned harness residue on logout ([#262](https://github.com/samzong/Recall/issues/262))
+
+
+### Refactors
+
+* **rx:** consolidate shared logic and split modules ([#260](https://github.com/samzong/Recall/issues/260))
+* **core:** consolidate parsers and state ownership ([#261](https://github.com/samzong/Recall/issues/261))
+
+
+## [0.6.0](https://github.com/samzong/Recall/compare/v0.5.9...v0.6.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **usage:** fold stats card into usage --card ([#254](https://github.com/samzong/Recall/issues/254))
+
+
+### Features
+
+* **mcp:** add antigravity mcp host ([#236](https://github.com/samzong/Recall/issues/236))
+* **session:** handoff via pointer and installed adapters ([#237](https://github.com/samzong/Recall/issues/237))
+* **mcp:** add grok MCP host ([#238](https://github.com/samzong/Recall/issues/238))
+* **tui:** add manual session sync ([#239](https://github.com/samzong/Recall/issues/239))
+* **search:** add anchored message retrieval ([#241](https://github.com/samzong/Recall/issues/241))
+* **extension:** add Cloudflare R2 remote transport ([#252](https://github.com/samzong/Recall/issues/252))
+* **remote:** report sync progress and upload objects concurrently ([#255](https://github.com/samzong/Recall/issues/255))
+
+
+### Fixes
+
+* **rx:** preserve pi credentials and malformed provider state ([#242](https://github.com/samzong/Recall/issues/242))
+* **rx:** tolerate out-of-range update timestamps ([#243](https://github.com/samzong/Recall/issues/243))
+* **rx:** respect shell completion argument contexts ([#244](https://github.com/samzong/Recall/issues/244))
+* **rx:** serialize provider updates and align provider selection ([#245](https://github.com/samzong/Recall/issues/245))
+* **rx:** preserve hosted routes and native launch inputs ([#246](https://github.com/samzong/Recall/issues/246))
+* **rx:** enforce provider catalog admission contracts ([#247](https://github.com/samzong/Recall/issues/247))
+* **rx:** preserve active native catalog identities ([#249](https://github.com/samzong/Recall/issues/249))
+* **remote:** release upload queue lock before transfer ([#256](https://github.com/samzong/Recall/issues/256))
+
+
+### Refactors
+
+* **rx:** remove unreachable dsh shell installer spec ([#248](https://github.com/samzong/Recall/issues/248))
+* **history:** simplify native file evidence ingestion ([#250](https://github.com/samzong/Recall/issues/250))
+
+
+### Documentation
+
+* **agents:** simplify guidance and repair skill workflows ([#240](https://github.com/samzong/Recall/issues/240))
+* **publishing:** define session dataset publication design ([#251](https://github.com/samzong/Recall/issues/251))
+
+
+## [0.5.9](https://github.com/samzong/Recall/compare/v0.5.8...v0.5.9) (2026-09-03)
+
+
+### Features
+
+* **share:** add list and unpublish for published pages ([#210](https://github.com/samzong/Recall/issues/210))
+* **recall:** add session continuation fallback ([#212](https://github.com/samzong/Recall/issues/212))
+* **mcp:** expose session provenance ([#215](https://github.com/samzong/Recall/issues/215))
+* **share:** improve session preview experience ([#219](https://github.com/samzong/Recall/issues/219))
+* **mcp:** exclude the current session from discovery ([#224](https://github.com/samzong/Recall/issues/224))
+* **events:** preserve structured tool event relationships ([#226](https://github.com/samzong/Recall/issues/226))
+* **share:** render structured tool timelines ([#227](https://github.com/samzong/Recall/issues/227))
+* **adapters:** add droid source adapter ([#232](https://github.com/samzong/Recall/issues/232))
+* **adapters:** add Amp source adapter ([#231](https://github.com/samzong/Recall/issues/231))
+* **adapters:** add OpenHands source adapter ([#229](https://github.com/samzong/Recall/issues/229))
+* **mcp:** add cursor-agent MCP host ([#235](https://github.com/samzong/Recall/issues/235))
+
+
+### Fixes
+
+* **search:** preserve tokenizer migration compatibility ([#181](https://github.com/samzong/Recall/issues/181))
+* **wrapped:** align metrics with indexed session data ([#214](https://github.com/samzong/Recall/issues/214))
+* **kimi:** reject unstable composite snapshots ([#216](https://github.com/samzong/Recall/issues/216))
+* **sync:** reconcile stale sessions safely ([#217](https://github.com/samzong/Recall/issues/217))
+* **sync:** preserve session ids across refreshes ([#218](https://github.com/samzong/Recall/issues/218))
+* **sync:** defer file-scan metadata writes ([#221](https://github.com/samzong/Recall/issues/221))
+* **acceptance:** enforce search and release invariants ([#233](https://github.com/samzong/Recall/issues/233))
+* **adapters:** recover sessions across storage formats ([#234](https://github.com/samzong/Recall/issues/234))
+
+
+### Performance
+
+* **sync:** stop event payload write amplification and show progress ([#211](https://github.com/samzong/Recall/issues/211))
+
+
+### Refactors
+
+* **sync:** restrict adapters to immutable sync context ([#222](https://github.com/samzong/Recall/issues/222))
+* **rx:** simplify launcher internals ([#225](https://github.com/samzong/Recall/issues/225))
+
+## Upgrade note
+
+Before using `recall powercontext backfill` with a Recall release that exports
+schema v6, run `recall ext upgrade powercontext` and verify that
+`recall ext list` shows version 0.1.1 or later. `recall-powercontext` 0.1.0
+accepts only schema v5.
+
 ## [0.5.8](https://github.com/samzong/Recall/compare/v0.5.7...v0.5.8) (2026-09-01)
 
 

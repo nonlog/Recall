@@ -1,14 +1,39 @@
 # Recall fork handoff
 
-Last updated: 2026-09-11
+Last updated: 2026-09-25
 Repository: https://github.com/nonlog/Recall
-Upstream baseline: samzong/Recall v0.5.8 (`c78cb5ba50963a509966e2c4b0c38b8369a8da48`)
+Upstream baseline: samzong/Recall main at `eac6975ff652b6f750b440979f55d20574b64790` (version 0.6.2)
 Fork release: `v0.5.8.7`
 Release commit: `ed37095b31e0c7b80f4913d50c0f75865dcf49cc`
 
 ## Current fork policy
 
-The runtime baseline is upstream Recall v0.5.8. Keep upstream behavior unless a fork-specific item is listed here or in `FORK_FEATURES.md`. `FORK_FEATURES.md` is the mandatory preservation checklist for every upstream merge/rebase. The old Primary/Subagents/All TUI filter and custom `oh-my-pi` adapter remain dropped. Native-title compatibility is retained where upstream misses source-native title metadata.
+### 2026-09-25 upstream-main migration and Codex completeness
+
+- Migration target is current upstream `main` at `eac6975ff652b6f750b440979f55d20574b64790`
+  (Cargo version 0.6.2), including upstream changes through the Devin CLI adapter.
+- The reported LOG mismatch was reproduced: `codex resume --all` / Codex
+  `state_5.sqlite` reports 73 active user-visible threads, while Recall showed 19.
+  Recall's persisted config had `sync_window: "week"`. That setting both restricts
+  sync discovery and initializes the TUI time filter to 7d, so older Codex primaries
+  were intentionally outside the indexed/visible window. The fix for LOG is to set
+  the persisted sync window back to `all`, run Sync, and verify the visible primary
+  set against the 73 native threads. Do not force-migrate every user's explicit
+  non-All setting in code.
+- Shortcut behavior is aligned with upstream as requested: `Ctrl+S` triggers the
+  background Sync worker and `Ctrl+P` opens Settings. Fork-only deletion shortcuts
+  remain additive (`Del` Trash, `Ctrl+D` permanent).
+- Native-title preservation was re-applied on top of upstream's refactored adapters:
+  Codex state/index titles, Claude explicit-vs-AI title precedence, and Pi
+  `session_info.name`. Codex title observations also refresh unchanged indexed
+  sessions without requiring rollout content changes.
+- Safe native deletion, persisted Windows DB/Trash, event-summary compaction,
+  source branding, and Windows Skill Audit discovery remain part of the merge tree.
+- Build/test/package validation must run in GitHub Actions; the VPS worktree is for
+  source editing and lightweight checks only.
+
+
+The runtime baseline is upstream Recall main at `eac6975ff652b6f750b440979f55d20574b64790` (Cargo version 0.6.2). Keep upstream behavior unless a fork-specific item is listed here or in `FORK_FEATURES.md`. `FORK_FEATURES.md` is the mandatory preservation checklist for every upstream merge/rebase. The old Primary/Subagents/All TUI filter and custom `oh-my-pi` adapter remain dropped. Native-title compatibility is retained where upstream misses source-native title metadata.
 
 Retained/requested fork behavior:
 
@@ -16,7 +41,7 @@ Retained/requested fork behavior:
 - Per-source TUI colors/icons with terminal-safe fallbacks.
 - Upstream `omp` adapter/source id is authoritative; deletion only adds safe path validation around its indexed session files.
 - Windows Trash defaults beside the installed `recall.exe`; Scoop persists the `trash` directory across upgrades. `RECALL_TRASH_DIR` remains an override.
-- Upstream bottom shortcut bar is preserved exactly. Ctrl+S Settings contains the full keyboard shortcut reference.
+- Upstream bottom shortcut bar is preserved. Current upstream bindings are retained: Ctrl+S Sync and Ctrl+P Settings; Settings contains the full keyboard shortcut reference.
 - Codex native titles are read from `state_5.sqlite.threads.name` plus latest `session_index.jsonl` rename records; session-index names win when the state DB lags.
 - Claude Code titles prefer explicit `custom-title`, otherwise latest `ai-title.aiTitle`; Pi titles use latest `session_info.name`. Metadata parser version bumps must backfill unchanged sessions when these rules change.
 - Structured `session_events.summary` payloads are capped at 4096 characters; schema v12 compacts existing oversized rows without deleting transcript/messages/usage/file-history identity fields.

@@ -6,6 +6,7 @@ use crate::db::search::TimeRange;
 use crate::db::store::Store;
 use crate::semantic;
 use crate::tui::search_worker::SearchWorker;
+use crate::tui::sync_worker::SyncWorker;
 use crate::tui::usage_worker::UsageWorker;
 
 pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>) -> Result<()> {
@@ -38,15 +39,30 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         semantic::ensure_background_worker(true)?;
     }
 
+    fn restore_terminal() {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+    }
+
     struct TerminalGuard;
     impl Drop for TerminalGuard {
         fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ =
-                execute!(io::stdout(), crossterm::event::DisableMouseCapture, LeaveAlternateScreen);
+            restore_terminal();
         }
     }
 
+    let previous_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if cfg!(panic = "abort") {
+            restore_terminal();
+        }
+        previous_panic_hook(info);
+    }));
     enable_raw_mode()?;
     let guard = TerminalGuard;
     let mut stdout = io::stdout();
@@ -61,14 +77,15 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             Some("Debug builds do not start semantic indexing; run cargo run -- sync first".into());
     }
     let search_worker = SearchWorker::spawn();
+    let sync_worker = SyncWorker::spawn();
     let usage_worker = UsageWorker::spawn();
     if let Some((source_filter, time_filter)) = usage_start {
-        app.source_filter_selection = source_filter.unwrap_or_default();
+        app.filters.active.sources = source_filter.unwrap_or_default();
         if let Some(time_filter) = time_filter {
-            app.usage_time_filter = time_filter;
+            app.usage.time_filter = time_filter;
         }
         app.mode = AppMode::Usage;
-        app.request_usage_refresh();
+        app.usage.request_refresh();
     }
     let mut usage_sync_pending = usage_mode;
     let tick_rate = Duration::from_millis(50);
@@ -78,6 +95,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
         app.poll_delete(&store);
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
+        }
+        while let Some(response) = sync_worker.try_recv() {
+            app.apply_sync_response(&store, response);
         }
         while let Some(response) = usage_worker.try_recv() {
             app.apply_usage_response(response);
@@ -102,21 +122,27 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
             break;
         }
 
+        if let Some(request) = app.take_sync_request()
+            && !sync_worker.refresh(request)
+        {
+            app.fail_sync("Sync worker unavailable");
+        }
         if let Some(request) = app.take_usage_request(usage_sync_pending) {
             usage_sync_pending = false;
             if !usage_worker.refresh(request) {
-                app.fail_usage_refresh("Usage worker unavailable");
+                app.usage.fail_refresh("Usage worker unavailable");
             }
         }
-
         app.try_search(&store, &search_worker);
         while let Some(response) = search_worker.try_recv() {
             app.apply_search_response(&store, response);
         }
+        while let Some(response) = sync_worker.try_recv() {
+            app.apply_sync_response(&store, response);
+        }
         while let Some(response) = usage_worker.try_recv() {
             app.apply_usage_response(response);
         }
-
         if app.should_quit {
             break;
         }
@@ -125,7 +151,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     drop(guard);
     terminal.show_cursor()?;
 
-    if let Some((command, cwd)) = app.exec_on_exit.take() {
+    let exec_on_exit = app.exec_on_exit.take();
+    drop(app);
+    if let Some((command, cwd)) = exec_on_exit {
         exec_resume(command, cwd)?;
     }
 

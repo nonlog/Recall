@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::opencode;
-use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats};
-use crate::db::store::Store;
+use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 
 pub(crate) struct ZcodeAdapter;
 
@@ -22,10 +22,11 @@ impl SourceAdapter for ZcodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "zcode".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("zcode", &["--resume", source_id]))
+    }
+
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("zcode", prompt))
     }
 
     fn app_command(&self, _source_id: &str) -> Option<ResumeCommand> {
@@ -41,18 +42,17 @@ impl SourceAdapter for ZcodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_zcode_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult::default()));
         };
         Ok(Some(opencode::scan_for_sync_conn_with_options(
             &conn,
-            store,
+            context,
             since_ts,
-            "zcode",
             include_events,
             opencode::ScanOptions::ZCODE,
         )?))
@@ -82,10 +82,7 @@ fn resolve_zcode_db_path_from(storage_dir: Option<String>, home: PathBuf) -> Opt
 
 #[cfg(target_os = "macos")]
 fn open_zcode_app() -> Option<ResumeCommand> {
-    Some(ResumeCommand {
-        program: "open".to_string(),
-        args: vec!["-a".to_string(), "ZCode".to_string()],
-    })
+    Some(ResumeCommand::new("open", &["-a", "ZCode"]))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -237,6 +234,23 @@ mod tests {
             ",
         )
         .unwrap();
+        let native_parts = [
+            serde_json::json!({"type":"tool","tool":"Read","callID":"read-1","state":{"status":"completed","input":{"file_path":"/repo/a.rs"},"output":"file contents","metadata":{"readFileState":{"schemaVersion":1,"tool":"Read","path":"/resolved/a.rs"}}}}),
+            serde_json::json!({"type":"tool","tool":"Edit","callID":"edit-1","state":{"status":"error","input":{"file_path":"/repo/a.rs","old_string":"old","new_string":"new"},"error":"permission denied"}}),
+            serde_json::json!({"type":"tool","tool":"Write","callID":"write-1","state":{"status":"running","input":{"file_path":"/repo/b.rs","content":"new file"}}}),
+            serde_json::json!({"type":"tool","tool":"Write","callID":"write-2","state":{"status":"completed","input":{"file_path":"/repo/b.rs","content":"new file"},"output":"written","metadata":{"readFileState":{"schemaVersion":1,"tool":"Write","path":"/resolved/b.rs","content":"new file"}}}}),
+            serde_json::json!({"type":"tool","tool":"Edit","callID":"edit-2","state":{"status":"completed","input":{"file_path":"/repo/a.rs","old_string":"old","new_string":"new"},"output":"edited","metadata":{"readFileState":{"schemaVersion":1,"tool":"Edit","path":"/resolved/a.rs","content":"new"}}}}),
+        ];
+        conn.execute(
+            "UPDATE part SET data=json_set(data, '$.state.input.command', 'git restore -- /repo/a.rs') WHERE id='part_tool'",
+            [],
+        ).unwrap();
+        for (index, part) in native_parts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO part(id,message_id,session_id,time_created,data,sequence) VALUES (?1,'msg_asst','sess_123',?2,?3,?4)",
+                rusqlite::params![format!("native-{index}"), 123 + index as i64, part.to_string(), 4 + index as i64],
+            ).unwrap();
+        }
         drop(conn);
 
         let conn = opencode::open_readonly(&db_path).unwrap().unwrap();
@@ -258,8 +272,54 @@ mod tests {
         assert_eq!(sessions[0].usage_events[0].provider, "builtin:zai");
         assert_eq!(sessions[0].usage_events[0].input_tokens, 10);
         assert_eq!(sessions[0].usage_events[0].output_tokens, 4);
-        assert_eq!(sessions[0].events.len(), 2);
-        assert_eq!(sessions[0].events[0].name.as_deref(), Some("Bash"));
+        let events = &sessions[0].events;
+        assert_eq!(events.len(), 11);
+        let call = |id: &str| {
+            events
+                .iter()
+                .find(|event| {
+                    event.actor == "assistant" && event.tool_call_id.as_deref() == Some(id)
+                })
+                .unwrap()
+        };
+        let bash = events
+            .iter()
+            .find(|event| event.actor == "assistant" && event.name.as_deref() == Some("Bash"))
+            .unwrap();
+        assert_eq!(bash.kind, "command");
+        assert_eq!(bash.files[0].path, "/repo/a.rs");
+        assert_eq!(bash.files[0].kind, crate::types::FileEvidenceKind::Command);
+        assert!(bash.files[0].cwd.is_none());
+        assert_eq!(call("read-1").files[0].operation, crate::types::FileOperation::Read);
+        assert_eq!(call("edit-1").files[0].operation, crate::types::FileOperation::Write);
+        let failure = events
+            .iter()
+            .find(|event| event.actor == "tool" && event.tool_call_id.as_deref() == Some("edit-1"))
+            .unwrap();
+        assert_eq!(failure.status.as_deref(), Some("error"));
+        assert!(call("edit-1").status.is_none());
+        assert_eq!(call("write-1").files[0].path, "/repo/b.rs");
+        assert!(call("write-1").status.is_none());
+        let observation = events
+            .iter()
+            .find(|event| event.actor == "tool" && event.tool_call_id.as_deref() == Some("read-1"))
+            .unwrap();
+        assert_eq!(observation.files[0].path, "/resolved/a.rs");
+        assert_eq!(observation.files[0].kind, crate::types::FileEvidenceKind::Observation);
+        assert!(failure.files.is_empty());
+        for id in ["write-2", "edit-2"] {
+            let result = events
+                .iter()
+                .find(|event| event.actor == "tool" && event.tool_call_id.as_deref() == Some(id))
+                .unwrap();
+            assert_eq!(result.files[0].kind, crate::types::FileEvidenceKind::Observation);
+            assert_eq!(result.files[0].operation, crate::types::FileOperation::Write);
+            assert_ne!(result.files[0].path, call(id).files[0].path);
+        }
+        assert!(events.iter().flat_map(|event| &event.files).all(|file| file.cwd.is_none()));
+        let attrs: serde_json::Value =
+            serde_json::from_str(call("read-1").attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs["part"], native_parts[0]);
     }
 
     fn fs_write_empty(path: &Path) {

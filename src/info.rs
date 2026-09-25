@@ -31,6 +31,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     let source_stats = store.indexed_source_stats()?;
     let progress = store.semantic_progress().unwrap_or_default();
     let worker = store.background_job_status("pipeline").unwrap_or_default();
+    let remote = crate::remote::load_settings()?;
 
     let rows = source_summaries(&labels, &source_stats);
     let grand_sessions = rows.iter().map(|row| row.sessions).sum::<u64>();
@@ -46,6 +47,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
                     "database": crate::db::schema::current_schema_version()
                 },
                 "sources": rows,
+                "remote": remote,
                 "settings": {
                     "enabled_sources": labels
                         .iter()
@@ -68,6 +70,18 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+
+    if let Some(remote) = &remote {
+        let provider = remote
+            .connection
+            .as_ref()
+            .map(|connection| connection.provider.as_str())
+            .unwrap_or("disconnected");
+        println!("Remote: {provider} | host: {}", remote.host.name);
+        if let Some(connection) = &remote.connection {
+            println!("Upload scope: {}", connection.scope.value().unwrap_or("all"));
+        }
     }
 
     let source_width = rows
@@ -100,14 +114,6 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     );
     for row in rows {
         let source = format!("{} ({})", row.label, row.id);
-        if let Some(error) = row.error {
-            println!(
-                "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  error: {error}",
-                sessions = "-",
-                messages = "-"
-            );
-            continue;
-        }
         println!(
             "  {source:<source_width$}  {sessions:>sessions_width$}  {messages:>messages_width$}  {range}",
             sessions = row.sessions,
@@ -149,7 +155,7 @@ pub(crate) fn run(format: InfoFormat) -> Result<()> {
     }
 
     println!();
-    println!("Tip: open the TUI and press Ctrl+S to edit settings.");
+    println!("Tip: open the TUI and press Ctrl+S to sync, Ctrl+P to edit settings.");
 
     Ok(())
 }

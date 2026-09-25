@@ -70,6 +70,25 @@ keystrokes, parse terminal UI output, and hope the focused row did not change.
 
 ## Command Design
 
+### `recall search --messages`
+
+Search individual message text with FTS, including assistant responses. The
+existing `recall search` mode continues to return sessions.
+
+```bash
+recall search "sync lock" --messages --project owner/repo --limit 10 --format json
+recall search "sync lock" --messages --session-id <session-id> --format json
+```
+
+`--limit` defaults to 10 and accepts 1–50 message matches. `--session-id`
+limits the search to an exact indexed session; it does not infer a project
+from the working directory. Explicit source, time, project, and repository
+filters still apply. JSON contains `protocol_version` and `matches`; each match
+has `session_id`, `source_session_id`, `source`, `title`, `seq`, `role`,
+`timestamp` (Unix milliseconds or null), and a match-centered `excerpt`.
+Matches are ranked and bounded, not an exhaustive list. This mode uses keyword
+matching only; existing session search retains hybrid retrieval.
+
 ### `recall session list`
 
 List indexed sessions. This command reads the local Recall SQLite index; it does
@@ -199,6 +218,42 @@ JSON output:
 }
 ```
 
+Read around a search hit:
+
+```bash
+recall session show --id <session-id> --messages --around-seq 83 --before 3 --after 3 --format json
+recall session show --id <session-id> --messages --from-seq 80 --to-seq 86 --max-chars 6000 --format json
+recall session show --id <session-id> --messages --cursor '<next_cursor>' --format json
+```
+
+`--around-seq` selects the exact anchor plus actual neighboring messages,
+including across gaps in sequence numbers. `--before` and `--after` default to
+3, allow zero, and require `--around-seq`. Around and explicit range selectors
+are mutually exclusive. Missing or ambiguous anchors are errors. The role
+filter is applied after selecting the neighboring window.
+
+Around reads default to 6,000 Unicode content characters per page. Set
+`--max-chars` to 1–32,000 to change the budget or enable range paging. Pages
+contain at most 1,000 message fragments and may end inside a message. Selected
+messages are returned in conversation order, so a long preceding message can
+fill a page before the anchor; use zero neighbors to read only the anchor.
+Paged JSON/JSONL adds `truncated`, `next_cursor`, and
+`first_message_byte_offset` (UTF-8 offset in the first returned message).
+Text mode prints the continuation argument on stderr. Continue with the same
+session reference and `--cursor`, without selection or role flags. Reindexing
+the session invalidates the cursor even if its content is unchanged. Sequence
+anchors refer to the current index, not permanent source identities.
+
+Without around, cursor, or a character budget, CLI show retains its existing
+full-content output. Bounds and role filtering are applied in SQLite.
+
+MCP exposes the same message search as `search_messages`. Pass `around_seq`,
+`before`, and `after` to `get_session`, or use `from_seq` / `to_seq`. Selected
+MCP reads default to at most 50 messages and 6,000 content characters;
+`max_chars` may lower this budget. `next_cursor` continues the selected window.
+Selectors and cursor cannot be combined with `tail`. Legacy `get_session`
+head/tail calls retain their existing text format and limits.
+
 ### `recall session export`
 
 Export explicitly selected sessions. This complements the existing bulk
@@ -286,6 +341,99 @@ JSON output:
 }
 ```
 
+### `recall share list`
+
+List pages currently in the configured publish directory, with their public
+URLs. This is the local inventory that the next Cloudflare Pages deploy
+publishes; it is not a live crawl of `pages.dev`.
+
+```bash
+recall share list
+recall share list --format json
+```
+
+Options:
+
+- `--format <text|json>`: default `text`.
+
+Behavior:
+
+- Requires existing `recall share init` configuration.
+- Reads `*.html` files from the managed publish directory.
+- Reconstructs each URL as `https://{project_domain}/{share_id}`.
+- Title and source come from the rendered page when present.
+- A missing publish directory prints an empty list, not an error.
+- Refuses to list a directory that is not managed by Recall.
+
+JSON output:
+
+```json
+{
+  "provider": "cloudflare-pages",
+  "project_name": "recall-share-7f3a2c",
+  "project_domain": "recall-share-7f3a2c.pages.dev",
+  "publish_dir": "/Users/me/Library/Application Support/recall/share-pages",
+  "url_base": "https://recall-share-7f3a2c.pages.dev",
+  "shares": [
+    {
+      "share_id": "019e6d8d-588b-7fd2-a326-c525469ed120",
+      "url": "https://recall-share-7f3a2c.pages.dev/019e6d8d-588b-7fd2-a326-c525469ed120",
+      "title": "Fix bug",
+      "source": "Codex",
+      "file_path": "/Users/me/Library/Application Support/recall/share-pages/019e6d8d-588b-7fd2-a326-c525469ed120.html",
+      "html_bytes": 18432
+    }
+  ]
+}
+```
+
+### `recall share unpublish`
+
+Delete one published page from the local publish directory and redeploy so the
+public URL stops serving it. Alias: `recall share rm`.
+
+```bash
+recall share unpublish <share-id>
+recall share unpublish https://recall-share-7f3a2c.pages.dev/<share-id>
+recall share unpublish <share-id> --dry-run
+recall share unpublish <share-id> --yes --format json
+```
+
+Options:
+
+- `<share-id>`: the id from `recall share list`, or this project's published
+  URL (`https://{project_domain}/{share-id}`). Other origins are rejected.
+- `--dry-run`: resolve the page and print the URL without deleting or deploying.
+- `--yes`: skip the interactive confirmation prompt. Required when stdin is not
+  a terminal.
+- `--format <text|json>`: default `text`.
+
+Behavior:
+
+- Requires existing `recall share init` configuration.
+- Deletes `{share_id}.html` from the managed publish directory, then deploys
+  that directory with Wrangler. Cloudflare Pages deployments are full snapshots,
+  so the public route 404s after a successful deploy.
+- If deploy fails, the local HTML file is restored.
+- Does not delete the Cloudflare Pages project.
+- Prints progress to stderr and the URL to stdout.
+
+JSON output:
+
+```json
+{
+  "share": {
+    "share_id": "019e6d8d-588b-7fd2-a326-c525469ed120",
+    "url": "https://recall-share-7f3a2c.pages.dev/019e6d8d-588b-7fd2-a326-c525469ed120",
+    "title": "Fix bug",
+    "source": "Codex",
+    "file_path": "/Users/me/Library/Application Support/recall/share-pages/019e6d8d-588b-7fd2-a326-c525469ed120.html",
+    "html_bytes": 18432
+  },
+  "dry_run": false
+}
+```
+
 ### `recall session resume`
 
 Resume one selected session in the source CLI when the adapter supports it.
@@ -337,6 +485,14 @@ recall session show --id <chosen-id> --include metadata,messages --format text
 recall session share --id <chosen-id> --format json
 ```
 
+### List Or Take Down Published Shares
+
+```bash
+recall share list --format json
+# User chooses which public URL to remove.
+recall share unpublish <share-id> --yes --format json
+```
+
 ### Export Selected Candidates
 
 ```bash
@@ -377,6 +533,8 @@ Example JSON error:
   Cloudflare-backed design.
 - `session share` must not add automatic confirmation prompts; coding agents
   should ask the user before invoking it.
+- `share unpublish` prompts on a TTY and requires `--yes` when stdin is not a
+  terminal; coding agents should ask the user before passing `--yes`.
 - `session show` should preserve Recall's existing sanitization behavior for
   displayed tool lines where applicable, but JSON output should clearly document
   whether content is sanitized or raw.
@@ -446,10 +604,11 @@ match `excluded_paths` still runs, restricted to the current scope.
   unchanged.
 - Existing `recall export` remains the bulk export command.
 - Existing TUI shortcuts keep using the same internal session operations.
-- Export record schema is `v5`: `session.topology` is additive and does not
-  affect `protocol_version`. Import accepts `v2`-`v5`; pre-topology records
-  default to `thread_role = null` with no parent links, and `v5` round-trips
-  topology losslessly.
+- Export record schema is `v7`: event records retain `files` and nullable
+  `command_evidence_status` alongside native call identity and visibility.
+  Import accepts `v2`–`v7`; older records default missing files to an empty list
+  and scan status to null. These defaults mean unknown evidence. Pre-topology
+  records retain `thread_role = null` with no parent links.
 - `protocol_version` is `2`: the default scope of `recall search`,
   `recall session list`, and `recall export` now comes from the current
   directory. Scripts and extensions that relied on the flagless global scope
@@ -465,6 +624,10 @@ match `excluded_paths` still runs, restricted to the current scope.
   `session export --format jsonl` reuses the existing JSONL export path.
 - Reuse `SearchEngine::hybrid_search` for `session list --query`.
 - Reuse `share::publish_session` for `session share`.
+- Inventory published pages from the managed publish directory; do not add a
+  separate share registry or crawl `pages.dev`.
+- Reuse the same Wrangler deploy path for `share unpublish` after deleting the
+  local HTML file.
 - Reuse `resume_command_for` and `app_command_for` for `session resume` and
   `session open`.
 - Keep stdout clean for data output; send sync/share/deploy progress to stderr.
@@ -474,12 +637,142 @@ match `excluded_paths` still runs, restricted to the current scope.
 - A coding agent can list candidate sessions with one JSON command.
 - A coding agent can retrieve a full session transcript without opening the TUI.
 - A coding agent can share a chosen session and receive the final URL as JSON.
+- A coding agent can list currently published share URLs and unpublish one.
 - A coding agent can export selected sessions without relying on search filters
   alone.
 - A coding agent can resume or open supported sessions by id.
 - `cargo test` covers argument parsing, session lookup, JSON output shape, and
   share dry-run behavior.
 - Documentation includes at least one end-to-end agent workflow.
+
+## File History Implementation Contract
+
+Use MCP `file_history` to find recorded operations on a target file across
+session projects. This reads the index without syncing or executing history.
+Pass an explicit `target_project` and an exact repository-relative or absolute
+`path`; omit `project`, which retains its older session-scope meaning.
+
+```json
+{"target_project":"owner/repo","path":"src/main.rs","include_command_candidates":true,"limit":20}
+```
+
+`target_project` accepts a local directory, remote URL, or unique indexed target
+repository name/slug. Repository identity can match across worktrees, including
+sessions started elsewhere. Check returned `target_file` and each match's
+`match_basis`. Ambiguous selectors require a more specific target. Basename or
+suffix matching belongs to the legacy mode without `target_project`.
+
+If a historical worktree is gone and its repository identity is unresolved,
+a path-only legacy query can discover recorded absolute paths. Retry target
+mode with that exact native path to read its evidence. Inspect `match_basis`;
+a suffix match alone does not establish repository identity. Legacy discovery
+is limited to 50 events and does not establish complete coverage.
+
+### Interpret and page file evidence
+
+Structured target mode includes all event kinds by default, with command
+candidates excluded unless `include_command_candidates` is true. An explicit
+`kind` filters the event kind. The default page holds 20 events, at most 50.
+Repeat the same target, path, source, kind, and candidate selection with
+`next_cursor` until `has_more` is false. Target-relevant index changes invalidate
+the cursor; restart the query rather than joining incompatible pages. Known
+timestamps sort newest first, with unknown timestamps last.
+
+Each page checks the count and highest ID of matching immutable indexed events.
+Reparsing replaces events with new IDs, invalidating affected continuations.
+This uses indexed target associations without reading full evidence payloads.
+Selected page metadata and file associations share a 64 MiB read budget.
+
+File associations distinguish `call`, `observation`, and `command`, and retain
+operations such as read, write, delete, and both sides of a move. Requests,
+results, and observations may describe one operation. Command evidence is a
+candidate; approval, wrapper completion, or a filename in output does not prove
+execution or success. `command_evidence_status` describes scanning coverage:
+`complete`, `unsupported`, `limit_exceeded`, or null for unscanned/older records.
+It does not describe execution success. Preserve native result statuses and
+use native call identity and surrounding evidence before combining records.
+Event rows, equal content, and Git commits are not counts of independent edits.
+
+Retain `coverage` from the first page; continuation pages omit that field.
+Check it and per-hit truncation flags before reporting completeness. Coverage
+describes all indexed sessions of the selected sources, not the
+history of this file alone. It reports recorded parser versions, imports,
+and missing parser state. Per-hit evidence reports file identity and command
+scan status separately.
+It does not scan native sources or prove that parsers are current. Empty
+matches do not prove that the file was never changed.
+
+### Read evidence and the discussion separately
+
+Copy `events[].evidence.event_ref` and the hit's `session_id` into MCP
+`get_session`:
+
+```json
+{"session_id":"<session-id>","event_ref":"<opaque-event-ref>","evidence_part":"payload","max_bytes":16384}
+```
+
+Concatenate each page's UTF-8 `data` in byte-offset order before parsing the
+payload JSON. Continue with the same `session_id`, `event_ref`, `evidence_part`,
+and the returned `next_cursor` as `cursor`. `max_bytes` bounds each evidence
+response, defaults to 16,384, and accepts 1,024–65,536. Each read has a 64 MiB
+budget; oversized evidence fails explicitly instead of returning a complete
+prefix. References identify an immutable event within one index. Any rebuild
+of that event invalidates its reference, even if its content is identical;
+query again for a fresh reference. Evidence cursors also bind the content
+digest and reject native content changes.
+
+The payload contains the full indexed event, native `attrs_json`, all file
+associations, same-session `related_event_refs`, and an optional `discussion`
+selector. Read related payloads to connect a request to its native result.
+For Cursor content, select the result reference whose native attrs contain
+`beforeContentId` or `afterContentId`, then request `evidence_part: "before"`
+or `"after"`. A call without those references returns
+`content_reference_not_recorded`; it is not evidence that the source changed.
+Native content is read only through the registered Cursor store, with session
+ownership and content-hash checks. Imports and unverifiable references remain
+`source_unverified`; unavailable or changed source records are reported as
+`source_missing` or `source_changed`. Indexed payload remains readable without
+claiming that the native source is still present or verified.
+
+Use the returned `discussion` object in a separate `get_session` call, without
+`event_ref`. It uses the existing `around_seq` message window and continuation
+rules. A missing anchor remains unknown; do not infer it from event order.
+Explain the reason for an edit only when the recorded discussion supports it,
+and separate the user's request, the agent's explanation, and an inference.
+
+### Refresh the index
+
+When index mutation is authorized, backfill native events across configured
+sources with an explicit global scope to include cross-project operations:
+
+```bash
+recall sync --backfill-events --project all --dry-run
+recall sync --backfill-events --project all
+```
+
+Backfill bypasses source time windows while respecting enabled sources,
+exclusions, `--source`, and session project scope. It updates events in existing
+sessions without rebuilding their discussion, usage, or embeddings. Newly
+encountered sessions with events use normal initial indexing, including
+discussion, parent relationships, usage and background embedding scheduling. If parsed discussion differs from an existing indexed transcript,
+unverifiable anchors are cleared. Use normal `recall sync --project all` to
+refresh supported discussion parsers; normal sync retains its usual scope,
+time-window, and retention behavior.
+
+`--dry-run` requires `--backfill-events` and leaves the index unchanged. It does
+not migrate an older database; `requires_index_upgrade` means a normal writable
+index upgrade is required before previewing. Inspect the maintenance report
+for missing or unknown originals, unsupported sessions, unstable reads, and
+failures. Backfill does not prune sessions or reconcile deletions. It cannot
+recover records the native source deleted or never stored, and does not add
+permanent archival, a filesystem monitor, a launcher, or a TUI flow.
+
+File evidence preserves the native `path` and optional operation `cwd`.
+Its `target` is derived during sync from available repository evidence,
+independently of the session's project. Missing files may resolve through an
+existing parent directory; unresolved paths remain unresolved. Derived identity
+does not prove historical Git state. Import preserves recorded targets without
+resolving imported paths on disk.
 
 ## Open Questions
 

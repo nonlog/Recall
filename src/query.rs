@@ -14,6 +14,61 @@ pub(crate) enum SearchFormat {
     Json,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_message_search(
+    query: &str,
+    source: Option<&str>,
+    time: Option<&str>,
+    project: Option<&str>,
+    repo: Option<&str>,
+    session_id: Option<&str>,
+    limit: usize,
+    format: SearchFormat,
+) -> Result<()> {
+    let store = Store::open()?;
+    if let Some(id) = session_id {
+        anyhow::ensure!(store.get_session_by_id(id)?.is_some(), "session not found: {id}");
+    }
+    let scope = if session_id.is_some() && project.is_none() && repo.is_none() {
+        crate::project_scope::ProjectScope::Global
+    } else {
+        store.resolve_scope(project, repo)?.announce()
+    };
+    let filters = SearchFilters {
+        sources: resolve_source_filter(source, &adapters::source_labels())?,
+        time_range: parse_time_range(time)?,
+        scope,
+        thread_role: None,
+        excluded_session_id: None,
+    };
+    let matches =
+        SearchEngine::new(&store.conn).search_messages(query, &filters, session_id, limit)?;
+    match format {
+        SearchFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "protocol_version": crate::PROTOCOL_VERSION, "matches": matches,
+            }))?
+        ),
+        SearchFormat::Text => {
+            for hit in &matches {
+                println!(
+                    "{} #{} [{}] {}\n  {}",
+                    hit.session_id, hit.seq, hit.role, hit.title, hit.excerpt
+                );
+                println!("  host: {}", crate::host::label(&hit.locations));
+                if hit.alternative_versions > 0 {
+                    println!("  alternative versions: {}", hit.alternative_versions);
+                }
+            }
+            if matches.is_empty() {
+                println!("No matching messages.");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run_search(
     query: &str,
     source_filter: Option<&str>,
@@ -23,20 +78,20 @@ pub(crate) fn run_search(
     format: SearchFormat,
 ) -> Result<()> {
     if matches!(format, SearchFormat::Json) {
-        return session::run_session_list(
-            Some(query),
-            source_filter,
-            time_filter,
-            project_filter,
-            repo_filter,
-            None,
-            20,
-            0,
-            false,
-            false,
-            Some(SessionSort::Relevance),
-            SessionListFormat::Json,
-        );
+        return session::run_session_list(&session::SessionListArgs {
+            query: Some(query.into()),
+            source: source_filter.map(str::to_string),
+            time: time_filter.map(str::to_string),
+            project: project_filter.map(str::to_string),
+            repo: repo_filter.map(str::to_string),
+            thread_role: None,
+            limit: 20,
+            offset: 0,
+            all: false,
+            sync: false,
+            sort: Some(SessionSort::Relevance),
+            format: SessionListFormat::Json,
+        });
     }
 
     let time_range = parse_time_range(time_filter)?;
@@ -47,7 +102,13 @@ pub(crate) fn run_search(
     let scope = store.resolve_scope(project_filter, repo_filter)?.announce();
     let embedding = query_embedding(&store, query, |message| println!("{message}"))?;
 
-    let filters = SearchFilters { sources: resolved_source, time_range, scope, thread_role: None };
+    let filters = SearchFilters {
+        sources: resolved_source,
+        time_range,
+        scope,
+        thread_role: None,
+        excluded_session_id: None,
+    };
 
     let results = engine.hybrid_search(query, embedding.as_deref(), &filters, 20, 3)?;
 
@@ -76,6 +137,10 @@ pub(crate) fn run_search(
             println!("    {short}");
         }
         println!("    dir: {dir}");
+        println!("    host: {}", crate::host::label(&s.locations));
+        if s.alternative_versions > 0 {
+            println!("    alternative versions: {}", s.alternative_versions);
+        }
         println!();
     }
 
@@ -86,16 +151,18 @@ pub(crate) fn resolve_source_filter(
     source_filter: Option<&str>,
     sources: &[(String, String)],
 ) -> Result<Option<Vec<String>>> {
-    let Some(source) = source_filter else {
-        return Ok(None);
-    };
+    source_filter
+        .map(|source| resolve_source_id(source, sources).map(|source| vec![source]))
+        .transpose()
+}
+
+pub(crate) fn resolve_source_id(source: &str, sources: &[(String, String)]) -> Result<String> {
     let lower = source.to_lowercase();
-    let resolved = sources
+    sources
         .iter()
         .find(|(id, label)| id == &lower || label.to_lowercase() == lower)
         .map(|(id, _)| id.clone())
-        .ok_or_else(|| anyhow::anyhow!("unknown source: {source}"))?;
-    Ok(Some(vec![resolved]))
+        .ok_or_else(|| anyhow::anyhow!("unknown source: {source}"))
 }
 
 pub(crate) fn parse_time_range_arg(value: &str) -> std::result::Result<String, String> {

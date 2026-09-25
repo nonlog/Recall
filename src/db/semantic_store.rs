@@ -125,7 +125,7 @@ impl Store {
             "UPDATE session_embedding_state
              SET status = 'processing',
                  units_done = ?2
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND status = 'processing'",
             rusqlite::params![session_id, units_done as i64],
         )?;
         Ok(())
@@ -139,7 +139,7 @@ impl Store {
                  units_done = units_total,
                  finished_at = ?2,
                  last_error = NULL
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND status = 'processing'",
             rusqlite::params![session_id, now],
         )?;
         Ok(())
@@ -152,7 +152,7 @@ impl Store {
              SET status = 'failed',
                  finished_at = ?2,
                  last_error = ?3
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND status = 'processing'",
             rusqlite::params![session_id, now, error],
         )?;
         Ok(())
@@ -230,42 +230,16 @@ impl Store {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
-        let progress = self.conn.query_row(&sql, param_refs.as_slice(), |row| {
-            Ok(SemanticProgress {
-                total_sessions: row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
-                done_sessions: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
-                processing_sessions: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
-                failed_sessions: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
-                pending_sessions: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
-                current_session_title: None,
+        self.conn
+            .query_row(&sql, param_refs.as_slice(), |row| {
+                Ok(SemanticProgress {
+                    total_sessions: row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                    done_sessions: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                    processing_sessions: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                    failed_sessions: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                    pending_sessions: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                })
             })
-        })?;
-
-        let mut current_sql = String::from(
-            "SELECT s.title
-             FROM session_embedding_state st
-             JOIN sessions s ON s.id = st.session_id
-             WHERE st.status = 'processing'",
-        );
-        let mut current_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut current_param_idx = 1;
-        apply_scope_filters(
-            &mut current_sql,
-            &mut current_params,
-            &mut current_param_idx,
-            sources,
-            time_range,
-            scope,
-        );
-        current_sql.push_str(" ORDER BY COALESCE(s.updated_at, s.started_at) DESC LIMIT 1");
-        let current_param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            current_params.iter().map(|p| p.as_ref()).collect();
-
-        let current_session_title = self
-            .conn
-            .query_row(&current_sql, current_param_refs.as_slice(), |row| row.get(0))
-            .optional()?;
-
-        Ok(SemanticProgress { current_session_title, ..progress })
+            .map_err(Into::into)
     }
 }

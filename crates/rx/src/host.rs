@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -33,7 +32,6 @@ struct HostRequest {
     harness: Option<String>,
     gateway: GatewayProfile,
     state_dir: PathBuf,
-    permission_policy: PermissionPolicy,
     install_policy: InstallPolicy,
 }
 
@@ -44,12 +42,6 @@ struct GatewayProfile {
     name: String,
     endpoint: String,
     credential_env: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PermissionPolicy {
-    Standard,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -74,7 +66,7 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
             None => return Ok(()),
         },
     };
-    validate_route_args(harness, &passthrough)?;
+    validate_route_args(harness, &passthrough, &request.gateway.provider_id)?;
     let key = env
         .get(&request.gateway.credential_env)
         .filter(|value| !value.is_empty())
@@ -84,17 +76,13 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
                 request.gateway.credential_env
             )
         })?;
-    let target = target(&request.gateway, key)?;
+    let target = target(&request.gateway, key);
     let paths = Paths::in_dir(request.state_dir);
     let launch_request = LaunchRequest { harness, provider: None, passthrough };
     let install_env = EnvLookup::real_with(install_overrides(request.install_policy));
     let program = crate::install::ensure(harness, &install_env)?;
-    let runtime = runtime_overrides(harness, &paths.dir)?;
-    prepare_state(&runtime)?;
-    let planning_env = EnvLookup::real_with(planning_overrides(&runtime));
-    let mut plan = crate::launch::plan_target(&launch_request, &paths, &planning_env, &target)?;
+    let mut plan = crate::launch::plan_target(&launch_request, &paths, env, &target)?;
     plan.program = program;
-    plan.env_set.extend(runtime);
     if let Some(note) = &plan.stderr_note {
         eprintln!("{note}");
     }
@@ -103,7 +91,7 @@ pub(crate) fn run(passthrough: Vec<OsString>, env: &EnvLookup) -> Result<()> {
 
 fn capabilities_json() -> Result<String> {
     serde_json::to_string(&Capabilities {
-        protocol: Protocol { major: 1, minor: 0 },
+        protocol: Protocol { major: 1, minor: 1 },
         version: crate::RELEASE_VERSION,
         harnesses: Harness::ALL.iter().map(|harness| harness.as_str()).collect(),
     })
@@ -128,7 +116,6 @@ fn parse_request(raw: &str) -> Result<HostRequest> {
     }
     validate_endpoint(&request.gateway.endpoint)?;
     validate_env_name(&request.gateway.credential_env)?;
-    let _ = request.permission_policy;
     Ok(request)
 }
 
@@ -166,40 +153,7 @@ fn install_overrides(policy: InstallPolicy) -> HashMap<String, String> {
     )])
 }
 
-fn runtime_overrides(harness: Harness, state_dir: &Path) -> Result<HashMap<String, String>> {
-    let Some((key, suffix)) = (match harness {
-        Harness::Claude => Some(("CLAUDE_CONFIG_DIR", "claude")),
-        Harness::Codex => Some(("CODEX_HOME", "codex")),
-        Harness::OpenCode => Some(("XDG_DATA_HOME", "data")),
-        Harness::Pi => Some(("PI_CODING_AGENT_DIR", "pi-agent")),
-        Harness::Dsh => None,
-        Harness::Kimi => Some(("KIMI_CODE_HOME", "kimi-code")),
-    }) else {
-        return Ok(HashMap::new());
-    };
-    let path = state_dir
-        .join(suffix)
-        .to_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("host state_dir must be UTF-8"))?;
-    Ok(HashMap::from([(key.to_string(), path)]))
-}
-
-fn planning_overrides(runtime: &HashMap<String, String>) -> HashMap<String, String> {
-    let mut environment = runtime.clone();
-    environment.insert("RX_NO_YOLO".to_string(), "1".to_string());
-    environment
-}
-
-fn prepare_state(environment: &HashMap<String, String>) -> Result<()> {
-    for path in environment.values() {
-        fs::create_dir_all(path)
-            .with_context(|| format!("failed to create hosted state {path}"))?;
-    }
-    Ok(())
-}
-
-fn target(profile: &GatewayProfile, key: String) -> Result<ProviderTarget> {
+fn target(profile: &GatewayProfile, key: String) -> ProviderTarget {
     let provider = Provider {
         id: profile.provider_id.clone(),
         name: profile.name.clone(),
@@ -211,27 +165,24 @@ fn target(profile: &GatewayProfile, key: String) -> Result<ProviderTarget> {
         default_model: None,
         claude_default_model: None,
     };
-    Ok(ProviderTarget {
-        provider_id: profile.provider_id.clone(),
-        base_url: profile.endpoint.clone(),
-        claude_url: crate::provider::claude_base(&provider),
-        provider,
-        key,
-        model: None,
-    })
+    ProviderTarget { provider, key, model: None }
 }
 
-fn validate_route_args(harness: Harness, passthrough: &[OsString]) -> Result<()> {
+fn validate_route_args(
+    harness: Harness,
+    passthrough: &[OsString],
+    provider_id: &str,
+) -> Result<()> {
     let args = args::before_double_dash(passthrough);
     match harness {
         Harness::Claude => reject_flags(args, &["--settings", "--setting-sources"]),
         Harness::Codex => validate_codex(args),
-        Harness::OpenCode => validate_scoped_values(args, &["-m", "--model"], "tokener"),
+        Harness::OpenCode => validate_scoped_values(args, &["-m", "--model"], provider_id),
         Harness::Pi => {
             reject_flags(args, &["--api-key"])?;
-            validate_exact_values(args, &["--provider"], "tokener")?;
-            validate_scoped_values(args, &["-m", "--model"], "tokener")?;
-            validate_list_values(args, &["--models"], "tokener")
+            validate_exact_values(args, &["--provider"], provider_id)?;
+            validate_scoped_values(args, &["-m", "--model"], provider_id)?;
+            validate_list_values(args, &["--models"], provider_id)
         }
         Harness::Dsh => reject_flags(args, &["--profile", "--patch"]),
         Harness::Kimi => Ok(()),
@@ -244,9 +195,10 @@ fn validate_codex(args: &[OsString]) -> Result<()> {
         let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
         if key == "model_provider"
             || key == "openai_base_url"
+            || key == "model_providers"
             || key.starts_with("model_providers.")
         {
-            bail!("{} cannot override the hosted Gateway route", value);
+            bail!("{key} cannot override the hosted Gateway route");
         }
     }
     Ok(())
@@ -282,9 +234,7 @@ fn validate_list_values(args: &[OsString], flags: &[&str], expected: &str) -> Re
 }
 
 fn reject_flags(args: &[OsString], flags: &[&str]) -> Result<()> {
-    if args.iter().any(|arg| {
-        flags.iter().any(|flag| arg == *flag || args::os_prefix(arg, &format!("{flag}=")))
-    }) {
+    if args::has_flags(args, flags) {
         bail!("{} cannot override the hosted Gateway route", flags[0]);
     }
     Ok(())
@@ -292,157 +242,22 @@ fn reject_flags(args: &[OsString], flags: &[&str]) -> Result<()> {
 
 fn flag_values<'a>(args: &'a [OsString], flags: &[&str]) -> Vec<&'a str> {
     let mut values = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if flags.iter().any(|flag| arg == *flag) {
-            if let Some(value) = args.get(index + 1).and_then(|value| value.to_str()) {
-                values.push(value);
-            }
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg
-            .to_str()
-            .and_then(|arg| flags.iter().find_map(|flag| arg.strip_prefix(&format!("{flag}="))))
-        {
-            values.push(value);
-        }
-        index += 1;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let value = if flags.iter().any(|flag| arg == *flag) {
+            args.next().and_then(|value| value.to_str())
+        } else {
+            arg.to_str().and_then(|arg| {
+                flags.iter().find_map(|flag| {
+                    arg.strip_prefix(&format!("{flag}="))
+                        .or_else(|| (flag.len() == 2).then(|| arg.strip_prefix(flag)).flatten())
+                })
+            })
+        };
+        values.extend(value);
     }
     values
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn os(args: &[&str]) -> Vec<OsString> {
-        args.iter().map(OsString::from).collect()
-    }
-
-    fn request(harness: Option<&str>) -> String {
-        serde_json::json!({
-            "harness": harness,
-            "gateway": {
-                "provider_id": "tokener",
-                "name": "Tokener",
-                "endpoint": "https://api.tokener.dev/v1",
-                "credential_env": "TOKENER_API_KEY"
-            },
-            "state_dir": "/tmp/tokener-agent",
-            "permission_policy": "standard",
-            "install_policy": "prompt"
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn capabilities_are_stable() {
-        let value: serde_json::Value = serde_json::from_str(&capabilities_json().unwrap()).unwrap();
-        assert_eq!(value["protocol"], serde_json::json!({"major": 1, "minor": 0}));
-        assert_eq!(
-            value["harnesses"],
-            serde_json::json!(["claude", "codex", "opencode", "pi", "dsh", "kimi"])
-        );
-        assert_eq!(value["version"], crate::RELEASE_VERSION);
-    }
-
-    #[test]
-    fn hosted_request_allows_missing_harness() {
-        assert!(parse_request(&request(None)).unwrap().harness.is_none());
-        assert_eq!(
-            parse_request(&request(Some("codex"))).unwrap().harness.as_deref(),
-            Some("codex")
-        );
-    }
-
-    #[test]
-    fn request_rejects_unknown_fields_and_unsafe_profile_values() {
-        let mut value: serde_json::Value = serde_json::from_str(&request(None)).unwrap();
-        value["tokener_key"] = serde_json::json!("secret");
-        assert!(parse_request(&value.to_string()).is_err());
-        let mut value: serde_json::Value = serde_json::from_str(&request(None)).unwrap();
-        value["gateway"]["credential_env"] = serde_json::json!("KEY;bad");
-        assert!(parse_request(&value.to_string()).is_err());
-    }
-
-    #[test]
-    fn route_guards_are_harness_specific() {
-        validate_route_args(Harness::Claude, &os(&["--resume", "session", "--tools", "Read"]))
-            .unwrap();
-        assert!(validate_route_args(Harness::Claude, &os(&["--settings", "route.json"])).is_err());
-        validate_route_args(
-            Harness::Codex,
-            &os(&["resume", "--last", "-c", "sandbox_mode=read-only"]),
-        )
-        .unwrap();
-        assert!(
-            validate_route_args(Harness::Codex, &os(&["-c", "model_provider=ollama"])).is_err()
-        );
-        validate_route_args(Harness::OpenCode, &os(&["--model", "tokener/model-a", "--fork"]))
-            .unwrap();
-        assert!(
-            validate_route_args(Harness::OpenCode, &os(&["--model", "openai/model-a"])).is_err()
-        );
-        validate_route_args(
-            Harness::Pi,
-            &os(&["--provider", "tokener", "--model", "model-a", "--resume"]),
-        )
-        .unwrap();
-        assert!(validate_route_args(Harness::Pi, &os(&["--api-key", "secret"])).is_err());
-        assert!(validate_route_args(Harness::Dsh, &os(&["--patch", "other.yml"])).is_err());
-        validate_route_args(Harness::Kimi, &os(&["--session", "session-id", "--plan"])).unwrap();
-    }
-
-    #[test]
-    fn native_arguments_after_double_dash_are_literal() {
-        validate_route_args(
-            Harness::Claude,
-            &os(&["--resume", "session", "--", "--settings", "literal"]),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn hosted_environment_scopes_are_harness_specific() {
-        let root = tempfile::tempdir().unwrap();
-        let state = root.path().join("tokener-agent");
-        let cases = [
-            (Harness::Claude, Some(("CLAUDE_CONFIG_DIR", "claude"))),
-            (Harness::Codex, Some(("CODEX_HOME", "codex"))),
-            (Harness::OpenCode, Some(("XDG_DATA_HOME", "data"))),
-            (Harness::Pi, Some(("PI_CODING_AGENT_DIR", "pi-agent"))),
-            (Harness::Dsh, None),
-            (Harness::Kimi, Some(("KIMI_CODE_HOME", "kimi-code"))),
-        ];
-        for (harness, expected) in cases {
-            let environment = runtime_overrides(harness, &state).unwrap();
-            assert_eq!(environment.len(), usize::from(expected.is_some()));
-            if let Some((key, suffix)) = expected {
-                assert_eq!(environment[key], state.join(suffix).to_str().unwrap());
-            }
-            prepare_state(&environment).unwrap();
-            assert!(environment.values().all(|path| Path::new(path).is_dir()));
-        }
-        assert!(!state.join("dsh-home").exists());
-    }
-
-    #[test]
-    fn hosted_control_environment_does_not_reach_runtime() {
-        assert_eq!(
-            install_overrides(InstallPolicy::Prompt),
-            HashMap::from([("RX_NO_INSTALL".to_string(), "0".to_string())])
-        );
-        assert_eq!(
-            install_overrides(InstallPolicy::Deny),
-            HashMap::from([("RX_NO_INSTALL".to_string(), "1".to_string())])
-        );
-        let runtime = runtime_overrides(Harness::Codex, Path::new("/tmp/tokener-agent")).unwrap();
-        assert!(!runtime.contains_key("RX_NO_INSTALL"));
-        assert!(!runtime.contains_key("RX_NO_YOLO"));
-        let planning = planning_overrides(&runtime);
-        assert_eq!(planning["RX_NO_YOLO"], "1");
-        assert!(!planning.contains_key("RX_NO_INSTALL"));
-    }
-}
+mod tests;

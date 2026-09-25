@@ -1,5 +1,107 @@
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+use fs2::FileExt;
+
+pub(crate) fn binary_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| binary_in(&dir, name))
+}
+
+#[cfg(unix)]
+fn binary_in(dir: &Path, name: &str) -> bool {
+    is_unix_executable(&dir.join(name))
+}
+
+#[cfg(windows)]
+fn binary_in(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn binary_in(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file()
+}
+
+#[cfg(unix)]
+fn is_unix_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path.metadata().ok().is_some_and(|meta| meta.permissions().mode() & 0o111 != 0)
+}
+
+pub(crate) fn text_needs_trigram(text: &str) -> bool {
+    if text.is_ascii() {
+        return false;
+    }
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{3400}'..='\u{9fff}'
+                | '\u{f900}'..='\u{faff}'
+                | '\u{3040}'..='\u{30ff}'
+                | '\u{3100}'..='\u{318f}'
+                | '\u{31a0}'..='\u{31bf}'
+                | '\u{31f0}'..='\u{31ff}'
+                | '\u{a960}'..='\u{a97f}'
+                | '\u{ac00}'..='\u{d7ff}'
+                | '\u{ff66}'..='\u{ff9f}'
+                | '\u{20000}'..='\u{323af}'
+        )
+    })
+}
+
+pub(crate) fn try_acquire_worker_lock() -> anyhow::Result<Option<File>> {
+    try_acquire_lock(&recall_lock_path("background-worker.lock")?)
+}
+
+pub(crate) fn acquire_sync_lock() -> anyhow::Result<File> {
+    acquire_lock(&recall_lock_path("sync.lock")?)
+}
+
+pub(crate) fn try_acquire_sync_lock() -> anyhow::Result<Option<File>> {
+    try_acquire_lock(&recall_lock_path("sync.lock")?)
+}
+
+fn acquire_lock(path: &Path) -> anyhow::Result<File> {
+    let mut file = open_lock_file(path)?;
+    file.lock_exclusive()?;
+    write_lock_owner(&mut file)?;
+    Ok(file)
+}
+
+fn try_acquire_lock(path: &Path) -> anyhow::Result<Option<File>> {
+    let mut file = open_lock_file(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            write_lock_owner(&mut file)?;
+            Ok(Some(file))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn open_lock_file(path: &Path) -> anyhow::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?)
+}
+
+fn write_lock_owner(file: &mut File) -> anyhow::Result<()> {
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(())
+}
+
+fn recall_lock_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("cannot determine data directory"))?;
+    Ok(dir.join("recall").join(name))
+}
 
 pub(crate) fn open_url_in_default_browser(url: &str) -> anyhow::Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
@@ -184,6 +286,16 @@ fn is_noise_first_message(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_file_excludes_parallel_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.lock");
+        let first = acquire_lock(&path).unwrap();
+
+        assert!(try_acquire_lock(&path).unwrap().is_none());
+        drop(first);
+    }
 
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

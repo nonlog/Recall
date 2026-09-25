@@ -7,14 +7,13 @@ use rusqlite::OptionalExtension;
 use super::event_store::replace_session_events;
 use super::project_store::apply_scope_filters;
 use super::store::{
-    MetadataSessionStateMeta, SESSION_COLUMNS, SessionListSort, SessionTopologyWrite, Store,
-    session_from_row,
+    IndexedSessionMeta, ParserStateMeta, SESSION_COLUMNS, SessionListSort, SessionTopologyWrite,
+    Store, session_from_row,
 };
+use super::topology_store::replace_parent_links_tx;
 use crate::db::search::{ThreadRoleFilter, TimeRange};
 use crate::project_scope::ProjectScope;
-use crate::types::{
-    Message, ParentLink, RawSessionEvent, RawUsageEvent, Role, Session, SessionTopology, ThreadRole,
-};
+use crate::types::{Message, RawSessionEvent, RawUsageEvent, Role, Session};
 
 pub(crate) struct IndexedSourceStats {
     pub(crate) sessions: u64,
@@ -42,12 +41,20 @@ impl Store {
     pub(crate) fn session_meta_map(
         &self,
         source: &str,
-    ) -> Result<HashMap<String, (Option<i64>, u32)>> {
+    ) -> Result<HashMap<String, IndexedSessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_id, updated_at, message_count FROM sessions WHERE source = ?1",
+            "SELECT source_id, id, updated_at, message_count FROM sessions
+             WHERE source = ?1 AND id IN (SELECT session_id FROM native_bindings)",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+            Ok((
+                row.get::<_, String>(0)?,
+                IndexedSessionMeta {
+                    id: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    message_count: row.get(3)?,
+                },
+            ))
         })?;
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
@@ -73,19 +80,42 @@ impl Store {
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
+    pub(crate) fn indexed_active_sessions_after(
+        &self,
+        after_millis: Option<i64>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, id
+             FROM sessions
+             WHERE (?1 IS NULL OR COALESCE(updated_at, started_at) >= ?1)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![after_millis], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub(crate) fn imported_source_ids(&self, source: &str) -> Result<HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT source_id FROM sessions WHERE source = ?1 AND is_import = 1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id FROM sessions WHERE source = ?1 AND is_import = 1
+                      AND id IN (SELECT session_id FROM native_bindings)",
+        )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| row.get(0))?;
         rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
     }
 
     pub(crate) fn clear_import_marker(&self, source: &str, source_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET is_import = 0 WHERE source = ?1 AND source_id = ?2",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE sessions SET is_import = 0 WHERE id =
+             (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2)",
             rusqlite::params![source, source_id],
         )?;
+        tx.execute(
+            "UPDATE native_bindings SET confirmed = 1 WHERE source = ?1 AND source_id = ?2",
+            rusqlite::params![source, source_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -108,7 +138,7 @@ impl Store {
                         WHEN ?3 IS NOT NULL AND ?3 != '' THEN ?3
                         ELSE title
                     END
-              WHERE source = ?1 AND source_id = ?2",
+              WHERE id = (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2)",
             rusqlite::params![
                 source,
                 source_id,
@@ -123,7 +153,8 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn insert_session(&self, session: &Session) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
@@ -146,27 +177,15 @@ impl Store {
                 session.is_import,
             ],
         )?;
+        bind_native_tx(&tx, session)?;
+        tx.commit()?;
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn insert_messages(&self, messages: &[Message]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO messages (session_id, role, content, timestamp, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for msg in messages {
-                stmt.execute(rusqlite::params![
-                    msg.session_id,
-                    msg.role.as_str(),
-                    msg.content,
-                    msg.timestamp,
-                    msg.seq,
-                ])?;
-            }
-        }
+        insert_messages_tx(&tx, messages, self.trigram_message_flag)?;
         tx.commit()?;
         Ok(())
     }
@@ -231,7 +250,9 @@ impl Store {
             session_events,
             event_parser_version,
             topology,
+            self.trigram_message_flag,
         )?;
+        bind_native_tx(&tx, session)?;
         tx.commit()?;
         Ok(())
     }
@@ -276,7 +297,17 @@ impl Store {
         topology: &SessionTopologyWrite<'_>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        delete_session_data_tx(&tx, old_source, old_source_id)?;
+        let old_id: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
+                rusqlite::params![old_source, old_source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if old_id.as_deref().is_some_and(|id| id != session.id) {
+            delete_session_data_tx(&tx, old_source, old_source_id)?;
+        }
+        clear_session_contents_tx(&tx, &session.id)?;
         persist_session_with_usage_and_events_tx(
             &tx,
             session,
@@ -286,109 +317,24 @@ impl Store {
             session_events,
             event_parser_version,
             topology,
+            self.trigram_message_flag,
         )?;
+        bind_native_tx(&tx, session)?;
         tx.commit()?;
         Ok(())
-    }
-
-    /// Topology-only write for an already-indexed session: does not touch
-    /// messages, usage, events, embeddings, or the local session id.
-    pub(crate) fn persist_topology_for_existing_session(
-        &self,
-        source: &str,
-        source_id: &str,
-        topology: &SessionTopologyWrite<'_>,
-    ) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let session_id: Option<String> = tx
-            .query_row(
-                "SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2",
-                rusqlite::params![source, source_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(session_id) = session_id else {
-            return Ok(false);
-        };
-        tx.execute(
-            "UPDATE sessions SET thread_role = ?1, metadata_parser_version = ?2 WHERE id = ?3",
-            rusqlite::params![
-                topology.thread_role.map(|role| role.as_str()),
-                topology.parser_version,
-                session_id,
-            ],
-        )?;
-        replace_parent_links_tx(&tx, &session_id, topology.parents)?;
-        tx.commit()?;
-        Ok(true)
-    }
-
-    pub(crate) fn session_topology(&self, session_id: &str) -> Result<SessionTopology> {
-        let thread_role = self
-            .conn
-            .query_row(
-                "SELECT thread_role FROM sessions WHERE id = ?1",
-                rusqlite::params![session_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .and_then(|role| role.parse::<ThreadRole>().ok());
-        let mut stmt = self.conn.prepare(
-            "SELECT relation, parent_source, parent_source_id
-             FROM session_parent_links
-             WHERE session_id = ?1
-             ORDER BY relation, parent_source, parent_source_id",
-        )?;
-        let parents = stmt
-            .query_map(rusqlite::params![session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter_map(|(relation, source, source_id)| {
-                relation.parse().ok().map(|relation| ParentLink { relation, source, source_id })
-            })
-            .collect();
-        Ok(SessionTopology { thread_role, parents })
-    }
-
-    /// Sessions whose `spawn` parent is the given portable identity — the
-    /// subagents this session directly spawned. `fork`/`resume` links are not
-    /// subagents and are excluded. Uses `idx_session_parent_links_parent`.
-    pub(crate) fn child_subagents(&self, source: &str, source_id: &str) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SESSION_COLUMNS}
-             FROM sessions s
-             JOIN session_parent_links l ON l.session_id = s.id
-             WHERE l.parent_source = ?1
-               AND l.parent_source_id = ?2
-               AND l.relation = 'spawn'
-             ORDER BY s.started_at, s.id"
-        ))?;
-        let rows = stmt.query_map(rusqlite::params![source, source_id], session_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub(crate) fn metadata_state_meta_map(
         &self,
         source: &str,
-    ) -> Result<HashMap<String, MetadataSessionStateMeta>> {
-        let mut stmt = self.conn.prepare(
+    ) -> Result<HashMap<String, ParserStateMeta>> {
+        self.parser_state_map(
             "SELECT source_id, metadata_parser_version, updated_at
              FROM sessions
-             WHERE source = ?1 AND metadata_parser_version IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                MetadataSessionStateMeta {
-                    parser_version: row.get(1)?,
-                    source_updated_at: row.get(2)?,
-                },
-            ))
-        })?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+             WHERE source = ?1 AND metadata_parser_version IS NOT NULL
+               AND id IN (SELECT session_id FROM native_bindings)",
+            source,
+        )
     }
 
     pub(crate) fn delete_session_data(&self, source: &str, source_id: &str) -> Result<()> {
@@ -432,7 +378,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             session_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), session_from_row)?;
+        let rows = stmt.query_map(params.as_slice(), |row| session_from_row(row, &self.conn))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -441,7 +387,7 @@ impl Store {
             .query_row(
                 &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
                 rusqlite::params![session_id],
-                session_from_row,
+                |row| session_from_row(row, &self.conn),
             )
             .optional()
             .map_err(Into::into)
@@ -452,18 +398,36 @@ impl Store {
         source: &str,
         source_id: &str,
     ) -> Result<Option<Session>> {
-        self.conn
-            .query_row(
-                &format!(
-                    "SELECT {SESSION_COLUMNS}
-                     FROM sessions
-                     WHERE source = ?1 AND source_id = ?2"
-                ),
-                rusqlite::params![source, source_id],
-                session_from_row,
-            )
-            .optional()
-            .map_err(Into::into)
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ?1 AND source_id = ?2 LIMIT 2"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![source, source_id])?;
+        let session = rows.next()?.map(|row| session_from_row(row, &self.conn)).transpose()?;
+        anyhow::ensure!(
+            rows.next()?.is_none(),
+            "session source ID is ambiguous; use its local UUID"
+        );
+        Ok(session)
+    }
+
+    pub(crate) fn get_native_session(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Result<Option<Session>> {
+        self.conn.query_row(
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id =
+                (SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2 AND confirmed = 1)"),
+            rusqlite::params![source, source_id],
+            |row| session_from_row(row, &self.conn),
+        ).optional().map_err(Into::into)
+    }
+
+    pub(crate) fn has_native_binding(&self, session_id: &str) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_bindings WHERE session_id = ?1 AND confirmed = 1)",
+            [session_id], |row| row.get(0),
+        ).map_err(Into::into)
     }
 
     pub(crate) fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -480,11 +444,7 @@ impl Store {
                 seq: row.get(3)?,
             })
         })?;
-        let mut messages = Vec::new();
-        for row in rows {
-            messages.push(row?);
-        }
-        Ok(messages)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub(crate) fn stats(&self) -> Result<(u64, u64)> {
@@ -524,6 +484,7 @@ impl Store {
             None,
             TimeRange::All,
             &ProjectScope::Global,
+            None,
             limit,
         )
     }
@@ -533,8 +494,12 @@ impl Store {
         sources: Option<&[String]>,
         time_range: TimeRange,
         scope: &ProjectScope,
+        excluded_session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Session>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut sql = format!(
             "SELECT {SESSION_COLUMNS}
              FROM sessions s
@@ -543,26 +508,42 @@ impl Store {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
         apply_scope_filters(&mut sql, &mut params, &mut param_idx, sources, time_range, scope);
-        sql.push_str(&format!(
-            " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx}"
-        ));
-        params.push(Box::new(limit as i64));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            sessions.push(row?);
+        if let Some(excluded_session_id) = excluded_session_id {
+            sql.push_str(&format!(" AND s.id != ?{param_idx}"));
+            params.push(Box::new(excluded_session_id.to_string()));
+            param_idx += 1;
         }
-        drop(stmt);
-
-        // Hide a subagent only when its spawn parent is present in this same
-        // scoped result set — then it is reachable through the parent's picker.
-        // Orphaned subagents, and children whose parent falls outside the active
-        // scope or the result limit, stay visible so nothing becomes unreachable.
-        self.retain_visible_subagents(&mut sessions)?;
-        Ok(sessions)
+        sql.push_str(&format!(
+            " ORDER BY COALESCE(updated_at, started_at) DESC, started_at DESC, source ASC, source_id ASC LIMIT ?{param_idx} OFFSET ?{}",
+            param_idx + 1
+        ));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let page_size = limit as i64;
+        let mut offset = 0_i64;
+        let mut sessions = Vec::with_capacity(limit);
+        loop {
+            let mut param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|param| param.as_ref()).collect();
+            param_refs.push(&page_size);
+            param_refs.push(&offset);
+            let rows =
+                stmt.query_map(param_refs.as_slice(), |row| session_from_row(row, &self.conn))?;
+            let page = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            let fetched = page.len();
+            offset += fetched as i64;
+            let mut page = page.into_iter();
+            while !page.as_slice().is_empty() {
+                let needed = limit - sessions.len();
+                sessions.extend(page.by_ref().take(needed));
+                self.retain_visible_subagents(&mut sessions)?;
+                if sessions.len() == limit {
+                    return Ok(sessions);
+                }
+            }
+            if fetched < limit {
+                return Ok(sessions);
+            }
+        }
     }
 
     fn retain_visible_subagents(&self, sessions: &mut Vec<Session>) -> Result<()> {
@@ -579,6 +560,11 @@ impl Store {
              JOIN session_parent_links l ON l.session_id = s.id AND l.relation = 'spawn'
              JOIN sessions p ON p.source = l.parent_source AND p.source_id = l.parent_source_id
              WHERE s.thread_role = 'subagent'
+               AND ((l.parent_sync_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM sync_aliases a WHERE a.sync_id = l.parent_sync_id AND a.session_id = p.id))
+                 OR (l.parent_sync_id IS NULL
+                   AND s.id IN (SELECT session_id FROM native_bindings)
+                   AND p.id IN (SELECT session_id FROM native_bindings)))
                AND s.id IN ({})
                AND p.id IN ({})",
             child_ph.join(", "),
@@ -620,10 +606,10 @@ impl Store {
             sql.push_str(thread_role.sql_predicate());
         }
         let order_by = match sort {
-            SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC",
-            SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC",
+            SessionListSort::Newest => "s.started_at DESC, source ASC, source_id ASC, s.id ASC",
+            SessionListSort::Oldest => "s.started_at ASC, source ASC, source_id ASC, s.id ASC",
             SessionListSort::Updated => {
-                "COALESCE(s.updated_at, s.started_at) DESC, s.started_at DESC, source ASC, source_id ASC"
+                "COALESCE(s.updated_at, s.started_at) DESC, s.started_at DESC, source ASC, source_id ASC, s.id ASC"
             }
         };
         sql.push_str(&format!(" ORDER BY {order_by}"));
@@ -642,7 +628,8 @@ impl Store {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), session_from_row)?;
+        let rows =
+            stmt.query_map(param_refs.as_slice(), |row| session_from_row(row, &self.conn))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -666,60 +653,80 @@ impl Store {
     }
 }
 
-fn replace_parent_links_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    parents: &[ParentLink],
-) -> Result<()> {
-    tx.execute(
-        "DELETE FROM session_parent_links WHERE session_id = ?1",
-        rusqlite::params![session_id],
-    )?;
-    if parents.is_empty() {
-        return Ok(());
-    }
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO session_parent_links
-            (session_id, relation, parent_source, parent_source_id)
-         VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    for parent in parents {
-        stmt.execute(rusqlite::params![
-            session_id,
-            parent.relation.as_str(),
-            parent.source,
-            parent.source_id,
-        ])?;
-    }
-    Ok(())
-}
-
 fn delete_session_data_tx(
     tx: &rusqlite::Transaction<'_>,
     source: &str,
     source_id: &str,
 ) -> Result<()> {
     let session_ids: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT id FROM sessions WHERE source = ?1 AND source_id = ?2")?;
+        let mut stmt = tx.prepare(
+            "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
+        )?;
         stmt.query_map(rusqlite::params![source, source_id], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for sid in &session_ids {
+    for sid in session_ids {
+        tx.execute("DELETE FROM native_bindings WHERE session_id = ?1", [&sid])?;
+        let replicated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_sync WHERE session_id = ?1)",
+            [&sid],
+            |row| row.get(0),
+        )?;
+        if replicated {
+            tx.execute("UPDATE sessions SET is_import = 1 WHERE id = ?1", [&sid])?;
+            continue;
+        }
         tx.execute(
             "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
             rusqlite::params![sid],
         )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [&sid])?;
     }
+    Ok(())
+}
+
+fn bind_native_tx(tx: &rusqlite::Transaction<'_>, session: &Session) -> Result<()> {
     tx.execute(
-        "DELETE FROM sessions WHERE source = ?1 AND source_id = ?2",
-        rusqlite::params![source, source_id],
+        "INSERT INTO native_bindings(source, source_id, session_id, confirmed)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(source, source_id) DO UPDATE SET
+             confirmed = MAX(native_bindings.confirmed, excluded.confirmed)
+         WHERE native_bindings.session_id = excluded.session_id",
+        rusqlite::params![session.source, session.source_id, session.id, !session.is_import],
     )?;
+    let bound: String = tx.query_row(
+        "SELECT session_id FROM native_bindings WHERE source = ?1 AND source_id = ?2",
+        rusqlite::params![session.source, session.source_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(bound == session.id, "native session is already bound to another local UUID");
+    Ok(())
+}
+
+pub(super) fn clear_session_contents_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM message_vec WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+        [session_id],
+    )?;
+    for table in [
+        "messages",
+        "usage_events",
+        "usage_session_state",
+        "session_events",
+        "event_session_state",
+        "session_embedding_state",
+        "session_parent_links",
+    ] {
+        tx.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [session_id])?;
+    }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn persist_session_with_usage_and_events_tx(
+pub(super) fn persist_session_with_usage_and_events_tx(
     tx: &rusqlite::Transaction<'_>,
     session: &Session,
     messages: &[Message],
@@ -728,10 +735,21 @@ fn persist_session_with_usage_and_events_tx(
     session_events: &[RawSessionEvent],
     event_parser_version: Option<u32>,
     topology: &SessionTopologyWrite<'_>,
+    trigram_message_flag: bool,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO sessions (id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import, thread_role, metadata_parser_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         ON CONFLICT(id) DO UPDATE SET
+             source = excluded.source, source_id = excluded.source_id, title = excluded.title,
+             directory = excluded.directory, repo_remote = excluded.repo_remote,
+             repo_slug = excluded.repo_slug, repo_name = excluded.repo_name,
+             started_at = excluded.started_at, updated_at = excluded.updated_at,
+             message_count = excluded.message_count, entrypoint = excluded.entrypoint,
+             custom_title = excluded.custom_title, summary = excluded.summary,
+             duration_minutes = excluded.duration_minutes, source_file_path = excluded.source_file_path,
+             is_import = excluded.is_import, thread_role = excluded.thread_role,
+             metadata_parser_version = excluded.metadata_parser_version",
         rusqlite::params![
             session.id,
             session.source,
@@ -757,105 +775,18 @@ fn persist_session_with_usage_and_events_tx(
 
     replace_parent_links_tx(tx, &session.id, topology.parents)?;
 
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO messages (session_id, role, content, timestamp, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for msg in messages {
-            stmt.execute(rusqlite::params![
-                msg.session_id,
-                msg.role.as_str(),
-                msg.content,
-                msg.timestamp,
-                msg.seq,
-            ])?;
-        }
-    }
+    insert_messages_tx(tx, messages, trigram_message_flag)?;
 
-    {
-        tx.execute(
-            "DELETE FROM usage_events WHERE session_id = ?1",
-            rusqlite::params![session.id],
-        )?;
-        let created_at = Utc::now().timestamp_millis();
-        let mut stmt = tx.prepare(
-            "INSERT INTO usage_events (
-                session_id, source, source_id, event_key, event_seq, message_seq,
-                timestamp, model, provider, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                token_source, parser_version, source_path, raw_usage_json, created_at
-             )
-             VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
-             )
-             ON CONFLICT(session_id, event_key) DO UPDATE SET
-                event_seq = excluded.event_seq,
-                message_seq = excluded.message_seq,
-                timestamp = excluded.timestamp,
-                model = excluded.model,
-                provider = excluded.provider,
-                input_tokens = excluded.input_tokens,
-                output_tokens = excluded.output_tokens,
-                cache_read_tokens = excluded.cache_read_tokens,
-                cache_write_tokens = excluded.cache_write_tokens,
-                reasoning_tokens = excluded.reasoning_tokens,
-                token_source = excluded.token_source,
-                parser_version = excluded.parser_version,
-                source_path = excluded.source_path,
-                raw_usage_json = excluded.raw_usage_json",
-        )?;
-        for event in usage_events {
-            stmt.execute(rusqlite::params![
-                session.id,
-                session.source,
-                session.source_id,
-                event.event_key,
-                event.event_seq,
-                event.message_seq,
-                event.timestamp,
-                event.model,
-                event.provider,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens,
-                event.token_source.as_str(),
-                event.parser_version,
-                event.source_path,
-                event.raw_usage_json,
-                created_at,
-            ])?;
-        }
-    }
-
-    if let Some(parser_version) = usage_parser_version {
-        let synced_at = Utc::now().timestamp_millis();
-        tx.execute(
-            "INSERT INTO usage_session_state (
-                session_id, source, source_id, parser_version,
-                source_updated_at, event_count, synced_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(source, source_id) DO UPDATE SET
-                session_id = excluded.session_id,
-                parser_version = excluded.parser_version,
-                source_updated_at = excluded.source_updated_at,
-                event_count = excluded.event_count,
-                synced_at = excluded.synced_at",
-            rusqlite::params![
-                session.id,
-                session.source,
-                session.source_id,
-                parser_version,
-                session.updated_at,
-                usage_events.len() as u32,
-                synced_at,
-            ],
-        )?;
-    }
+    super::usage_store::replace_usage_events(
+        tx,
+        &session.id,
+        &session.source,
+        &session.source_id,
+        usage_events,
+        usage_parser_version,
+        session.updated_at,
+        super::usage_store::UsageConflict::Update,
+    )?;
 
     replace_session_events(
         tx,
@@ -906,346 +837,33 @@ fn persist_session_with_usage_and_events_tx(
     Ok(())
 }
 
-#[cfg(test)]
-mod topology_tests {
-    use super::*;
-    use crate::db::schema;
-    use crate::db::store::SessionListSort;
-    use crate::types::{Message, ParentLink, ParentRelation, Role, Session, ThreadRole};
-
-    fn store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
-
-    fn sess(source_id: &str) -> Session {
-        Session {
-            id: format!("local-{source_id}"),
-            source: "codex".to_string(),
-            source_id: source_id.to_string(),
-            title: "t".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: Some(10),
-            message_count: 1,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
-        }
-    }
-
-    fn msg(session_id: &str) -> Vec<Message> {
-        vec![Message {
-            session_id: session_id.to_string(),
-            role: Role::User,
-            content: "hello world".to_string(),
-            timestamp: Some(1),
-            seq: 0,
-        }]
-    }
-
-    fn persist(store: &Store, session: &Session, topology: &SessionTopologyWrite<'_>) {
-        store
-            .persist_session_with_usage_and_events_with_topology(
-                session,
-                &msg(&session.id),
-                &[],
-                None,
-                &[],
-                None,
-                topology,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn session_topology_round_trips_role_and_parents() {
-        let store = store();
-        let session = sess("s1");
-        let parents = vec![
-            ParentLink {
-                relation: ParentRelation::Spawn,
-                source: "codex".to_string(),
-                source_id: "p-spawn".to_string(),
-            },
-            ParentLink {
-                relation: ParentRelation::Fork,
-                source: "codex".to_string(),
-                source_id: "p-fork".to_string(),
-            },
+fn insert_messages_tx(
+    tx: &rusqlite::Transaction<'_>,
+    messages: &[Message],
+    trigram_message_flag: bool,
+) -> Result<()> {
+    let sql = if trigram_message_flag {
+        "INSERT INTO messages (session_id, role, content, timestamp, seq, trigram_indexed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    } else {
+        "INSERT INTO messages (session_id, role, content, timestamp, seq)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    };
+    let mut stmt = tx.prepare(sql)?;
+    let parameter_count = stmt.parameter_count();
+    for msg in messages {
+        let indexed = trigram_message_flag && crate::utils::text_needs_trigram(&msg.content);
+        let parameters = rusqlite::params![
+            msg.session_id,
+            msg.role.as_str(),
+            msg.content,
+            msg.timestamp,
+            msg.seq,
+            indexed,
         ];
-        persist(
-            &store,
-            &session,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &parents,
-                parser_version: Some(1),
-            },
-        );
-
-        let topology = store.session_topology(&session.id).unwrap();
-        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
-        assert_eq!(
-            topology.parents,
-            vec![
-                ParentLink {
-                    relation: ParentRelation::Fork,
-                    source: "codex".to_string(),
-                    source_id: "p-fork".to_string(),
-                },
-                ParentLink {
-                    relation: ParentRelation::Spawn,
-                    source: "codex".to_string(),
-                    source_id: "p-spawn".to_string(),
-                },
-            ]
-        );
+        stmt.execute(&parameters[..parameter_count])?;
     }
-
-    #[test]
-    fn metadata_backfill_updates_topology_without_touching_messages() {
-        let store = store();
-        let session = sess("s1");
-        persist(
-            &store,
-            &session,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        let embedding_before: i64 = store
-            .conn
-            .query_row(
-                "SELECT units_total FROM session_embedding_state WHERE session_id = ?1",
-                [&session.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-
-        let parents = vec![ParentLink {
-            relation: ParentRelation::Fork,
-            source: "codex".to_string(),
-            source_id: "p1".to_string(),
-        }];
-        let updated = store
-            .persist_topology_for_existing_session(
-                "codex",
-                "s1",
-                &SessionTopologyWrite {
-                    thread_role: Some(ThreadRole::Subagent),
-                    parents: &parents,
-                    parser_version: Some(2),
-                },
-            )
-            .unwrap();
-        assert!(updated);
-
-        let topology = store.session_topology(&session.id).unwrap();
-        assert_eq!(topology.thread_role, Some(ThreadRole::Subagent));
-        assert_eq!(topology.parents, parents);
-
-        assert_eq!(store.get_messages(&session.id).unwrap().len(), 1);
-        let same_id: String = store
-            .conn
-            .query_row(
-                "SELECT id FROM sessions WHERE source = 'codex' AND source_id = 's1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(same_id, session.id);
-        let embedding_after: i64 = store
-            .conn
-            .query_row(
-                "SELECT units_total FROM session_embedding_state WHERE session_id = ?1",
-                [&session.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(embedding_before, embedding_after);
-
-        let meta = store.metadata_state_meta_map("codex").unwrap();
-        assert_eq!(meta.get("s1").map(|m| m.parser_version), Some(2));
-    }
-
-    #[test]
-    fn persist_topology_for_missing_session_reports_false() {
-        let store = store();
-        let updated = store
-            .persist_topology_for_existing_session("codex", "absent", &SessionTopologyWrite::none())
-            .unwrap();
-        assert!(!updated);
-    }
-
-    #[test]
-    fn list_indexed_sessions_filters_by_thread_role() {
-        let store = store();
-        persist(
-            &store,
-            &sess("primary"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        persist(
-            &store,
-            &sess("subagent"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        persist(
-            &store,
-            &sess("unknown"),
-            &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
-        );
-
-        let ids = |filter| {
-            store
-                .list_indexed_sessions(
-                    None,
-                    TimeRange::All,
-                    &ProjectScope::Global,
-                    Some(filter),
-                    None,
-                    0,
-                    SessionListSort::Newest,
-                )
-                .unwrap()
-                .into_iter()
-                .map(|s| s.source_id)
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(ids(ThreadRoleFilter::Primary), vec!["primary".to_string()]);
-        assert_eq!(ids(ThreadRoleFilter::Subagent), vec!["subagent".to_string()]);
-        assert_eq!(ids(ThreadRoleFilter::Unknown), vec!["unknown".to_string()]);
-    }
-
-    #[test]
-    fn recent_sessions_for_search_scope_hides_only_reachable_subagents() {
-        let store = store();
-        persist(
-            &store,
-            &sess("primary"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        // Reachable subagent: spawn parent is the indexed "primary" — hidden,
-        // because it can be opened from primary's subagent picker.
-        let spawn_parent = ParentLink {
-            relation: ParentRelation::Spawn,
-            source: "codex".to_string(),
-            source_id: "primary".to_string(),
-        };
-        persist(
-            &store,
-            &sess("child"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: std::slice::from_ref(&spawn_parent),
-                parser_version: Some(1),
-            },
-        );
-        // Orphaned subagent: no parent link — must stay visible in the list.
-        persist(
-            &store,
-            &sess("orphan"),
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        persist(
-            &store,
-            &sess("unknown"),
-            &SessionTopologyWrite { thread_role: None, parents: &[], parser_version: Some(1) },
-        );
-
-        let mut ids = store
-            .list_recent_sessions_for_search_scope(None, TimeRange::All, &ProjectScope::Global, 100)
-            .unwrap()
-            .into_iter()
-            .map(|s| s.source_id)
-            .collect::<Vec<_>>();
-        ids.sort();
-        assert_eq!(
-            ids,
-            vec!["orphan".to_string(), "primary".to_string(), "unknown".to_string()],
-            "reachable child hidden; orphaned subagent stays visible"
-        );
-    }
-
-    #[test]
-    fn recent_sessions_keeps_subagent_when_parent_is_out_of_scope() {
-        let store = store();
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut parent = sess("primary");
-        parent.started_at = now - 3 * 86_400_000;
-        parent.updated_at = Some(parent.started_at);
-        let mut child = sess("child");
-        child.started_at = now;
-        child.updated_at = Some(now);
-        persist(
-            &store,
-            &parent,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Primary),
-                parents: &[],
-                parser_version: Some(1),
-            },
-        );
-        let spawn = ParentLink {
-            relation: ParentRelation::Spawn,
-            source: "codex".to_string(),
-            source_id: "primary".to_string(),
-        };
-        persist(
-            &store,
-            &child,
-            &SessionTopologyWrite {
-                thread_role: Some(ThreadRole::Subagent),
-                parents: std::slice::from_ref(&spawn),
-                parser_version: Some(1),
-            },
-        );
-
-        // Under Today, the parent (3 days ago) is filtered out; the child must
-        // stay visible because its picker is unreachable without the parent.
-        let ids: Vec<String> = store
-            .list_recent_sessions_for_search_scope(
-                None,
-                TimeRange::Today,
-                &ProjectScope::Global,
-                100,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|s| s.source_id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["child".to_string()],
-            "subagent stays visible when its parent is out of the active scope"
-        );
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1302,23 +920,14 @@ mod search_scope_stats_tests {
         directory: Option<&str>,
     ) -> Session {
         Session {
-            id: id.to_string(),
             source: source.to_string(),
             source_id: format!("raw-{id}"),
             title: id.to_string(),
             directory: directory.map(str::to_string),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
             started_at,
             updated_at: Some(started_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(id)
         }
     }
 

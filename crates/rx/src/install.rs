@@ -19,45 +19,16 @@ pub(crate) struct InstallSpec {
     pub shell: &'static str,
 }
 
-pub(crate) fn spec(harness: Harness) -> InstallSpec {
-    match harness {
-        Harness::Claude => InstallSpec {
-            program: "claude",
-            display: "Claude Code",
-            url: "https://claude.ai/install.sh",
-            shell: "bash",
-        },
-        Harness::Codex => InstallSpec {
-            program: "codex",
-            display: "Codex",
-            url: "https://chatgpt.com/codex/install.sh",
-            shell: "sh",
-        },
-        Harness::OpenCode => InstallSpec {
-            program: "opencode",
-            display: "OpenCode",
-            url: "https://opencode.ai/install",
-            shell: "bash",
-        },
-        Harness::Pi => InstallSpec {
-            program: "pi",
-            display: "Pi",
-            url: "https://pi.dev/install.sh",
-            shell: "sh",
-        },
-        Harness::Dsh => InstallSpec {
-            program: "dsh",
-            display: "DeepSeek Harness",
-            url: "https://www.npmjs.com/package/@deepseek-ai/dsh",
-            shell: "sh",
-        },
-        Harness::Kimi => InstallSpec {
-            program: "kimi",
-            display: "Kimi Code",
-            url: "https://code.kimi.com/kimi-code/install.sh",
-            shell: "bash",
-        },
-    }
+pub(crate) fn spec(harness: Harness) -> Option<InstallSpec> {
+    let (display, url, shell) = match harness {
+        Harness::Claude => ("Claude Code", "https://claude.ai/install.sh", "bash"),
+        Harness::Codex => ("Codex", "https://chatgpt.com/codex/install.sh", "sh"),
+        Harness::OpenCode => ("OpenCode", "https://opencode.ai/install", "bash"),
+        Harness::Pi => ("Pi", "https://pi.dev/install.sh", "sh"),
+        Harness::Dsh => return None,
+        Harness::Kimi => ("Kimi Code", "https://code.kimi.com/kimi-code/install.sh", "bash"),
+    };
+    Some(InstallSpec { program: harness.as_str(), display, url, shell })
 }
 
 pub(crate) fn command_line(spec: &InstallSpec) -> String {
@@ -65,13 +36,12 @@ pub(crate) fn command_line(spec: &InstallSpec) -> String {
 }
 
 pub(crate) fn ensure(harness: Harness, env: &EnvLookup) -> Result<PathBuf> {
-    if matches!(harness, Harness::Dsh) {
-        return ensure_dsh(env);
-    }
     if !env.is_real() {
         return Ok(PathBuf::from(harness.as_str()));
     }
-    let spec = spec(harness);
+    let Some(spec) = spec(harness) else {
+        return ensure_dsh(env);
+    };
     if let Some(path) = lookup(spec.program) {
         return Ok(path);
     }
@@ -101,15 +71,9 @@ pub(crate) fn lookup_with(
     extensions: Option<&OsStr>,
 ) -> Option<PathBuf> {
     let names = executable_names(program, extensions);
-    for dir in std::env::split_paths(path.as_ref()).chain(extra.iter().cloned()) {
-        for name in &names {
-            let candidate = dir.join(name);
-            if is_runnable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    std::env::split_paths(path.as_ref())
+        .chain(extra.iter().cloned())
+        .find_map(|dir| names.iter().map(|name| dir.join(name)).find(|path| is_runnable(path)))
 }
 
 fn executable_names(program: &str, extensions: Option<&OsStr>) -> Vec<OsString> {
@@ -146,7 +110,7 @@ fn executable_extensions() -> Option<OsString> {
     None
 }
 
-pub(crate) fn extra_bin_dirs() -> Vec<PathBuf> {
+fn extra_bin_dirs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
@@ -185,9 +149,6 @@ fn run_official_installer(spec: &InstallSpec) -> Result<()> {
 }
 
 fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
-    if !env.is_real() {
-        return Ok(PathBuf::from("dsh"));
-    }
     if let Some(path) = lookup_program("dsh") {
         if crate::dsh::profile_ready(env) {
             return Ok(path);
@@ -199,7 +160,9 @@ fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
     }
     offer_install("DeepSeek Harness", &crate::dsh::install_hint(), env)?;
     ensure_pnpm()?;
-    install_dsh_packages()?;
+    let cmd = crate::dsh::npm_install_cmd();
+    eprintln!("[rx] {cmd}");
+    run_npm(&["install", "-g", crate::dsh::CLI_PACKAGE, crate::dsh::PLUGIN_PACKAGE], &cmd)?;
     let path = lookup_program("dsh").ok_or_else(|| {
         anyhow::anyhow!(
             "DeepSeek Harness finished installing but dsh was not found. Add npm's global bin to PATH, then retry."
@@ -209,22 +172,6 @@ fn ensure_dsh(env: &EnvLookup) -> Result<PathBuf> {
         install_dsh_profile(&path, env)?;
     }
     Ok(path)
-}
-
-fn install_dsh_packages() -> Result<()> {
-    let cmd = crate::dsh::npm_install_cmd();
-    eprintln!("[rx] {cmd}");
-    run_npm(
-        &[
-            "install",
-            "-g",
-            "--legacy-peer-deps",
-            crate::dsh::CLI_PACKAGE,
-            crate::dsh::PLUGIN_PACKAGE,
-        ],
-        &cmd,
-    )?;
-    Ok(())
 }
 
 fn ensure_pnpm() -> Result<()> {

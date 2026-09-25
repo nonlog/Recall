@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use tracing::debug;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::opencode;
-use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats};
-use crate::db::store::Store;
+use crate::adapters::{RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 
 pub(crate) struct MimoCodeAdapter;
 
@@ -24,9 +24,13 @@ impl SourceAdapter for MimoCodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
+        Some(ResumeCommand::new("mimo", &["--session", source_id]))
+    }
+
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
         Some(ResumeCommand {
             program: "mimo".to_string(),
-            args: vec!["--session".to_string(), source_id.to_string()],
+            args: vec!["--prompt".to_string(), prompt],
         })
     }
 
@@ -39,15 +43,14 @@ impl SourceAdapter for MimoCodeAdapter {
 
     fn scan_for_sync(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
         let Some(conn) = open_mimo_db()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
+            return Ok(Some(SyncScanResult::default()));
         };
-        let mut result =
-            opencode::scan_for_sync_conn(&conn, store, since_ts, "mimo-code", include_events)?;
+        let mut result = opencode::scan_for_sync_conn(&conn, context, since_ts, include_events)?;
         result.sessions = drop_imported(&conn, result.sessions);
         Ok(Some(result))
     }

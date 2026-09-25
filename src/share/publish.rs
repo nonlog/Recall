@@ -1,16 +1,18 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{AppConfig, ShareConfig};
-use crate::types::{Message, Session, SessionUsageEventRecord};
+use crate::types::{Message, Session, SessionEventRecord, SessionUsageEventRecord};
 
 use super::assets::{HEADERS, ROBOTS};
 use super::meta::collect_session_display_meta;
 use super::render::{
-    ShareRenderOptions, render_session_html, render_session_html_with_tldr, share_id_for_session,
+    ShareRenderOptions, render_session_html_with_tldr, render_session_preview_html,
+    share_id_for_session,
 };
 
 const PROVIDER_CLOUDFLARE_PAGES: &str = "cloudflare-pages";
@@ -91,32 +93,25 @@ pub(crate) fn init_cloudflare_pages(
     config.save()
 }
 
-pub(crate) fn default_preview_dir() -> Result<PathBuf> {
-    let root = dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
-        .or_else(dirs::data_dir)
-        .ok_or_else(|| anyhow!("cannot determine cache directory"))?;
-    Ok(root.join("recall").join("preview"))
-}
-
-pub(crate) fn write_preview_file(
+pub(crate) fn create_session_preview(
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
-) -> Result<PathBuf> {
-    let preview_dir = default_preview_dir()?;
-    fs::create_dir_all(&preview_dir)
-        .with_context(|| format!("failed to create {}", preview_dir.display()))?;
-    let share_id = share_id_for_session(session);
-    let file_path = preview_dir.join(format!("{share_id}.html"));
+) -> Result<tempfile::NamedTempFile> {
     let display_meta = collect_session_display_meta(session, usage_events);
-    let html = render_session_html(session, messages, &display_meta);
-    fs::write(&file_path, html)
-        .with_context(|| format!("failed to write {}", file_path.display()))?;
-    Ok(file_path)
+    let html = render_session_preview_html(session, messages, events, &display_meta);
+    let mut file = tempfile::Builder::new()
+        .prefix("recall-preview-")
+        .suffix(".html")
+        .tempfile()
+        .context("failed to create temporary preview")?;
+    file.write_all(html.as_bytes()).context("failed to write temporary preview")?;
+    file.flush().context("failed to flush temporary preview")?;
+    Ok(file)
 }
 
-pub(crate) fn open_path_in_browser(path: &Path) -> Result<()> {
+pub(crate) fn open_preview_file(path: &Path) -> Result<()> {
     let path_arg = path.as_os_str();
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(path_arg).status()
@@ -133,24 +128,16 @@ pub(crate) fn open_path_in_browser(path: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn open_session_preview(
-    session: &Session,
-    messages: &[Message],
-    usage_events: &[SessionUsageEventRecord],
-) -> Result<PathBuf> {
-    let path = write_preview_file(session, messages, usage_events)?;
-    open_path_in_browser(&path)?;
-    Ok(path)
-}
-
 pub(crate) fn preview_session_with_options(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
     options: &ShareRenderOptions,
 ) -> Result<SharePreview> {
-    let (preview, _) = build_publish_preview(config, session, messages, usage_events, options)?;
+    let (preview, _) =
+        build_publish_preview(config, session, messages, events, usage_events, options)?;
     Ok(preview)
 }
 
@@ -158,12 +145,14 @@ pub(crate) fn publish_session(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
 ) -> Result<String> {
     publish_session_with_options(
         config,
         session,
         messages,
+        events,
         usage_events,
         &ShareRenderOptions::default(),
     )
@@ -173,10 +162,12 @@ pub(crate) fn publish_session_with_options(
     config: &AppConfig,
     session: &Session,
     messages: &[Message],
+    events: &[SessionEventRecord],
     usage_events: &[SessionUsageEventRecord],
     options: &ShareRenderOptions,
 ) -> Result<String> {
-    let (preview, html) = build_publish_preview(config, session, messages, usage_events, options)?;
+    let (preview, html) =
+        build_publish_preview(config, session, messages, events, usage_events, options)?;
 
     init_publish_dir(&preview.publish_dir)?;
 
@@ -186,13 +177,8 @@ pub(crate) fn publish_session_with_options(
     deploy_pages(&preview.publish_dir, &preview.project_name)?;
     Ok(preview.url)
 }
-fn build_publish_preview(
-    config: &AppConfig,
-    session: &Session,
-    messages: &[Message],
-    usage_events: &[SessionUsageEventRecord],
-    options: &ShareRenderOptions,
-) -> Result<(SharePreview, String)> {
+
+pub(super) fn require_share_config(config: &AppConfig) -> Result<&ShareConfig> {
     let share = config
         .share
         .as_ref()
@@ -201,6 +187,28 @@ fn build_publish_preview(
         bail!("unsupported share provider '{}'", share.provider);
     }
     validate_project_name(&share.project_name)?;
+    Ok(share)
+}
+
+pub(super) fn share_page_url(project_domain: &str, share_id: &str) -> String {
+    format!("https://{project_domain}/{share_id}")
+}
+
+fn html_is_recall_share_page(html: &str) -> bool {
+    html.starts_with(SHARE_HTML_PREFIX)
+        && SHARE_HTML_SIGNATURES.iter().any(|signature| html.contains(signature))
+        && html.ends_with("</body></html>")
+}
+
+fn build_publish_preview(
+    config: &AppConfig,
+    session: &Session,
+    messages: &[Message],
+    events: &[SessionEventRecord],
+    usage_events: &[SessionUsageEventRecord],
+    options: &ShareRenderOptions,
+) -> Result<(SharePreview, String)> {
+    let share = require_share_config(config)?;
     let project_domain = configured_project_domain(share)?;
 
     let publish_dir = expand_path(&share.publish_dir);
@@ -208,7 +216,7 @@ fn build_publish_preview(
     let share_id = share_id_for_session(session);
     let display_meta = collect_session_display_meta(session, usage_events);
     let tldr = options.tldr_markdown.as_deref().map(str::trim).filter(|tldr| !tldr.is_empty());
-    let html = render_session_html_with_tldr(session, messages, &display_meta, tldr);
+    let html = render_session_html_with_tldr(session, messages, events, &display_meta, tldr);
     if html.len() > MAX_PAGES_ASSET_BYTES {
         bail!("session page is larger than Cloudflare Pages' 25 MiB asset limit");
     }
@@ -222,14 +230,14 @@ fn build_publish_preview(
             publish_dir,
             file_path,
             share_id: share_id.clone(),
-            url: format!("https://{project_domain}/{share_id}"),
+            url: share_page_url(&project_domain, &share_id),
             html_bytes: html.len(),
         },
         html,
     ))
 }
 
-fn configured_project_domain(share: &ShareConfig) -> Result<String> {
+pub(super) fn configured_project_domain(share: &ShareConfig) -> Result<String> {
     if share.project_domain.is_empty() {
         resolve_pages_project_domain(&share.project_name).with_context(|| {
             format!(
@@ -243,12 +251,26 @@ fn configured_project_domain(share: &ShareConfig) -> Result<String> {
         Ok(share.project_domain.clone())
     }
 }
-fn init_publish_dir(publish_dir: &Path) -> Result<()> {
+
+pub(super) fn ensure_readable_publish_dir(publish_dir: &Path) -> Result<bool> {
+    if !publish_dir.exists() {
+        return Ok(false);
+    }
+    if publish_dir_is_unmanaged(publish_dir, publish_dir_has_marker(publish_dir))? {
+        bail!("publish directory {} is not managed by Recall", publish_dir.display());
+    }
+    Ok(true)
+}
+
+fn publish_dir_has_marker(publish_dir: &Path) -> bool {
+    let marker = publish_dir.join(PUBLISH_DIR_MARKER);
+    fs::read_to_string(&marker).is_ok_and(|contents| contents == PUBLISH_DIR_MARKER_CONTENT)
+}
+
+pub(super) fn init_publish_dir(publish_dir: &Path) -> Result<()> {
     fs::create_dir_all(publish_dir)
         .with_context(|| format!("failed to create {}", publish_dir.display()))?;
-    let marker = publish_dir.join(PUBLISH_DIR_MARKER);
-    let managed =
-        fs::read_to_string(&marker).is_ok_and(|contents| contents == PUBLISH_DIR_MARKER_CONTENT);
+    let managed = publish_dir_has_marker(publish_dir);
     if publish_dir_is_unmanaged(publish_dir, managed)? {
         bail!(
             "publish directory {} is not managed by Recall; choose an empty directory",
@@ -256,7 +278,7 @@ fn init_publish_dir(publish_dir: &Path) -> Result<()> {
         );
     }
     if !managed {
-        fs::write(&marker, PUBLISH_DIR_MARKER_CONTENT)?;
+        fs::write(publish_dir.join(PUBLISH_DIR_MARKER), PUBLISH_DIR_MARKER_CONTENT)?;
     }
     fs::write(publish_dir.join("_headers"), HEADERS)?;
     fs::write(publish_dir.join("robots.txt"), ROBOTS)?;
@@ -290,10 +312,7 @@ fn publish_dir_is_unmanaged(publish_dir: &Path, managed: bool) -> Result<bool> {
             }
             Some(name) if name.ends_with(".html") => {
                 let html = fs::read_to_string(entry.path())?;
-                if !html.starts_with(SHARE_HTML_PREFIX)
-                    || !SHARE_HTML_SIGNATURES.iter().any(|signature| html.contains(signature))
-                    || !html.ends_with("</body></html>")
-                {
+                if !html_is_recall_share_page(&html) {
                     return Ok(true);
                 }
             }
@@ -354,7 +373,7 @@ fn list_pages_projects() -> Result<serde_json::Value> {
         .map_err(|e| anyhow!("failed to parse wrangler project list JSON: {e}"))
 }
 
-fn deploy_pages(publish_dir: &Path, project_name: &str) -> Result<()> {
+pub(super) fn deploy_pages(publish_dir: &Path, project_name: &str) -> Result<()> {
     let output = wrangler_command()?
         .args(["pages", "deploy"])
         .arg(publish_dir)
@@ -448,7 +467,9 @@ pub(crate) fn validate_project_name(project_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Session;
+    use crate::share::render::render_session_html;
+    use crate::share::test_session as session;
+    use crate::types::{Message, Role, SessionEventRecord};
 
     #[test]
     fn share_id_prefers_source_id() {
@@ -491,6 +512,74 @@ mod tests {
     }
 
     #[test]
+    fn preview_file_is_removed_when_dropped() {
+        let file = create_session_preview(
+            &session("preview"),
+            &[Message {
+                session_id: "local-id".to_string(),
+                role: Role::User,
+                content: "hello".to_string(),
+                timestamp: None,
+                seq: 0,
+            }],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let path = file.path().to_path_buf();
+
+        assert!(fs::read_to_string(&path).unwrap().contains("hello"));
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn local_preview_and_publish_dry_run_share_identical_timeline_semantics() {
+        let session = session("same-timeline");
+        let messages = [Message {
+            session_id: "local-id".to_string(),
+            role: Role::Assistant,
+            content: "Answer".to_string(),
+            timestamp: None,
+            seq: 0,
+        }];
+        let events = [session_event(0, "tool_call"), session_event(1, "tool_result")];
+        let local = create_session_preview(&session, &messages, &events, &[]).unwrap();
+        let local_html = fs::read_to_string(local.path()).unwrap();
+        let publish_dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.share = Some(ShareConfig {
+            provider: PROVIDER_CLOUDFLARE_PAGES.to_string(),
+            project_name: "recall-share-test".to_string(),
+            project_domain: "recall-share-test.pages.dev".to_string(),
+            publish_dir: publish_dir.path().to_string_lossy().to_string(),
+        });
+        let (_, published_html) = build_publish_preview(
+            &config,
+            &session,
+            &messages,
+            &events,
+            &[],
+            &ShareRenderOptions::default(),
+        )
+        .unwrap();
+
+        let normalized = published_html
+            .replace("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">", "")
+            .replace(
+                "<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>",
+                "",
+            )
+            .replace("<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500&display=swap\">", "");
+        assert_eq!(local_html, normalized);
+        assert!(local_html.contains("call + result"));
+        assert!(
+            local_html.find("Target: src/lib.rs").unwrap()
+                < local_html.find("Result: Tool result").unwrap()
+        );
+    }
+
+    #[test]
     fn publish_dir_rejects_unmanaged_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("canary-secret"), "do not publish").unwrap();
@@ -519,7 +608,7 @@ mod tests {
         let meta = collect_session_display_meta(&session, &[]);
         fs::write(
             legacy.path().join("legacy-session.html"),
-            render_session_html(&session, &[], &meta),
+            render_session_html(&session, &[], &[], &meta),
         )
         .unwrap();
         init_publish_dir(legacy.path()).unwrap();
@@ -527,25 +616,26 @@ mod tests {
         init_publish_dir(legacy.path()).unwrap();
     }
 
-    fn session(source_id: &str) -> Session {
-        Session {
-            id: "local-id".to_string(),
-            source: "codex".to_string(),
-            source_id: source_id.to_string(),
-            title: "Fix <bug>".to_string(),
-            directory: Some("/tmp/project".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
-            updated_at: None,
-            message_count: 1,
-            entrypoint: None,
-            custom_title: None,
+    fn session_event(event_seq: u32, kind: &str) -> SessionEventRecord {
+        SessionEventRecord {
+            command_evidence_status: None,
+            files: Vec::new(),
+            event_seq,
+            timestamp: None,
+            kind: kind.to_string(),
+            actor: if kind == "tool_result" { "tool" } else { "assistant" }.to_string(),
+            name: (kind == "tool_call").then(|| "Read".to_string()),
+            status: None,
+            target: (kind == "tool_call").then(|| "src/lib.rs".to_string()),
+            message_seq: Some(0),
             summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            source_path: None,
+            source_event_id: Some(format!("source-{event_seq}")),
+            tool_call_id: Some("call-1".to_string()),
+            is_meta: None,
+            visibility: None,
+            attrs_json: None,
+            parser_version: 1,
         }
     }
 }

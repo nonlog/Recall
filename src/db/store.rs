@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -7,7 +8,10 @@ use crate::types::{ParentLink, Session, ThreadRole};
 
 pub(crate) const SESSION_COLUMNS: &str = "id, source, source_id, title, directory, repo_remote, repo_slug, repo_name, started_at, updated_at, message_count, entrypoint, custom_title, summary, duration_minutes, source_file_path, is_import";
 
-pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+pub(crate) fn session_from_row(
+    row: &rusqlite::Row<'_>,
+    conn: &Connection,
+) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -26,11 +30,17 @@ pub(crate) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
         duration_minutes: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
         source_file_path: row.get(15)?,
         is_import: row.get(16)?,
+        locations: crate::host::locations(conn, &row.get::<_, String>(0)?)?,
+        alternative_versions: super::remote_store::alternative_versions(
+            conn,
+            &row.get::<_, String>(0)?,
+        )?,
     })
 }
 
 pub(crate) struct Store {
     pub(crate) conn: Connection,
+    pub(crate) trigram_message_flag: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +60,13 @@ pub(crate) struct SessionPath {
     pub(crate) repo_name: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedSessionMeta {
+    pub(crate) id: String,
+    pub(crate) updated_at: Option<i64>,
+    pub(crate) message_count: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionListSort {
     Newest,
@@ -58,19 +75,7 @@ pub(crate) enum SessionListSort {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UsageSessionStateMeta {
-    pub(crate) parser_version: u32,
-    pub(crate) source_updated_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EventSessionStateMeta {
-    pub(crate) parser_version: u32,
-    pub(crate) source_updated_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MetadataSessionStateMeta {
+pub(crate) struct ParserStateMeta {
     pub(crate) parser_version: u32,
     pub(crate) source_updated_at: Option<i64>,
 }
@@ -92,15 +97,55 @@ impl SessionTopologyWrite<'_> {
 #[derive(Debug, Clone)]
 pub(crate) struct SkillAuditEventRow {
     pub(crate) session_id: String,
-    #[allow(dead_code)] // selected from session_events.source
-    pub(crate) source: String,
     pub(crate) timestamp: Option<i64>,
     pub(crate) name: Option<String>,
     pub(crate) target: Option<String>,
     pub(crate) attrs_json: Option<String>,
 }
 
+const COMPACT_MIN_FREE_BYTES: u64 = 1 << 30;
+
+pub(crate) struct CompactionPlan {
+    pub(crate) reclaimable_bytes: u64,
+    pub(crate) required_disk_bytes: u64,
+}
+
 impl Store {
+    pub(super) fn parser_state_map(
+        &self,
+        sql: &str,
+        source: &str,
+    ) -> Result<HashMap<String, ParserStateMeta>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([source], |row| {
+            Ok((
+                row.get(0)?,
+                ParserStateMeta { parser_version: row.get(1)?, source_updated_at: row.get(2)? },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    fn pragma_u64(&self, name: &str) -> Result<u64> {
+        Ok(self.conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))? as u64)
+    }
+
+    pub(crate) fn compaction_plan(&self) -> Result<Option<CompactionPlan>> {
+        let page_size = self.pragma_u64("page_size")?;
+        let page_count = self.pragma_u64("page_count")?;
+        let freelist = self.pragma_u64("freelist_count")?;
+        let reclaimable_bytes = freelist * page_size;
+        if reclaimable_bytes < COMPACT_MIN_FREE_BYTES || freelist * 2 < page_count {
+            return Ok(None);
+        }
+        Ok(Some(CompactionPlan { reclaimable_bytes, required_disk_bytes: page_count * page_size }))
+    }
+
+    pub(crate) fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+
     pub(crate) fn default_db_path() -> Result<PathBuf> {
         if let Some(path) = std::env::var_os("RECALL_DB_PATH").filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(path));
@@ -125,39 +170,47 @@ impl Store {
     }
 
     pub(crate) fn open() -> Result<Self> {
-        let db_path = Self::default_db_path()?;
-        if let Some(data_dir) = db_path.parent() {
-            std::fs::create_dir_all(data_dir)?;
+        Self::open_at(&Self::default_db_path()?)
+    }
+
+    pub(crate) fn open_event_preview_at(path: &Path) -> Result<Self> {
+        if !path.try_exists()? {
+            return Self::open_in_memory();
         }
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA foreign_keys=ON;",
-        )?;
-        crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let store = Self::open_read_only_at(path)?;
+        let version: i64 = store.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < crate::db::schema::SCHEMA_VERSION {
+            anyhow::bail!(
+                "requires_index_upgrade: run recall sync to upgrade the index before previewing event backfill"
+            );
+        }
+        Ok(store)
     }
 
     pub(crate) fn open_read_only_at(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            version >= 17,
+            "requires_index_upgrade: upgrade this index with current Recall before opening it read-only (run recall info for the default index)"
+        );
         conn.execute_batch(
             "PRAGMA query_only=ON;
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 
-    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
         crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
 
-    #[cfg(test)]
     pub(crate) fn open_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -168,9 +221,30 @@ impl Store {
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
+        backup_before_remote_migration(&conn, path)?;
         crate::db::schema::init(&conn)?;
-        Ok(Store { conn })
+        let trigram_message_flag = crate::db::schema::has_trigram_message_flag(&conn)?;
+        Ok(Store { conn, trigram_message_flag })
     }
+}
+
+fn backup_before_remote_migration(conn: &Connection, path: &Path) -> Result<Option<PathBuf>> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if !(1..17).contains(&version) {
+        return Ok(None);
+    }
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
+    let file = tempfile::Builder::new()
+        .prefix("recall-before-remote-")
+        .suffix(".db")
+        .tempfile_in(parent)?;
+    conn.backup(rusqlite::DatabaseName::Main, file.path(), None)?;
+    file.as_file().sync_all()?;
+    let (_, backup) = file.keep()?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    eprintln!("Index backup before remote migration: {}", backup.display());
+    Ok(Some(backup))
 }
 
 #[cfg(test)]
@@ -180,23 +254,12 @@ mod exclusion_tests {
 
     fn sess(id: &str, dir: Option<&str>) -> Session {
         Session {
-            id: id.to_string(),
             source: "claude-code".to_string(),
             source_id: format!("src-{id}"),
             title: "t".to_string(),
             directory: dir.map(String::from),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(1),
-            message_count: 0,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(id)
         }
     }
 
@@ -329,9 +392,29 @@ mod exclusion_tests {
             let store = Store::open_at(&path).unwrap();
             store.insert_session(&sess("a", None)).unwrap();
         }
-        let store = Store::open_read_only_at(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = Store::open_event_preview_at(&path).unwrap();
         let loaded = store.get_session_by_id("a").unwrap().unwrap();
         assert_eq!(loaded.title, "t");
         assert!(store.insert_session(&sess("b", None)).is_err());
+        drop(store);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let legacy = dir.path().join("legacy.db");
+        rusqlite::Connection::open(&legacy)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=1; CREATE TABLE sessions(id TEXT);")
+            .unwrap();
+        let before = std::fs::read(&legacy).unwrap();
+        assert!(Store::open_event_preview_at(&legacy).is_err());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
+        let absent = dir.path().join("absent.db");
+        assert!(
+            Store::open_event_preview_at(&absent)
+                .unwrap()
+                .list_sessions_by_ids(&[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!absent.exists());
     }
 }

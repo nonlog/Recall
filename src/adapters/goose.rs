@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
@@ -6,18 +6,21 @@ use rusqlite::{Connection, Row};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::opencode;
 use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp, last_timestamp,
+    InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand, SourceAdapter,
+    SyncScanOutput, SyncScanResult, SyncScanStats, first_timestamp, last_timestamp,
 };
-use crate::db::store::Store;
-use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::types::{
+    FileEvidence, FileOperation, ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role,
+    ThreadRole,
+};
 
 const SOURCE: &str = "goose";
 const USAGE_PARSER_VERSION: u32 = 1;
-const EVENT_PARSER_VERSION: u32 = 1;
+const EVENT_PARSER_VERSION: u32 = 2;
 const METADATA_PARSER_VERSION: u32 = 2;
 const MS_THRESHOLD: i64 = 10_000_000_000;
 
@@ -48,6 +51,7 @@ impl SessionRow {
 }
 
 struct MessageRow {
+    record_id: i64,
     message_id: Option<String>,
     role: String,
     content_json: String,
@@ -79,44 +83,21 @@ impl SourceAdapter for GooseAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "goose".to_string(),
-            args: vec![
-                "session".to_string(),
-                "--resume".to_string(),
-                "--session-id".to_string(),
-                source_id.to_string(),
-            ],
-        })
+        Some(ResumeCommand::new("goose", &["session", "--resume", "--session-id", source_id]))
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        Ok(scan_db(open_goose_db()?, None, None, true)?.sessions)
+        Ok(scan_db(open_goose_db()?, None, None, true, false)?.scan.sessions)
     }
 
-    fn scan_for_sync(
+    fn scan_for_sync_output(
         &self,
-        store: &Store,
+        context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(scan_db(open_goose_db()?, Some(store), since_ts, include_events)?))
-    }
-
-    fn prune(&self, store: &Store) -> anyhow::Result<()> {
-        let Some((conn, _)) = open_goose_db()? else {
-            return Ok(());
-        };
-        if !has_table(&conn, "sessions") {
-            return Ok(());
-        }
-        let live = load_all_session_ids(&conn)?;
-        for source_id in store.session_meta_map(SOURCE)?.keys() {
-            if !live.contains(source_id) {
-                store.delete_session_data(SOURCE, source_id)?;
-            }
-        }
-        Ok(())
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        Ok(Some(scan_db(open_goose_db()?, Some(context), since_ts, include_events, force)?))
     }
 }
 
@@ -172,36 +153,30 @@ fn resolve_db_path_from(
 
 fn scan_db(
     opened: Option<(Connection, PathBuf)>,
-    store: Option<&Store>,
+    context: Option<&AdapterSyncContext>,
     since_ts: Option<i64>,
     include_events: bool,
-) -> anyhow::Result<SyncScanResult> {
+    force: bool,
+) -> anyhow::Result<SyncScanOutput> {
     let Some((conn, db_path)) = opened else {
-        return Ok(SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() });
+        return Ok(unavailable_scan_result(context));
     };
-    if !has_table(&conn, "sessions") || !has_table(&conn, "messages") {
+    let snapshot = conn.unchecked_transaction()?;
+    if !has_table(&snapshot, "sessions") || !has_table(&snapshot, "messages") {
         debug!("Goose sessions.db missing required tables, skipping");
-        return Ok(SyncScanResult { sessions: Vec::new(), stats: SyncScanStats::default() });
+        return Ok(unavailable_scan_result(context));
     }
 
-    let existing = match store {
-        Some(store) => store.session_meta_map(SOURCE)?,
-        None => HashMap::new(),
-    };
-    let usage_state = match store {
-        Some(store) => store.usage_state_meta_map(SOURCE)?,
-        None => HashMap::new(),
-    };
-    let event_state = match store {
-        Some(store) if include_events => store.event_state_meta_map(SOURCE)?,
-        _ => HashMap::new(),
-    };
-    let metadata_state = match store {
-        Some(store) => store.metadata_state_meta_map(SOURCE)?,
-        None => HashMap::new(),
-    };
+    let incremental_context = if force { None } else { context };
+    let since_ts = if force { None } else { since_ts };
+    let existing = incremental_context.map(AdapterSyncContext::session_meta);
+    let usage_state = incremental_context.map(AdapterSyncContext::usage_state);
+    let event_state = incremental_context.map(AdapterSyncContext::event_state);
+    let metadata_state = incremental_context.map(AdapterSyncContext::metadata_state);
 
-    let rows = load_session_rows(&conn)?;
+    let (live, inventory_issues) = load_all_session_ids(&snapshot, &db_path)?;
+    let rows =
+        load_session_rows(&snapshot, context.and_then(AdapterSyncContext::target_source_id))?;
     let mut sessions = Vec::new();
     let mut stats = SyncScanStats::default();
 
@@ -216,28 +191,28 @@ fn scan_db(
             stats.filtered_sessions += 1;
             continue;
         }
-        if store.is_some()
-            && existing.get(&row.id).is_some_and(|&(old_updated_at, _)| {
-                old_updated_at == freshness
+        if existing.is_some_and(|existing| {
+            existing.get(&row.id).is_some_and(|old| {
+                old.updated_at == freshness
                     && crate::adapters::sync_state::session_state_is_current(
                         USAGE_PARSER_VERSION,
                         EVENT_PARSER_VERSION,
-                        usage_state.get(&row.id).copied(),
-                        event_state.get(&row.id).copied(),
+                        usage_state.and_then(|state| state.get(&row.id).copied()),
+                        event_state.and_then(|state| state.get(&row.id).copied()),
                         freshness,
                         include_events,
                     )
-                    && crate::adapters::sync_state::metadata_state_is_current(
+                    && crate::adapters::sync_state::parser_state_is_current(
                         METADATA_PARSER_VERSION,
-                        metadata_state.get(&row.id).copied(),
+                        metadata_state.and_then(|state| state.get(&row.id).copied()),
                         freshness,
                     )
             })
-        {
+        }) {
             stats.skipped_sessions += 1;
             continue;
         }
-        match scan_session(&conn, &row, &db_path, include_events) {
+        match scan_session(&snapshot, &row, &db_path, include_events) {
             Ok(Some(raw)) => {
                 stats.parsed += 1;
                 sessions.push(raw);
@@ -247,19 +222,43 @@ fn scan_db(
         }
     }
 
-    Ok(SyncScanResult { sessions, stats })
+    snapshot.commit()?;
+    let reconcile = if inventory_issues.is_empty() {
+        ReconcilePlan::CompleteLiveSet(live)
+    } else {
+        ReconcilePlan::PartialInventory(inventory_issues)
+    };
+    Ok(SyncScanOutput {
+        scan: SyncScanResult { sessions, stats, observations: Vec::new() },
+        reconcile: Some(reconcile),
+    })
+}
+
+fn unavailable_scan_result(context: Option<&AdapterSyncContext>) -> SyncScanOutput {
+    let result = SyncScanResult {
+        sessions: Vec::new(),
+        stats: SyncScanStats::default(),
+        observations: Vec::new(),
+    };
+    if context.is_some_and(AdapterSyncContext::has_existing_sessions) {
+        return SyncScanOutput {
+            scan: result,
+            reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
+        };
+    }
+    SyncScanOutput { scan: result, reconcile: None }
 }
 
 fn include_session_type(session_type: &str) -> bool {
     matches!(session_type, "user" | "scheduled" | "acp" | "sub_agent")
 }
 
-fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
+fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<Vec<SessionRow>> {
     let columns = table_columns(conn, "sessions")?;
     let sql = format!(
         "SELECT id, working_dir, created_at, updated_at, {}, {}, {}, {}, {},
                 (SELECT MAX(created_timestamp) FROM messages WHERE session_id = sessions.id)
-         FROM sessions",
+         FROM sessions WHERE (?1 IS NULL OR id = ?1)",
         col_or_lit(&columns, "name", "''"),
         col_or_lit(&columns, "session_type", "'user'"),
         col_or_null(&columns, "parent_session_id"),
@@ -267,7 +266,7 @@ fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
         col_or_null(&columns, "model_config_json"),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([target], |row| {
         Ok(SessionRow {
             id: row.get(0)?,
             working_dir: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -291,19 +290,26 @@ fn load_session_rows(conn: &Connection) -> anyhow::Result<Vec<SessionRow>> {
     Ok(sessions)
 }
 
-fn load_all_session_ids(conn: &Connection) -> anyhow::Result<HashSet<String>> {
+fn load_all_session_ids(
+    conn: &Connection,
+    db_path: &Path,
+) -> anyhow::Result<(HashSet<String>, Vec<InventoryIssue>)> {
     let mut stmt = conn.prepare("SELECT id FROM sessions")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     let mut ids = HashSet::new();
+    let mut issues = Vec::new();
     for row in rows {
         match row {
             Ok(id) => {
                 ids.insert(id);
             }
-            Err(err) => warn!("skipping malformed Goose session id: {err}"),
+            Err(_) => issues.push(InventoryIssue {
+                path: db_path.to_path_buf(),
+                category: std::io::ErrorKind::InvalidData,
+            }),
         }
     }
-    Ok(ids)
+    Ok((ids, issues))
 }
 
 fn scan_session(
@@ -317,12 +323,7 @@ fn scan_session(
     let mut events = Vec::new();
 
     for row in message_rows {
-        if !is_user_visible(row.metadata_json.as_deref()) {
-            continue;
-        }
-        let Some(role) = parse_role(&row.role) else {
-            continue;
-        };
+        let visible = is_user_visible(row.metadata_json.as_deref());
         let parts = match serde_json::from_str::<Vec<Value>>(&row.content_json) {
             Ok(parts) => parts,
             Err(err) => {
@@ -331,17 +332,40 @@ fn scan_session(
             }
         };
         let timestamp = row.created_timestamp;
-        if let Some(content) = extract_text(&parts) {
+        if visible
+            && let Some(role) = parse_role(&row.role)
+            && let Some(content) = extract_text(&parts)
+        {
             messages.push(RawMessage { role, content, timestamp });
         }
         if include_events {
-            for part in &parts {
-                if let Some(event) = parse_tool_event(
-                    part,
+            for (part_index, part) in parts.iter().enumerate() {
+                let context = events::EventContext {
+                    event_seq: events.len() as u32,
                     timestamp,
-                    events.len() as u32,
-                    row.message_id.as_deref(),
-                ) {
+                    source_path: db_path.to_str().map(str::to_string),
+                    source_event_id: Some(format!(
+                        "messages:{}:content:{part_index}",
+                        row.record_id
+                    )),
+                    message_seq: visible
+                        .then(|| messages.len().checked_sub(1))
+                        .flatten()
+                        .map(|seq| seq as u32),
+                    parser_version: EVENT_PARSER_VERSION,
+                };
+                if let Some(mut event) = parse_tool_event(part, context, &session.working_dir) {
+                    if !visible {
+                        event.visibility = Some(crate::types::EvidenceVisibility::Hidden);
+                    }
+                    event.attrs_json = Some(
+                        serde_json::json!({
+                            "message_id": row.message_id.as_deref(),
+                            "content": part,
+                            "metadata_json": row.metadata_json,
+                        })
+                        .to_string(),
+                    );
                     events.push(event);
                 }
             }
@@ -389,7 +413,7 @@ fn load_message_rows(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<
     let order =
         if columns.contains("id") { "created_timestamp, id" } else { "created_timestamp, rowid" };
     let sql = format!(
-        "SELECT {}, role, content_json, created_timestamp, {}
+        "SELECT {}, role, content_json, created_timestamp, {}, rowid
          FROM messages
          WHERE session_id = ?1
          ORDER BY {order}",
@@ -399,6 +423,7 @@ fn load_message_rows(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![session_id], |row| {
         Ok(MessageRow {
+            record_id: row.get(5)?,
             message_id: row.get(0)?,
             role: row.get(1)?,
             content_json: row.get(2)?,
@@ -534,29 +559,100 @@ fn part_text(part: &Value) -> Option<&str> {
 
 fn parse_tool_event(
     part: &Value,
-    timestamp: Option<i64>,
-    event_seq: u32,
-    message_id: Option<&str>,
+    context: events::EventContext,
+    directory: &str,
 ) -> Option<RawSessionEvent> {
-    let content_type = part.get("type").and_then(Value::as_str)?;
-    let source_event_id = part.get("id").and_then(Value::as_str).or(message_id).map(str::to_string);
-    let context = events::EventContext {
-        event_seq,
-        timestamp,
-        source_path: None,
-        source_event_id,
-        message_seq: None,
-        parser_version: EVENT_PARSER_VERSION,
-    };
-    match content_type {
+    let mut event = match part.get("type").and_then(Value::as_str)? {
         "toolRequest" => {
-            let value = part.get("toolCall")?.get("value")?;
-            let name = value.get("name").and_then(Value::as_str).filter(|name| !name.is_empty())?;
-            Some(events::tool_call_event(context, name.to_string(), value.get("arguments")))
+            let call = part.get("toolCall")?;
+            let value = call.get("value");
+            let name = value.and_then(|value| value.get("name")).and_then(Value::as_str);
+            let args = value.and_then(|value| value.get("arguments"));
+            let mut event =
+                events::tool_call_event(context, name.unwrap_or("tool").to_string(), args);
+            event.name = name.map(str::to_string);
+            event.status = (call.get("status").and_then(Value::as_str) == Some("error"))
+                .then(|| "error".to_string());
+            event.kind = "tool_call".to_string();
+            event.target = None;
+            if let Some(args) = args {
+                let operation = match name {
+                    Some("developer__write" | "developer__edit") => Some(FileOperation::Write),
+                    Some("developer__text_editor") => {
+                        match args.get("command").and_then(Value::as_str) {
+                            Some("view") => Some(FileOperation::Read),
+                            Some("write" | "insert" | "undo_edit") => Some(FileOperation::Write),
+                            Some("str_replace") if args.get("diff").is_none_or(Value::is_null) => {
+                                Some(FileOperation::Write)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(operation) = operation
+                    && let Some(path) = args.get("path").and_then(Value::as_str)
+                    && !path.trim().is_empty()
+                {
+                    event.kind =
+                        if operation == FileOperation::Read { "file_read" } else { "file_write" }
+                            .to_string();
+                    event.target = Some(path.to_string());
+                    event.files.push(FileEvidence::call(
+                        path.to_string(),
+                        operation,
+                        Some(directory.to_string()).filter(|cwd| !cwd.trim().is_empty()),
+                    ));
+                } else if name == Some("developer__shell") {
+                    event.kind = "command".to_string();
+                    event.target = args.get("command").and_then(Value::as_str).map(str::to_string);
+                    if let Some(command) = event.target.as_deref() {
+                        let (files, status) = events::shell_file_evidence(
+                            command,
+                            Some(directory).filter(|cwd| !cwd.trim().is_empty()),
+                        );
+                        event.files = files;
+                        event.command_evidence_status = Some(status);
+                    }
+                }
+            }
+            event
         }
-        "toolResponse" => Some(events::tool_result_event(context, None, None)),
-        _ => None,
-    }
+        "toolResponse" => {
+            let result = part.get("toolResult");
+            let value = result.and_then(|result| result.get("value"));
+            let content = value.and_then(|value| {
+                value.as_array().or_else(|| value.get("content").and_then(Value::as_array))
+            });
+            let summary = content.and_then(|content| extract_text(content)).or_else(|| {
+                result
+                    .and_then(|result| result.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let mut event = events::tool_result_event(context, None, summary);
+            event.status =
+                match result.and_then(|result| result.get("status")).and_then(Value::as_str) {
+                    Some("error") => Some("error"),
+                    Some("success") => match value {
+                        Some(Value::Array(_)) => Some("success"),
+                        Some(Value::Object(value)) => match value.get("isError") {
+                            Some(Value::Bool(true)) => Some("error"),
+                            Some(Value::Bool(false)) | None => Some("success"),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .map(str::to_string);
+            event
+        }
+        _ => return None,
+    };
+    event.tool_call_id = part.get("id").and_then(Value::as_str).map(str::to_string);
+    event.attrs_json = Some(part.to_string());
+    Some(event)
 }
 
 fn is_user_visible(metadata_json: Option<&str>) -> bool {
@@ -654,34 +750,24 @@ fn col_or_lit(columns: &HashSet<String>, name: &str, lit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
+    use crate::types::FileEvidenceKind;
     use crate::types::Session;
 
     fn make_session(source_id: &str, updated_at: Option<i64>, message_count: u32) -> Session {
         Session {
-            id: format!("local-{source_id}"),
             source: SOURCE.to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
             directory: Some("/repo".to_string()),
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
             started_at: 100,
             updated_at,
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(&format!("local-{source_id}"))
         }
-    }
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
     }
 
     fn write_empty(path: &Path) {
@@ -797,6 +883,27 @@ mod tests {
             rusqlite::params![session_id, role, content_json, created_timestamp, metadata_json],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn single_session_scan_filters_before_reading_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sessions.db");
+        let conn = setup_goose_db(&path);
+        for id in ["target", "other"] {
+            insert_session(&conn, &SessionSpec { id, ..SessionSpec::default() });
+            insert_message(&conn, id, "user", r#"[{"type":"text","text":"hello"}]"#, 100, None);
+        }
+        drop(conn);
+        for (target, count) in [(None, 2), (Some("target"), 1), (Some("missing"), 0)] {
+            let context = AdapterSyncContext::empty_for_test(SOURCE);
+            let context = target.map(|id| context.restricted_to(id));
+            let opened = opencode::open_readonly(&path).unwrap().map(|conn| (conn, path.clone()));
+            let result = scan_db(opened, context.as_ref(), None, true, false).unwrap().scan;
+            assert_eq!(result.sessions.len(), count);
+            assert_eq!(result.stats.candidates as usize, count);
+            assert!(result.sessions.iter().all(|s| target.is_none_or(|id| s.source_id == id)));
+        }
     }
 
     #[test]
@@ -917,8 +1024,8 @@ mod tests {
         assert!(
             resolve_db_path_from(None, None, Some(PathBuf::from("/no/such/home")), None).is_none()
         );
-        let result = scan_db(None, None, None, true).unwrap();
-        assert!(result.sessions.is_empty());
+        let result = scan_db(None, None, None, true, false).unwrap();
+        assert!(result.scan.sessions.is_empty());
     }
 
     #[test]
@@ -950,7 +1057,15 @@ mod tests {
             &conn,
             "20250310_2",
             "assistant",
-            r#"[{"type":"text","text":"done"},{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt"}}}}]"#,
+            r#"[{"type":"text","text":"done"},{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt","command":"write","file_text":"hello"}}}}]"#,
+            1_741_615_823,
+            None,
+        );
+        insert_message(
+            &conn,
+            "20250310_2",
+            "user",
+            r#"[{"type":"toolResponse","id":"tool123","toolResult":{"status":"success","value":{"content":[{"type":"text","text":"written"}],"isError":false}}}]"#,
             1_741_615_823,
             None,
         );
@@ -958,7 +1073,7 @@ mod tests {
             &conn,
             "20250310_2",
             "assistant",
-            r#"[{"type":"text","text":"hidden"}]"#,
+            r#"[{"type":"text","text":"hidden"},{"type":"toolRequest","id":"hidden-shell","toolCall":{"status":"success","value":{"name":"developer__shell","arguments":{"command":"git restore -- hello.txt"}}}}]"#,
             1_741_615_824,
             Some(r#"{"userVisible":false}"#),
         );
@@ -973,9 +1088,9 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, None, None, true).unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        let raw = &result.sessions[0];
+        let result = scan_db(opened, None, None, true, false).unwrap();
+        assert_eq!(result.scan.sessions.len(), 1);
+        let raw = &result.scan.sessions[0];
         assert_eq!(raw.source_id, "20250310_2");
         assert_eq!(raw.directory.as_deref(), Some("/repo"));
         assert_eq!(raw.custom_title.as_deref(), Some("seed title"));
@@ -992,9 +1107,35 @@ mod tests {
         assert_eq!(raw.usage_events[0].output_tokens, 4);
         assert_eq!(raw.usage_events[0].cache_read_tokens, 2);
         assert_eq!(raw.usage_events[0].cache_write_tokens, 1);
-        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.events.len(), 3);
         assert_eq!(raw.events[0].name.as_deref(), Some("developer__text_editor"));
         assert_eq!(raw.events[0].target.as_deref(), Some("/repo/hello.txt"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("tool123"));
+        assert_eq!(raw.events[1].tool_call_id, raw.events[0].tool_call_id);
+        assert_eq!(raw.events[0].source_event_id.as_deref(), Some("messages:2:content:1"));
+        assert_eq!(raw.events[1].source_event_id.as_deref(), Some("messages:3:content:0"));
+        assert_eq!(raw.events[0].source_path.as_deref(), db_path.to_str());
+        assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(raw.events[0].status, None);
+        assert_eq!(raw.events[0].message_seq, Some(1));
+        assert_eq!(raw.events[2].visibility, Some(crate::types::EvidenceVisibility::Hidden));
+        assert_eq!(raw.events[2].message_seq, None);
+        assert_eq!(raw.events[2].kind, "command");
+        assert_eq!(raw.events[2].files[0].path, "hello.txt");
+        assert_eq!(raw.events[2].files[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(raw.events[2].files[0].kind, FileEvidenceKind::Command);
+        assert_eq!(
+            raw.events[2].command_evidence_status,
+            Some(crate::types::CommandEvidenceStatus::Complete)
+        );
+        assert_eq!(raw.events[1].status.as_deref(), Some("success"));
+        assert!(raw.events[1].files.is_empty());
+        let native: Value =
+            serde_json::from_str(raw.events[0].attrs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            native.pointer("/content/toolCall/status").and_then(Value::as_str),
+            Some("success")
+        );
         assert!(raw.thread_role.is_none());
     }
 
@@ -1022,7 +1163,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, false).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, false, false).unwrap().scan.sessions[0];
         assert_eq!(raw.started_at, 1_741_615_822_000);
         assert_eq!(raw.updated_at, Some(1_741_615_823_000));
         assert_eq!(raw.messages[0].timestamp, Some(1_741_615_822_000));
@@ -1048,10 +1189,10 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, None, None, false).unwrap();
-        assert_eq!(result.stats.rejected_before_parse, 3);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].source_id, "u1");
+        let result = scan_db(opened, None, None, false, false).unwrap();
+        assert_eq!(result.scan.stats.rejected_before_parse, 3);
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].source_id, "u1");
     }
 
     #[test]
@@ -1073,7 +1214,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, false).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, false, false).unwrap().scan.sessions[0];
         assert_eq!(raw.custom_title, None);
         assert_eq!(raw.thread_role, Some(ThreadRole::Subagent));
         assert_eq!(raw.parent_links[0].source, SOURCE);
@@ -1110,7 +1251,7 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, true).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, true, false).unwrap().scan.sessions[0];
         assert!(raw.usage_events.is_empty());
         assert_eq!(raw.messages[0].content, "hi");
     }
@@ -1126,40 +1267,48 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("s1", Some(200_000), 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                SOURCE,
-                "s1",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, SOURCE, "s1", USAGE_PARSER_VERSION, Some(200_000));
+        seed_empty_event_state(&store, SOURCE, "s1", EVENT_PARSER_VERSION, Some(200_000));
+        seed_empty_metadata_state(&store, SOURCE, "s1", METADATA_PARSER_VERSION);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, Some(&store), None, true).unwrap();
-        assert_eq!(result.stats.skipped_sessions, 1);
-        assert!(result.sessions.is_empty());
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+        seed_empty_event_state(&store, SOURCE, "s1", EVENT_PARSER_VERSION - 1, Some(200_000));
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
+        let stale = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(stale.scan.sessions.len(), 1);
+        assert_eq!(stale.scan.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert!(result.scan.sessions.is_empty());
+
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+        let forced = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(forced.scan.sessions.len(), 1);
+        assert!(matches!(
+            forced.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ids)) if ids == HashSet::from(["s1".to_string()])
+        ));
     }
 
     #[test]
@@ -1174,42 +1323,23 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_session("s1", Some(200_000), 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                SOURCE,
-                "s1",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(200_000),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                SOURCE,
-                "s1",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(&store, SOURCE, "s1", USAGE_PARSER_VERSION, Some(200_000));
+        seed_empty_event_state(&store, SOURCE, "s1", EVENT_PARSER_VERSION, Some(200_000));
+        seed_empty_metadata_state(&store, SOURCE, "s1", METADATA_PARSER_VERSION);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, Some(&store), None, true).unwrap();
-        assert_eq!(result.stats.skipped_sessions, 0);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].updated_at, Some(400_000));
-        assert_eq!(result.sessions[0].messages.len(), 2);
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.scan.stats.skipped_sessions, 0);
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].updated_at, Some(400_000));
+        assert_eq!(result.scan.sessions[0].messages.len(), 2);
     }
 
     #[test]
@@ -1222,10 +1352,105 @@ mod tests {
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let result = scan_db(opened, None, Some(300_000), false).unwrap();
-        assert_eq!(result.stats.filtered_sessions, 0);
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(result.sessions[0].updated_at, Some(400_000));
+        let result = scan_db(opened, None, Some(300_000), false, false).unwrap();
+        assert_eq!(result.scan.stats.filtered_sessions, 0);
+        assert_eq!(result.scan.sessions.len(), 1);
+        assert_eq!(result.scan.sessions[0].updated_at, Some(400_000));
+    }
+
+    #[test]
+    fn native_tool_status_and_file_operations_are_independent() {
+        let parse = |part: &Value| {
+            parse_tool_event(
+                part,
+                events::EventContext {
+                    event_seq: 0,
+                    timestamp: Some(1000),
+                    source_path: Some("sessions.db".into()),
+                    source_event_id: Some("messages:7:content:0".into()),
+                    message_seq: None,
+                    parser_version: EVENT_PARSER_VERSION,
+                },
+                "/repo",
+            )
+            .unwrap()
+        };
+        for (result, status) in [
+            (serde_json::json!({"status":"error","error":"transport failed"}), Some("error")),
+            (
+                serde_json::json!({"status":"success","value":{"content":[],"isError":true}}),
+                Some("error"),
+            ),
+            (
+                serde_json::json!({"status":"success","value":{"content":[],"isError":false}}),
+                Some("success"),
+            ),
+            (serde_json::json!({"status":"success","value":{"content":[]}}), Some("success")),
+            (
+                serde_json::json!({"status":"success","value":[{"type":"text","text":"legacy result"}]}),
+                Some("success"),
+            ),
+            (serde_json::json!({"value":{"content":[]}}), None),
+        ] {
+            let part = serde_json::json!({"type":"toolResponse","id":"call-1","toolResult":result});
+            let event = parse(&part);
+            assert_eq!(event.status.as_deref(), status);
+            assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+            assert!(event.files.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+                part
+            );
+        }
+        for (name, args, operation) in [
+            (
+                "developer__text_editor",
+                serde_json::json!({"path":"a.rs","command":"view"}),
+                FileOperation::Read,
+            ),
+            (
+                "developer__text_editor",
+                serde_json::json!({"path":"a.rs","command":"str_replace","old_str":"old","new_str":"new"}),
+                FileOperation::Write,
+            ),
+            (
+                "developer__text_editor",
+                serde_json::json!({"path":"a.rs","command":"undo_edit"}),
+                FileOperation::Write,
+            ),
+            (
+                "developer__write",
+                serde_json::json!({"path":"a.rs","content":"new"}),
+                FileOperation::Write,
+            ),
+            (
+                "developer__edit",
+                serde_json::json!({"path":"a.rs","before":"old","after":"new"}),
+                FileOperation::Write,
+            ),
+        ] {
+            let part = serde_json::json!({"type":"toolRequest","id":"call-1","toolCall":{"status":"success","value":{"name":name,"arguments":args}}});
+            let event = parse(&part);
+            assert_eq!(event.status, None);
+            assert_eq!(event.files.len(), 1);
+            assert_eq!(event.files[0].operation, operation);
+            assert_eq!(event.files[0].kind, FileEvidenceKind::Call);
+            assert_eq!(event.files[0].path, "a.rs");
+            assert_eq!(event.files[0].cwd.as_deref(), Some("/repo"));
+        }
+        let diff = serde_json::json!({"type":"toolRequest","id":"diff-1","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo","command":"str_replace","diff":"--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n"}}}});
+        let event = parse(&diff);
+        assert!(event.files.iter().all(|file| file.path != "/repo"));
+        assert_ne!(event.target.as_deref(), Some("/repo"));
+        assert_eq!(
+            serde_json::from_str::<Value>(event.attrs_json.as_deref().unwrap()).unwrap(),
+            diff
+        );
+        let error = serde_json::json!({"type":"toolRequest","id":"invalid-1","toolCall":{"status":"error","error":"invalid arguments"}});
+        let event = parse(&error);
+        assert_eq!(event.status.as_deref(), Some("error"));
+        assert_eq!(event.tool_call_id.as_deref(), Some("invalid-1"));
+        assert!(event.files.is_empty());
     }
 
     #[test]
@@ -1241,14 +1466,14 @@ mod tests {
             &conn,
             "s1",
             "assistant",
-            r#"[{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt"}}}}]"#,
+            r#"[{"type":"toolRequest","id":"tool123","toolCall":{"status":"success","value":{"name":"developer__text_editor","arguments":{"path":"/repo/hello.txt","command":"write","file_text":"hello"}}}}]"#,
             400,
             None,
         );
         drop(conn);
 
         let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path.clone()));
-        let raw = &scan_db(opened, None, None, true).unwrap().sessions[0];
+        let raw = &scan_db(opened, None, None, true, false).unwrap().scan.sessions[0];
         assert!(raw.messages.is_empty());
         assert_eq!(raw.events.len(), 1);
         assert_eq!(raw.started_at, 400_000);
@@ -1256,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_deletes_sessions_missing_from_goose() {
+    fn complete_scan_returns_live_set_without_mutating_store() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("sessions.db");
         let conn = setup_goose_db(&db_path);
@@ -1267,16 +1492,102 @@ mod tests {
         store.insert_session(&make_session("keep", Some(200_000), 1)).unwrap();
         store.insert_session(&make_session("gone", Some(200_000), 1)).unwrap();
 
-        let opened = opencode::open_readonly(&db_path).unwrap().unwrap();
-        let live = load_all_session_ids(&opened).unwrap();
-        for source_id in store.session_meta_map(SOURCE).unwrap().keys() {
-            if !live.contains(source_id) {
-                store.delete_session_data(SOURCE, source_id).unwrap();
-            }
-        }
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         let remaining = store.session_meta_map(SOURCE).unwrap();
         assert!(remaining.contains_key("keep"));
-        assert!(!remaining.contains_key("gone"));
+        assert!(remaining.contains_key("gone"));
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ids)) if ids == HashSet::from(["keep".to_string()])
+        ));
+    }
+
+    #[test]
+    fn external_database_query_failure_preserves_existing_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("sessions.db");
+        let conn = setup_goose_db(&db_path);
+        conn.execute(
+            "ALTER TABLE sessions RENAME COLUMN working_dir TO unexpected_working_dir",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = setup_store();
+        store.insert_session(&make_session("existing", Some(200_000), 1)).unwrap();
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+
+        assert!(
+            scan_db(
+                opened,
+                Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+                None,
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(store.session_meta(SOURCE, "existing").unwrap().is_some());
+    }
+
+    #[test]
+    fn malformed_live_id_marks_inventory_partial_and_keeps_valid_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("sessions.db");
+        let conn = setup_goose_db(&db_path);
+        insert_session(&conn, &SessionSpec { id: "keep", ..SessionSpec::default() });
+        insert_message(&conn, "keep", "user", r#"[{"type":"text","text":"hello"}]"#, 100, None);
+        conn.execute(
+            "INSERT INTO sessions (id, working_dir) VALUES (?1, '/broken')",
+            rusqlite::params![vec![0xff_u8]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = setup_store();
+        store.insert_session(&make_session("keep", Some(200_000), 1)).unwrap();
+        store.insert_session(&make_session("stale", Some(200_000), 1)).unwrap();
+        let opened = opencode::open_readonly(&db_path).unwrap().map(|conn| (conn, db_path));
+
+        let result = scan_db(
+            opened,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(result.reconcile, Some(ReconcilePlan::PartialInventory(_))));
+        assert!(result.scan.sessions.iter().any(|session| session.source_id == "keep"));
+        assert!(store.session_meta(SOURCE, "stale").unwrap().is_some());
+    }
+
+    #[test]
+    fn missing_database_with_history_is_unavailable() {
+        let store = setup_store();
+        store.insert_session(&make_session("existing", Some(200_000), 1)).unwrap();
+
+        let result = scan_db(
+            None,
+            Some(&AdapterSyncContext::from_store_for_test(&store, SOURCE).unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(result.reconcile, Some(ReconcilePlan::UnavailableInventory(_))));
+        assert!(store.session_meta(SOURCE, "existing").unwrap().is_some());
     }
 
     #[test]

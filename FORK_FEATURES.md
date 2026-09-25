@@ -108,10 +108,11 @@ when title parsing changes so unchanged files backfill correctly.
 ### Shortcut UX
 
 - Keep the upstream bottom shortcut bar rather than a fork-only replacement.
-- Ctrl+S Settings must contain the complete keyboard shortcut reference,
-  including bulk selection, Trash, permanent delete, usage, viewer, and other
-  supported modes.
-- Landmarks: `src/tui/ui/popups.rs`, `src/tui/ui/mod.rs` tests.
+- Match current upstream bindings: `Ctrl+S` starts Sync and `Ctrl+P` opens
+  Settings. The Settings popup must contain the complete keyboard shortcut
+  reference, including bulk selection, Trash, permanent delete, usage, viewer,
+  and other supported modes.
+- Landmarks: `src/tui/app.rs`, `src/tui/ui/popups.rs`, `src/tui/ui/mod.rs` tests.
 
 ### Skill Audit discovery on Windows/multi-harness setups
 
@@ -136,6 +137,8 @@ At minimum, verify on the installed Windows build:
 - `current/data` and `current/trash` are Scoop-persisted junctions.
 - `recall info` uses the persisted DB and does not recreate the legacy
   `%APPDATA%/recall/recall.db`.
+- With LOG `sync_window=all`, the Codex primary-session set is complete against
+  the active user-visible native thread set from `state_5.sqlite` / `codex resume --all`.
 - A Codex session with a native rename matches Codex metadata.
 - A Claude Code session containing `ai-title` displays that title rather than
   `/effort`, `<local-command-stdout>`, or the first prompt.

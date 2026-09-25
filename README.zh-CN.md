@@ -27,6 +27,8 @@ recall import recall-export.jsonl --dry-run  # 预览导入
 recall session list  # 为 agent/脚本列出会话
 recall session share --id <session-id> --format json  # 发布选中的一个会话
 recall session delete --id <session-id> --dry-run  # 预览安全删除会话
+recall share list --format json  # 列出已发布的分享地址
+recall share unpublish <share-id> --yes  # 下线一个公开页面
 recall info  # 索引统计与 worker 状态
 ```
 
@@ -79,6 +81,7 @@ recall skill install # 自动检测 agent 并安装 skills
 | MiMo Code       |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | ZCode           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 | Goose           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
+| Droid           |  ✅  |    ✅    |    ✅    |    ✅    |  ✅  |  ✅  |  ✅  |
 
 ## 致谢
 

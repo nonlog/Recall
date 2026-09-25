@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -7,22 +7,28 @@ use serde_json::Value;
 use tracing::debug;
 use walkdir::WalkDir;
 
+use crate::adapters::AdapterSyncContext;
 use crate::adapters::events;
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
-use crate::adapters::paths::resolve_home_dir;
-use crate::adapters::{
-    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
-    first_timestamp,
+use crate::adapters::invocation_probe::{
+    InvocationProbeBudget, ProviderInvocationProbe, is_discovery_tool, nonce_matches_input,
+    probe_recent_files,
 };
-use crate::db::store::Store;
-use crate::types::{ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role, ThreadRole};
+use crate::adapters::json_util::{jsonl_indexed, rfc3339_ms};
+use crate::adapters::paths::{self, resolve_home_dir};
+use crate::adapters::{
+    RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, first_timestamp,
+};
+use crate::types::{
+    EvidenceVisibility, FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation,
+    RawSessionEvent, RawUsageEvent, Role, ThreadRole,
+};
 
 pub(crate) struct ClaudeCodeAdapter;
 
-const USAGE_PARSER_VERSION: u32 = 5;
-const EVENT_PARSER_VERSION: u32 = 2;
-const METADATA_PARSER_VERSION: u32 = 2;
+const USAGE_PARSER_VERSION: u32 = 6;
+const EVENT_PARSER_VERSION: u32 = 7;
+const METADATA_PARSER_VERSION: u32 = 4;
 
 impl SourceAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &str {
@@ -33,10 +39,11 @@ impl SourceAdapter for ClaudeCodeAdapter {
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand {
-            program: "claude".to_string(),
-            args: vec!["--resume".to_string(), source_id.to_string()],
-        })
+        Some(ResumeCommand::new("claude", &["--resume", source_id]))
+    }
+
+    fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
+        Some(crate::adapters::prompt_start("claude", prompt))
     }
 
     fn usage_parser_version(&self) -> Option<u32> {
@@ -44,15 +51,32 @@ impl SourceAdapter for ClaudeCodeAdapter {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(claude_dir) = resolve_claude_dir()? else {
-            return Ok(vec![]);
-        };
-        let mut indexes = load_session_indexes(&claude_dir);
+        scan_claude_dirs(&resolve_claude_dirs()?)
+    }
 
-        let mut sessions = Vec::new();
-        let mut entries = collect_project_entries(&claude_dir, &mut indexes);
-        entries.extend(collect_transcript_entries(&claude_dir));
+    fn scan_for_sync(
+        &self,
+        context: &AdapterSyncContext,
+        since_ts: Option<i64>,
+        include_events: bool,
+    ) -> anyhow::Result<Option<SyncScanResult>> {
+        Ok(Some(scan_claude_dirs_for_sync(
+            &resolve_claude_dirs()?,
+            context,
+            since_ts,
+            include_events,
+        )?))
+    }
+}
 
+fn scan_claude_dirs(claude_dirs: &[PathBuf]) -> anyhow::Result<Vec<RawSession>> {
+    let mut sessions = Vec::new();
+    let mut claimed = HashSet::new();
+    for claude_dir in claude_dirs {
+        let mut indexes = load_session_indexes(claude_dir);
+        let mut entries = collect_project_entries(claude_dir, &mut indexes);
+        entries.extend(collect_transcript_entries(claude_dir));
+        claim_session_entries(&mut entries, &mut claimed);
         for entry in entries {
             let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
                 continue;
@@ -61,22 +85,32 @@ impl SourceAdapter for ClaudeCodeAdapter {
                 sessions.push(raw);
             }
         }
-
-        Ok(sessions)
     }
+    Ok(sessions)
+}
 
-    fn scan_for_sync(
-        &self,
-        store: &Store,
-        since_ts: Option<i64>,
-        include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(claude_dir) = resolve_claude_dir()? else {
-            return Ok(Some(SyncScanResult { sessions: vec![], stats: SyncScanStats::default() }));
-        };
-        let result = scan_for_sync_impl(&claude_dir, store, since_ts, include_events)?;
-        Ok(Some(result))
+fn scan_claude_dirs_for_sync(
+    claude_dirs: &[PathBuf],
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    include_events: bool,
+) -> anyhow::Result<SyncScanResult> {
+    let mut combined = SyncScanResult::default();
+    let mut claimed = HashSet::new();
+    for claude_dir in claude_dirs {
+        combined.absorb(scan_for_sync_claimed(
+            claude_dir,
+            context,
+            since_ts,
+            include_events,
+            &mut claimed,
+        )?);
     }
+    Ok(combined)
+}
+
+fn claim_session_entries(entries: &mut Vec<FileScanEntry>, claimed: &mut HashSet<String>) {
+    entries.retain(|entry| claimed.insert(entry.session_id.clone()));
 }
 
 struct SessionMeta {
@@ -95,23 +129,119 @@ fn load_session_indexes(claude_dir: &Path) -> SessionIndexes {
     SessionIndexes { live: load_session_index(claude_dir), project_summaries: HashMap::new() }
 }
 
-fn resolve_claude_dir() -> anyhow::Result<Option<PathBuf>> {
-    resolve_home_dir(".claude", "~/.claude not found, skipping Claude Code")
+fn resolve_claude_dirs() -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(dir) = paths::env_path_dir("CLAUDE_CONFIG_DIR") {
+        let Some(dir) = paths::existing_dir(dir) else {
+            debug!("CLAUDE_CONFIG_DIR not found, skipping Claude Code");
+            return Ok(Vec::new());
+        };
+        return Ok(vec![dir]);
+    }
+    let mut dirs = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+        && let Some(dir) = paths::existing_dir(PathBuf::from(xdg).join("claude-code"))
+    {
+        dirs.push(dir);
+    }
+    if let Some(dir) = resolve_home_dir(".claude", "~/.claude not found, skipping Claude Code")?
+        && !dirs.iter().any(|existing| existing == &dir)
+    {
+        dirs.push(dir);
+    }
+    Ok(dirs)
 }
 
+pub(crate) fn probe_invocation_nonce(
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> anyhow::Result<ProviderInvocationProbe> {
+    let claude_dirs = resolve_claude_dirs()?;
+    Ok(probe_invocation_nonce_in(&claude_dirs, nonce, budget))
+}
+
+fn probe_invocation_nonce_in(
+    claude_dirs: &[PathBuf],
+    nonce: &str,
+    budget: InvocationProbeBudget,
+) -> ProviderInvocationProbe {
+    let entries =
+        claude_dirs.iter().flat_map(|claude_dir| collect_invocation_entries(claude_dir)).collect();
+    probe_recent_files(nonce, entries, budget, claude_invocation_input)
+}
+
+fn collect_invocation_entries(claude_dir: &Path) -> Vec<FileScanEntry> {
+    let mut entries = Vec::new();
+    for root in [claude_dir.join("projects"), claude_dir.join("transcripts")] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+                || !path.is_file()
+            {
+                continue;
+            }
+            let Some(session_id) = transcript_source_id(path) else {
+                continue;
+            };
+            entries.push(FileScanEntry {
+                session_id,
+                stat_target: path.to_path_buf(),
+                directory: None,
+            });
+        }
+    }
+    entries
+}
+
+fn claude_invocation_input(value: &Value, nonce: &str) -> anyhow::Result<bool> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Ok(false);
+    }
+    let Some(content) =
+        value.get("message").and_then(|message| message.get("content")).and_then(Value::as_array)
+    else {
+        return Ok(false);
+    };
+    Ok(content.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("tool_use")
+            && item.get("name").and_then(Value::as_str).is_some_and(is_discovery_tool)
+            && item.get("input").is_some_and(|input| nonce_matches_input(input, nonce))
+    }))
+}
+
+fn transcript_source_id(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
 fn scan_for_sync_impl(
     claude_dir: &Path,
-    store: &Store,
+    context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
+) -> anyhow::Result<SyncScanResult> {
+    scan_for_sync_claimed(claude_dir, context, since_ts, include_events, &mut HashSet::new())
+}
+
+fn scan_for_sync_claimed(
+    claude_dir: &Path,
+    context: &AdapterSyncContext,
+    since_ts: Option<i64>,
+    include_events: bool,
+    claimed: &mut HashSet<String>,
 ) -> anyhow::Result<SyncScanResult> {
     let mut indexes = load_session_indexes(claude_dir);
     let mut entries = collect_project_entries(claude_dir, &mut indexes);
     entries.extend(collect_transcript_entries(claude_dir));
+    claim_session_entries(&mut entries, claimed);
 
     file_scan::run_file_scan_with_options(
-        store,
-        "claude-code",
+        context,
         since_ts,
         file_scan::FileScanOptions {
             usage_parser_version: Some(USAGE_PARSER_VERSION),
@@ -197,9 +327,8 @@ fn collect_project_entries(claude_dir: &Path, indexes: &mut SessionIndexes) -> V
             if !file_path.is_file() {
                 continue;
             }
-            let session_id = match file_path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => continue,
+            let Some(session_id) = transcript_source_id(file_path) else {
+                continue;
             };
 
             let meta_cwd = indexes.live.get(&session_id).and_then(|m| m.cwd.clone());
@@ -267,9 +396,8 @@ fn collect_transcript_entries(claude_dir: &Path) -> Vec<FileScanEntry> {
         if !path.is_file() {
             continue;
         }
-        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => continue,
+        let Some(session_id) = transcript_source_id(path) else {
+            continue;
         };
 
         entries.push(FileScanEntry {
@@ -288,7 +416,7 @@ fn parse_claude_session_file(
     indexes: &SessionIndexes,
     include_events: bool,
 ) -> anyhow::Result<Option<RawSession>> {
-    let parsed = match parse_conversation_jsonl(&entry.stat_target, mtime_ms, include_events) {
+    let mut parsed = match parse_conversation_jsonl(&entry.stat_target, mtime_ms, include_events) {
         Ok(parsed) => parsed,
         Err(e) => {
             debug!("failed to parse {}: {e}", entry.stat_target.display());
@@ -296,16 +424,22 @@ fn parse_claude_session_file(
         }
     };
 
-    if parsed.messages.is_empty() && parsed.usage_events.is_empty() {
+    if parsed.messages.is_empty() && parsed.usage_events.is_empty() && parsed.events.is_empty() {
         return Ok(None);
     }
 
     let meta = indexes.live.get(&entry.session_id);
+    let fallback_cwd = meta.and_then(|m| m.cwd.as_deref());
+    for file in parsed.events.iter_mut().flat_map(|event| &mut event.files) {
+        if file.cwd.is_none() && file.kind != FileEvidenceKind::Command {
+            file.cwd = fallback_cwd.map(str::to_string);
+        }
+    }
     let started_at = first_timestamp(
         meta.and_then(|m| m.started_at),
         &parsed.messages,
         &parsed.usage_events,
-        &[],
+        &parsed.events,
     )
     .unwrap_or(0);
     let directory =
@@ -338,7 +472,20 @@ fn parse_claude_session_file(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_on_metadata_backfill: true,
     }))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_conformance_fixture(claude_dir: &Path) -> anyhow::Result<Option<RawSession>> {
+    let mut indexes = load_session_indexes(claude_dir);
+    let Some(entry) = collect_project_entries(claude_dir, &mut indexes).into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(mtime_ms) = file_scan::stat_mtime_ms(&entry.stat_target) else {
+        return Ok(None);
+    };
+    parse_claude_session_file(entry, mtime_ms, &indexes, true)
 }
 
 pub(crate) struct ParsedConversation {
@@ -365,12 +512,14 @@ pub(crate) fn parse_conversation_jsonl(
     let mut events = Vec::new();
     let mut usage_index: HashMap<String, usize> = HashMap::new();
     let mut cwd: Option<String> = None;
+    let mut effective_cwd: Option<String> = None;
     let mut custom_title: Option<String> = None;
-    let mut ai_title: Option<String> = None;
+    let mut generated_title: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
     let mut session_id: Option<String> = None;
+    let mut last_visible_message_seq: Option<u32> = None;
     let source_path = path.to_string_lossy().to_string();
 
     for item in jsonl_indexed(reader.lines()) {
@@ -392,21 +541,26 @@ pub(crate) fn parse_conversation_jsonl(
 
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-        if msg_type == "custom-title"
-            && let Some(title) = v.get("customTitle").and_then(|t| t.as_str())
-        {
-            let trimmed = title.trim();
-            if !trimmed.is_empty() {
-                custom_title = Some(trimmed.to_string());
+        if matches!(msg_type, "custom-title" | "ai-title" | "title") {
+            let title = match msg_type {
+                "custom-title" => v.get("customTitle").or_else(|| v.get("title")),
+                "ai-title" | "title" => v
+                    .get("aiTitle")
+                    .or_else(|| v.get("title"))
+                    .or_else(|| v.get("customTitle")),
+                _ => None,
             }
-            continue;
-        }
-        if msg_type == "ai-title"
-            && let Some(title) = v.get("aiTitle").and_then(|t| t.as_str())
-        {
-            let trimmed = title.trim();
-            if !trimmed.is_empty() {
-                ai_title = Some(trimmed.to_string());
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+            if let Some(title) = title {
+                if msg_type == "custom-title" {
+                    // Explicit user titles always outrank generated/AI titles,
+                    // even when an AI-title record is appended later.
+                    custom_title = Some(title.to_string());
+                } else {
+                    generated_title = Some(title.to_string());
+                }
             }
             continue;
         }
@@ -426,9 +580,11 @@ pub(crate) fn parse_conversation_jsonl(
             _ => continue,
         }
 
-        let is_machinery = v.get("isCompactSummary").and_then(|b| b.as_bool()).unwrap_or(false)
-            || v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false)
-            || v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false);
+        let is_compact_summary =
+            v.get("isCompactSummary").and_then(Value::as_bool).unwrap_or(false);
+        let is_sidechain = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
+        let is_meta = v.get("isMeta").and_then(Value::as_bool);
+        let is_machinery = is_compact_summary || is_sidechain || is_meta == Some(true);
 
         let role = if msg_type == "user" { Role::User } else { Role::Assistant };
 
@@ -437,7 +593,7 @@ pub(crate) fn parse_conversation_jsonl(
             None => continue,
         };
 
-        let text = extract_content(message.get("content"));
+        let text = claude_visible_content(message.get("content"));
         let timestamp = rfc3339_ms(v.get("timestamp"));
 
         let message_seq =
@@ -461,7 +617,49 @@ pub(crate) fn parse_conversation_jsonl(
             }
         }
 
-        if is_machinery {
+        if !is_machinery
+            && let Some(value) = v.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty())
+        {
+            effective_cwd = Some(value.to_string());
+        }
+
+        if include_events {
+            collect_claude_content_events(
+                message.get("content"),
+                ClaudeContentEventContext {
+                    role: role.clone(),
+                    timestamp,
+                    source_path: &source_path,
+                    line_index,
+                    prior_message_seq: if is_machinery { None } else { last_visible_message_seq },
+                    current_message_seq: message_seq,
+                    is_meta,
+                    cwd: v
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .or(effective_cwd.as_deref()),
+                    visibility: is_machinery.then_some(EvidenceVisibility::Hidden),
+                },
+                &mut events,
+            );
+        }
+
+        if is_compact_summary || is_meta == Some(true) {
+            if include_events {
+                collect_claude_meta_event(
+                    message.get("content"),
+                    role,
+                    timestamp,
+                    &source_path,
+                    line_index,
+                    &mut events,
+                );
+            }
+            continue;
+        }
+
+        if is_sidechain {
             continue;
         }
 
@@ -474,20 +672,11 @@ pub(crate) fn parse_conversation_jsonl(
             }
         }
 
-        if include_events {
-            collect_claude_content_events(
-                message.get("content"),
-                role.clone(),
-                timestamp,
-                &source_path,
-                line_index,
-                message_seq,
-                &mut events,
-            );
-        }
-
         if !text.is_empty() {
             messages.push(RawMessage { role, content: text, timestamp });
+        }
+        if claude_content_has_visible_text(message.get("content")) {
+            last_visible_message_seq = message_seq;
         }
     }
 
@@ -496,7 +685,7 @@ pub(crate) fn parse_conversation_jsonl(
         usage_events,
         events,
         cwd,
-        custom_title: custom_title.or(ai_title),
+        custom_title: custom_title.or(generated_title),
         summary,
         first_ts,
         last_ts,
@@ -527,55 +716,163 @@ fn claude_topology(
     (Some(ThreadRole::Subagent), parents)
 }
 
-fn collect_claude_content_events(
-    content: Option<&Value>,
+struct ClaudeContentEventContext<'a> {
     role: Role,
     timestamp: Option<i64>,
-    source_path: &str,
+    source_path: &'a str,
     line_index: usize,
-    message_seq: Option<u32>,
+    prior_message_seq: Option<u32>,
+    current_message_seq: Option<u32>,
+    is_meta: Option<bool>,
+    cwd: Option<&'a str>,
+    visibility: Option<EvidenceVisibility>,
+}
+
+fn collect_claude_content_events(
+    content: Option<&Value>,
+    context: ClaudeContentEventContext<'_>,
     events_out: &mut Vec<RawSessionEvent>,
 ) {
     let Some(Value::Array(arr)) = content else {
         return;
     };
+    let mut message_seq = context.prior_message_seq;
     for (item_index, item) in arr.iter().enumerate() {
         match item.get("type").and_then(|t| t.as_str()) {
-            Some("tool_use") if role == Role::Assistant => {
+            Some("text") => {
+                if item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty()) {
+                    message_seq = context.current_message_seq;
+                }
+            }
+            Some("tool_use") if context.role == Role::Assistant => {
                 let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-                events_out.push(events::tool_call_event(
+                let mut event = events::tool_call_event(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        timestamp: context.timestamp,
+                        source_path: Some(context.source_path.to_string()),
+                        source_event_id: Some(format!("{}:{item_index}", context.line_index)),
                         message_seq,
                         parser_version: EVENT_PARSER_VERSION,
                     },
                     name,
                     item.get("input"),
-                ));
+                );
+                let operation = match event.name.as_deref() {
+                    Some("Read") => Some(FileOperation::Read),
+                    Some("Edit" | "Write" | "MultiEdit") => Some(FileOperation::Write),
+                    _ => None,
+                };
+                if let Some(operation) = operation
+                    && let Some(path) = item
+                        .pointer("/input/file_path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.trim().is_empty())
+                {
+                    event.files.push(FileEvidence::call(
+                        path.to_string(),
+                        operation,
+                        context.cwd.map(str::to_string),
+                    ));
+                }
+                if event.name.as_deref() == Some("Bash")
+                    && let Some(command) = item.pointer("/input/command").and_then(Value::as_str)
+                {
+                    let (files, status) = events::shell_file_evidence(command, context.cwd);
+                    event.files = files;
+                    event.command_evidence_status = Some(status);
+                }
+                event.attrs_json = Some(item.to_string());
+                event.tool_call_id = claude_tool_call_id(item.get("id"));
+                event.is_meta = context.is_meta;
+                event.visibility = context.visibility;
+                events_out.push(event);
             }
             Some("tool_result") => {
                 let summary = item.get("content").map(|content| match content {
                     Value::String(text) => text.to_string(),
                     other => other.to_string(),
                 });
-                events_out.push(events::tool_result_event(
+                let mut event = events::tool_result_event(
                     events::EventContext {
                         event_seq: events_out.len() as u32,
-                        timestamp,
-                        source_path: Some(source_path.to_string()),
-                        source_event_id: Some(format!("{line_index}:{item_index}")),
+                        timestamp: context.timestamp,
+                        source_path: Some(context.source_path.to_string()),
+                        source_event_id: Some(format!("{}:{item_index}", context.line_index)),
                         message_seq,
                         parser_version: EVENT_PARSER_VERSION,
                     },
-                    item.get("tool_use_id").and_then(|id| id.as_str()).map(String::from),
+                    item.get("name").and_then(Value::as_str).map(String::from),
                     summary,
-                ));
+                );
+                event.status = item
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .map(|is_error| if is_error { "error" } else { "success" }.to_string());
+                event.attrs_json = Some(item.to_string());
+                event.tool_call_id = claude_tool_call_id(item.get("tool_use_id"));
+                event.is_meta = context.is_meta;
+                event.visibility = context.visibility;
+                events_out.push(event);
             }
             _ => {}
         }
+    }
+}
+
+fn claude_tool_call_id(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty()).map(String::from)
+}
+
+fn claude_content_has_visible_text(content: Option<&Value>) -> bool {
+    match content {
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("text")
+                && item.get("text").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+        }),
+        _ => false,
+    }
+}
+
+fn collect_claude_meta_event(
+    content: Option<&Value>,
+    role: Role,
+    timestamp: Option<i64>,
+    source_path: &str,
+    line_index: usize,
+    events_out: &mut Vec<RawSessionEvent>,
+) {
+    let summary = claude_visible_content(content);
+    if summary.is_empty() {
+        return;
+    }
+    events_out.push(RawSessionEvent {
+        summary: Some(events::bounded_summary(summary)),
+        is_meta: Some(true),
+        ..events::EventContext {
+            event_seq: events_out.len() as u32,
+            timestamp,
+            source_path: Some(source_path.to_string()),
+            source_event_id: Some(line_index.to_string()),
+            message_seq: None,
+            parser_version: EVENT_PARSER_VERSION,
+        }
+        .event("message", role.as_str())
+    });
+}
+
+fn claude_visible_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -630,53 +927,6 @@ fn merge_claude_usage_event(existing: &mut RawUsageEvent, next: RawUsageEvent) {
     existing.raw_usage_json = next.raw_usage_json;
 }
 
-fn extract_content(content: Option<&Value>) -> String {
-    match content {
-        None => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => {
-            let mut parts = Vec::new();
-            for item in arr {
-                match item.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            parts.push(text.to_string());
-                        }
-                    }
-                    Some("tool_use") => {
-                        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        if let Some(input) = item.get("input") {
-                            parts.push(format!("[{name}] {input}"));
-                        }
-                    }
-                    Some("tool_result") => {
-                        if let Some(content) = item.get("content") {
-                            match content {
-                                Value::String(s) => parts.push(s.clone()),
-                                Value::Array(inner) => {
-                                    for block in inner {
-                                        if block.get("type").and_then(|t| t.as_str())
-                                            == Some("text")
-                                            && let Some(text) =
-                                                block.get("text").and_then(|t| t.as_str())
-                                        {
-                                            parts.push(text.to_string());
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            parts.join("\n")
-        }
-        _ => String::new(),
-    }
-}
-
 fn project_key_to_path(key: &str) -> String {
     let key = key.strip_prefix('-').unwrap_or(key);
     let mut result = String::with_capacity(key.len() + 1);
@@ -702,13 +952,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::db::{schema, store::Store};
+    use crate::adapters::test_support::{
+        seed_empty_event_state, seed_empty_metadata_state, seed_empty_usage_state,
+        store as setup_store,
+    };
     use crate::types::Session;
-
-    fn setup_store() -> Store {
-        schema::register_sqlite_vec();
-        Store::open_in_memory().unwrap()
-    }
 
     fn temp_claude_root(label: &str) -> PathBuf {
         let root =
@@ -736,52 +984,326 @@ mod tests {
         let project = root.join("projects").join("-tmp-foo");
         fs::create_dir_all(&project).unwrap();
         let path = project.join("tool-session.jsonl");
-        let assistant = serde_json::json!({
-            "type": "assistant",
-            "timestamp": "2026-04-13T10:00:00Z",
-            "message": {
-                "content": [
-                    {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "src/main.rs"}}
-                ]
-            }
-        });
-        let user = serde_json::json!({
-            "type": "user",
-            "timestamp": "2026-04-13T10:00:01Z",
-            "message": {
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "file body"}
-                ]
-            }
-        });
+        let large_content = "汉🦀".repeat(3000);
+        let cases = [
+            ("Read", serde_json::json!({"file_path": "src/main.rs"}), Some(false)),
+            (
+                "Edit",
+                serde_json::json!({"file_path": "src/main.rs", "old_string": "before", "new_string": "after"}),
+                Some(true),
+            ),
+            (
+                "Write",
+                serde_json::json!({"file_path": "src/other.rs", "content": large_content}),
+                None,
+            ),
+            (
+                "MultiEdit",
+                serde_json::json!({"file_path": "src/main.rs", "edits": [
+                    {"old_string": "before", "new_string": "after"},
+                    {"old_string": "first", "new_string": "second"}
+                ]}),
+                None,
+            ),
+        ];
         let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "{assistant}").unwrap();
-        writeln!(f, "{user}").unwrap();
+        let mut expected_calls = Vec::new();
+        let mut expected_results = Vec::new();
+        for (index, (name, input, is_error)) in cases.iter().enumerate() {
+            let call_id = format!("tool-{index}");
+            let call = serde_json::json!({
+                "type": "tool_use", "id": call_id, "name": name, "input": input
+            });
+            let mut assistant = serde_json::json!({
+                "type": "assistant", "isMeta": false,
+                "timestamp": "2026-04-13T10:00:00Z",
+                "message": {"content": [
+                    {"type": "text", "text": format!("Operation {index}")}, call.clone()
+                ]}
+            });
+            if index == 1 {
+                assistant["cwd"] = serde_json::json!("/tmp/target-worktree");
+            }
+            let mut result = serde_json::json!({
+                "type": "tool_result", "tool_use_id": call_id, "content": large_content
+            });
+            if let Some(value) = is_error {
+                result["is_error"] = serde_json::json!(value);
+            } else if index == 3 {
+                result["is_error"] = serde_json::json!("false");
+            }
+            let user = serde_json::json!({
+                "type": "user", "timestamp": "2026-04-13T10:00:01Z",
+                "message": {"content": [result.clone()]}
+            });
+            writeln!(f, "{assistant}").unwrap();
+            writeln!(f, "{user}").unwrap();
+            expected_calls.push(call);
+            expected_results.push(result);
+        }
         let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
         let entry = FileScanEntry {
             session_id: "tool-session".to_string(),
             stat_target: path.clone(),
-            directory: Some("/tmp/foo".to_string()),
+            directory: Some("/tmp/origin".to_string()),
         };
-        let indexes = SessionIndexes::default();
+        let indexes = SessionIndexes {
+            live: HashMap::from([(
+                "tool-session".to_string(),
+                SessionMeta {
+                    cwd: Some("/tmp/session-origin".to_string()),
+                    started_at: None,
+                    entrypoint: None,
+                },
+            )]),
+            project_summaries: HashMap::new(),
+        };
         let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
 
-        assert_eq!(raw.events.len(), 2);
-        assert_eq!(raw.events[0].kind, "file_read");
-        assert_eq!(raw.events[0].name.as_deref(), Some("Read"));
-        assert_eq!(raw.events[0].target.as_deref(), Some("src/main.rs"));
-        assert_eq!(raw.events[1].kind, "tool_result");
+        assert_eq!(raw.events.len(), cases.len() * 2);
+        assert_eq!(raw.directory.as_deref(), Some("/tmp/session-origin"));
+        for (index, (name, input, is_error)) in cases.iter().enumerate() {
+            let call = &raw.events[index * 2];
+            let result = &raw.events[index * 2 + 1];
+            assert_eq!(call.name.as_deref(), Some(*name));
+            assert_eq!(call.files.len(), 1);
+            assert_eq!(call.files[0].path, input["file_path"].as_str().unwrap());
+            assert_eq!(call.files[0].kind, FileEvidenceKind::Call);
+            assert_eq!(
+                call.files[0].operation,
+                if index == 0 { FileOperation::Read } else { FileOperation::Write }
+            );
+            assert_eq!(
+                call.files[0].cwd.as_deref(),
+                Some(if index == 0 { "/tmp/session-origin" } else { "/tmp/target-worktree" })
+            );
+            assert_eq!(call.is_meta, Some(false));
+            assert_eq!(call.message_seq, Some(index as u32));
+            assert_eq!(result.message_seq, call.message_seq);
+            assert_eq!(call.tool_call_id, result.tool_call_id);
+            assert_eq!(call.source_event_id, Some(format!("{}:1", index * 2)));
+            assert_eq!(result.source_event_id, Some(format!("{}:0", index * 2 + 1)));
+            assert_eq!(
+                result.status.as_deref(),
+                is_error.map(|value| if value { "error" } else { "success" })
+            );
+            assert!(result.files.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(call.attrs_json.as_deref().unwrap()).unwrap(),
+                expected_calls[index]
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(result.attrs_json.as_deref().unwrap()).unwrap(),
+                expected_results[index]
+            );
+        }
+        assert_eq!(raw.event_parser_version, Some(EVENT_PARSER_VERSION));
 
         let entry = FileScanEntry {
             session_id: "tool-session".to_string(),
             stat_target: path,
             directory: Some("/tmp/foo".to_string()),
         };
+        let without_index =
+            parse_claude_session_file(entry.clone(), mtime, &SessionIndexes::default(), true)
+                .unwrap()
+                .unwrap();
+        assert!(without_index.events[0].files[0].cwd.is_none());
+        assert_eq!(without_index.events[2].files[0].cwd.as_deref(), Some("/tmp/target-worktree"));
         let raw = parse_claude_session_file(entry, mtime, &indexes, false).unwrap().unwrap();
-
         assert!(raw.events.is_empty());
         assert_eq!(raw.event_parser_version, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_preserves_relationships_meta_and_source_order_anchors() {
+        let root = temp_claude_root("event-relationships");
+        let project = root.join("projects").join("-tmp-foo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("event-relationships.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-04-13T10:00:00Z",
+                "message": {"content": "Inspect the repository"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-04-13T10:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool-before",
+                            "name": "Read",
+                            "input": {"path": "Cargo.toml"}
+                        },
+                        {"type": "text", "text": "I found the manifest."},
+                        {
+                            "type": "tool_use",
+                            "id": "tool-after",
+                            "name": "Read",
+                            "input": {"path": "src/lib.rs"}
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "   ",
+                            "name": "Read",
+                            "input": {"path": "src/main.rs"}
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": 42,
+                            "name": "Read",
+                            "input": {"path": "src/cli.rs"}
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-04-13T10:00:02Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-after",
+                            "name": "Read result",
+                            "content": "library body"
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-before",
+                            "content": "manifest body"
+                        },
+                        {"type": "tool_result", "tool_use_id": "", "content": "empty id"},
+                        {"type": "tool_result", "tool_use_id": false, "content": "wrong id"}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isMeta": false,
+                "timestamp": "2026-04-13T10:00:03Z",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Continue."},
+                        {
+                            "type": "tool_use",
+                            "id": "tool-explicit-false",
+                            "name": "Glob",
+                            "input": {"pattern": "src/**/*.rs"}
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isMeta": true,
+                "timestamp": "2026-04-13T10:00:04Z",
+                "message": {"content": [{"type": "text", "text": "汉".repeat(5000)}]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "isCompactSummary": true,
+                "timestamp": "2026-04-13T10:00:05Z",
+                "message": {"content": "Compacted context"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isSidechain": true,
+                "timestamp": "2026-04-13T10:00:06Z",
+                "cwd": "/tmp/sidechain",
+                "message": {"content": [
+                    {"type": "text", "text": "Hidden sidechain"},
+                    {"type": "tool_use", "id": "hidden-edit", "name": "Edit", "input": {"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isMeta": true,
+                "isSidechain": true,
+                "timestamp": "2026-04-13T10:00:07Z",
+                "message": {"content": "Explicit sidechain metadata"}
+            }),
+        ];
+        let mut file = fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+
+        let parsed = parse_conversation_jsonl(&path, 0, true).unwrap();
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert!(parsed.messages.iter().all(|message| message.content != "Hidden sidechain"));
+        assert_eq!(parsed.usage_events.len(), 0);
+        assert_eq!(parsed.events.len(), 13);
+        assert_eq!(parsed.events[0].message_seq, Some(0));
+        assert_eq!(parsed.events[0].tool_call_id.as_deref(), Some("tool-before"));
+        assert_eq!(parsed.events[1].message_seq, Some(1));
+        assert_eq!(parsed.events[1].tool_call_id.as_deref(), Some("tool-after"));
+        assert_eq!(parsed.events[2].tool_call_id, None);
+        assert_eq!(parsed.events[3].tool_call_id, None);
+        assert_eq!(parsed.events[4].name.as_deref(), Some("Read result"));
+        assert_eq!(parsed.events[4].tool_call_id.as_deref(), Some("tool-after"));
+        assert_eq!(parsed.events[5].name, None);
+        assert_eq!(parsed.events[5].tool_call_id.as_deref(), Some("tool-before"));
+        assert_eq!(parsed.events[6].tool_call_id, None);
+        assert_eq!(parsed.events[7].tool_call_id, None);
+        assert_eq!(parsed.events[8].source_event_id.as_deref(), Some("3:1"));
+        assert_eq!(parsed.events[8].message_seq, Some(2));
+        assert_eq!(parsed.events[8].is_meta, Some(false));
+        assert_eq!(parsed.events[9].source_event_id.as_deref(), Some("4"));
+        assert_eq!(parsed.events[9].is_meta, Some(true));
+        assert_eq!(parsed.events[9].visibility, None);
+        let summary = parsed.events[9].summary.as_deref().unwrap();
+        assert!(summary.ends_with('…'));
+        assert!(summary.len() <= 4099);
+        assert_eq!(parsed.events[10].source_event_id.as_deref(), Some("5"));
+        assert_eq!(parsed.events[10].summary.as_deref(), Some("Compacted context"));
+        assert_eq!(parsed.events[10].is_meta, Some(true));
+        assert_eq!(parsed.events[11].visibility, Some(EvidenceVisibility::Hidden));
+        assert_eq!(parsed.events[11].message_seq, None);
+        assert_eq!(parsed.events[11].tool_call_id.as_deref(), Some("hidden-edit"));
+        assert_eq!(parsed.events[11].files[0].cwd.as_deref(), Some("/tmp/sidechain"));
+        assert_eq!(parsed.events[12].summary.as_deref(), Some("Explicit sidechain metadata"));
+        assert_eq!(parsed.events[12].is_meta, Some(true));
+        assert_eq!(parsed.events[12].visibility, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_claude_session_file_keeps_meta_event_only_transcript() {
+        let root = temp_claude_root("meta-event-only");
+        let project = root.join("projects").join("-tmp-foo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("meta-event-only.jsonl");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "isCompactSummary": true,
+            "timestamp": "2026-04-13T10:00:00Z",
+            "message": {"content": "Compacted context"}
+        });
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "{line}").unwrap();
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+        let entry = FileScanEntry {
+            session_id: "meta-event-only".to_string(),
+            stat_target: path,
+            directory: Some("/tmp/foo".to_string()),
+        };
+
+        let raw = parse_claude_session_file(entry, mtime, &SessionIndexes::default(), true)
+            .unwrap()
+            .unwrap();
+
+        assert!(raw.messages.is_empty());
+        assert!(raw.usage_events.is_empty());
+        assert_eq!(raw.events.len(), 1);
+        assert_eq!(raw.started_at, 1_776_074_400_000);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -853,23 +1375,12 @@ mod tests {
 
     fn make_existing_session(source_id: &str, updated_at: i64, message_count: u32) -> Session {
         Session {
-            id: format!("internal-{source_id}"),
             source: "claude-code".to_string(),
             source_id: source_id.to_string(),
             title: "existing".to_string(),
-            directory: None,
-            repo_remote: None,
-            repo_slug: None,
-            repo_name: None,
-            started_at: 0,
             updated_at: Some(updated_at),
             message_count,
-            entrypoint: None,
-            custom_title: None,
-            summary: None,
-            duration_minutes: None,
-            source_file_path: None,
-            is_import: false,
+            ..crate::types::test_support::session(&format!("internal-{source_id}"))
         }
     }
 
@@ -1011,132 +1522,68 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_session_file_prefers_explicit_title_over_latest_ai_title() {
+    fn parse_claude_session_prefers_ai_title_when_present() {
         let root = temp_claude_root("ai-title");
-        let project = root.join("projects").join("-tmp-ai-title");
+        let project = root.join("projects").join("-tmp-ai");
         fs::create_dir_all(&project).unwrap();
-        let path = project.join("ai-title-session.jsonl");
+        let path = project.join("ai-session.jsonl");
         let lines = [
-            serde_json::json!({
-                "type": "user",
-                "message": {"content": "real user prompt"},
-                "timestamp": "2026-04-13T10:00:00Z"
-            }),
-            serde_json::json!({
-                "type": "ai-title",
-                "aiTitle": "First generated title"
-            }),
-            serde_json::json!({
-                "type": "ai-title",
-                "aiTitle": "Final generated title"
-            }),
+            serde_json::json!({"type":"user","message":{"content":"start"},"timestamp":"2026-04-13T10:00:00Z"}),
+            serde_json::json!({"type":"ai-title","title":"Named by Claude"}),
+            serde_json::json!({"type":"assistant","message":{"content":"done"},"timestamp":"2026-04-13T10:00:01Z"}),
         ];
         let mut file = fs::File::create(&path).unwrap();
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
         let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        let indexes = SessionIndexes::default();
-        let entry = FileScanEntry {
-            session_id: "ai-title-session".to_string(),
-            stat_target: path.clone(),
-            directory: Some("/tmp/ai-title".to_string()),
-        };
-        let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
-        assert_eq!(raw.custom_title.as_deref(), Some("Final generated title"));
-
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({"type": "custom-title", "customTitle": "Manual title"})
+        let raw = parse_claude_session_file(
+            FileScanEntry {
+                session_id: "ai-session".to_string(),
+                stat_target: path,
+                directory: None,
+            },
+            mtime,
+            &SessionIndexes::default(),
+            false,
         )
+        .unwrap()
         .unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({"type": "ai-title", "aiTitle": "Later generated title"})
-        )
-        .unwrap();
-        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-        let entry = FileScanEntry {
-            session_id: "ai-title-session".to_string(),
-            stat_target: path,
-            directory: Some("/tmp/ai-title".to_string()),
-        };
-        let raw = parse_claude_session_file(entry, mtime, &indexes, true).unwrap().unwrap();
-        assert_eq!(raw.custom_title.as_deref(), Some("Manual title"));
-
+        assert_eq!(raw.custom_title.as_deref(), Some("Named by Claude"));
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn scan_for_sync_backfills_claude_ai_title_when_metadata_version_changes() {
-        let root = temp_claude_root("ai-title-backfill");
-        let project = root.join("projects").join("-tmp-ai-title");
+    fn parse_claude_session_prefers_explicit_title_over_later_ai_title() {
+        let root = temp_claude_root("title-precedence");
+        let project = root.join("projects").join("-tmp-title-precedence");
         fs::create_dir_all(&project).unwrap();
-        let path = project.join("ai-title-backfill.jsonl");
+        let path = project.join("title-session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","message":{"content":"start"},"timestamp":"2026-04-13T10:00:00Z"}),
+            serde_json::json!({"type":"ai-title","aiTitle":"Generated first"}),
+            serde_json::json!({"type":"custom-title","customTitle":"Manual title"}),
+            serde_json::json!({"type":"ai-title","aiTitle":"Generated later"}),
+            serde_json::json!({"type":"assistant","message":{"content":"done"},"timestamp":"2026-04-13T10:00:01Z"}),
+        ];
         let mut file = fs::File::create(&path).unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({
-                "type": "user",
-                "message": {"content": "real user prompt"},
-                "timestamp": "2026-04-13T10:00:00Z"
-            })
-        )
-        .unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({
-                "type": "ai-title",
-                "aiTitle": "cua-driver connect Claude Code and pi"
-            })
-        )
-        .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
         let mtime = file_scan::stat_mtime_ms(&path).unwrap();
-
-        let store = setup_store();
-        store.insert_session(&make_existing_session("ai-title-backfill", mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "claude-code",
-                "ai-title-backfill",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "claude-code",
-                "ai-title-backfill",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "claude-code",
-                "ai-title-backfill",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION - 1),
-                },
-            )
-            .unwrap();
-
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        assert_eq!(
-            result.sessions[0].custom_title.as_deref(),
-            Some("cua-driver connect Claude Code and pi")
-        );
-
+        let raw = parse_claude_session_file(
+            FileScanEntry {
+                session_id: "title-session".to_string(),
+                stat_target: path,
+                directory: None,
+            },
+            mtime,
+            &SessionIndexes::default(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw.custom_title.as_deref(), Some("Manual title"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1157,7 +1604,13 @@ mod tests {
         fs::write(project.join("sessions-index.json"), index.to_string()).unwrap();
 
         let store = setup_store();
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].summary.as_deref(), Some("Project index summary"));
@@ -1287,39 +1740,121 @@ mod tests {
 
         let store = setup_store();
         store.insert_session(&make_existing_session("sess-skip", mtime, 1)).unwrap();
-        store
-            .persist_usage_events_for_existing_session(
-                "claude-code",
-                "sess-skip",
-                &[],
-                USAGE_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_session_events_for_existing_session(
-                "claude-code",
-                "sess-skip",
-                &[],
-                EVENT_PARSER_VERSION,
-                Some(mtime),
-            )
-            .unwrap();
-        store
-            .persist_topology_for_existing_session(
-                "claude-code",
-                "sess-skip",
-                &crate::db::store::SessionTopologyWrite {
-                    thread_role: None,
-                    parents: &[],
-                    parser_version: Some(METADATA_PARSER_VERSION),
-                },
-            )
-            .unwrap();
+        seed_empty_usage_state(
+            &store,
+            "claude-code",
+            "sess-skip",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_event_state(
+            &store,
+            "claude-code",
+            "sess-skip",
+            EVENT_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_metadata_state(&store, "claude-code", "sess-skip", METADATA_PARSER_VERSION);
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 0);
         assert_eq!(result.stats.skipped_sessions, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_reparses_unchanged_session_for_ai_title_backfill() {
+        let root = temp_claude_root("ai-title-backfill");
+        let project = root.join("projects").join("-tmp-proj");
+        let path = write_user_jsonl(&project, "sess-ai-title", "hello");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"ai-title","title":"Named by Claude"}))
+            .unwrap();
+        drop(file);
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session("sess-ai-title", mtime, 1)).unwrap();
+        seed_empty_usage_state(
+            &store,
+            "claude-code",
+            "sess-ai-title",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_event_state(
+            &store,
+            "claude-code",
+            "sess-ai-title",
+            EVENT_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_metadata_state(&store, "claude-code", "sess-ai-title", 1);
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].custom_title.as_deref(), Some("Named by Claude"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_for_sync_reparses_unchanged_session_with_stale_event_parser() {
+        let root = temp_claude_root("event-parser-backfill");
+        let project = root.join("projects").join("-tmp-proj");
+        let path = write_user_jsonl(&project, "sess-event-backfill", "hello");
+        let mtime = file_scan::stat_mtime_ms(&path).unwrap();
+
+        let store = setup_store();
+        store.insert_session(&make_existing_session("sess-event-backfill", mtime, 1)).unwrap();
+        seed_empty_usage_state(
+            &store,
+            "claude-code",
+            "sess-event-backfill",
+            USAGE_PARSER_VERSION,
+            Some(mtime),
+        );
+        seed_empty_event_state(
+            &store,
+            "claude-code",
+            "sess-event-backfill",
+            EVENT_PARSER_VERSION - 1,
+            Some(mtime),
+        );
+        seed_empty_metadata_state(
+            &store,
+            "claude-code",
+            "sess-event-backfill",
+            METADATA_PARSER_VERSION,
+        );
+
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions[0].event_parser_version, Some(EVENT_PARSER_VERSION));
+        assert_eq!(result.sessions[0].messages.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "hello");
+        assert!(result.sessions[0].usage_events.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1336,7 +1871,13 @@ mod tests {
             .insert_session(&make_existing_session("sess-stale", actual_mtime - 1_000, 1))
             .unwrap();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-stale");
         assert_eq!(result.sessions[0].updated_at, Some(actual_mtime));
@@ -1353,12 +1894,145 @@ mod tests {
 
         let store = setup_store();
 
-        let result = scan_for_sync_impl(&root, &store, None, true).unwrap();
+        let result = scan_for_sync_impl(
+            &root,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.sessions.len(), 1);
         assert_eq!(result.sessions[0].source_id, "sess-fresh");
         assert_eq!(result.stats.skipped_sessions, 0);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_accepts_only_discovery_tool_input_and_deduplicates_a_session() {
+        let root = temp_claude_root("invocation-probe");
+        let project = root.join("projects").join("-tmp-probe");
+        let path = write_user_jsonl(&project, "claude-session", "normal nonce-claude reference");
+        let call = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "name": "mcp__recall__list_recent_sessions",
+                    "input": {"invocation_nonce": "nonce-claude"}
+                }]
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{call}").unwrap();
+        writeln!(file, "{call}").unwrap();
+
+        let result = probe_invocation_nonce_in(
+            std::slice::from_ref(&root),
+            "nonce-claude",
+            InvocationProbeBudget::default(),
+        );
+        assert!(result.complete);
+        assert_eq!(result.source_ids, vec!["claude-session".to_string()]);
+
+        let normal = probe_invocation_nonce_in(
+            std::slice::from_ref(&root),
+            "normal nonce-claude reference",
+            InvocationProbeBudget::default(),
+        );
+        assert!(normal.complete);
+        assert!(normal.source_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_reports_multiple_source_sessions_without_guessing() {
+        let root = temp_claude_root("invocation-probe-multiple");
+        let project = root.join("projects").join("-tmp-probe");
+        for session_id in ["claude-one", "claude-two"] {
+            let path = write_user_jsonl(&project, session_id, "ordinary");
+            let call = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "mcp__recall__search_sessions",
+                        "input": {"query": "history", "invocation_nonce": "nonce-shared"}
+                    }]
+                }
+            });
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(file, "{call}").unwrap();
+        }
+
+        let result = probe_invocation_nonce_in(
+            std::slice::from_ref(&root),
+            "nonce-shared",
+            InvocationProbeBudget::default(),
+        );
+        assert!(result.complete);
+        assert_eq!(result.source_ids.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invocation_probe_shares_budget_across_roots() {
+        let first = temp_claude_root("invocation-probe-budget-first");
+        let second = temp_claude_root("invocation-probe-budget-second");
+        for (root, prefix) in [(&first, "first"), (&second, "second")] {
+            let project = root.join("projects").join("-tmp-probe");
+            for index in 0..40 {
+                write_user_jsonl(&project, &format!("{prefix}-{index}"), "ordinary");
+            }
+        }
+
+        let result = probe_invocation_nonce_in(
+            &[first.clone(), second.clone()],
+            "absent-nonce",
+            InvocationProbeBudget::default(),
+        );
+        assert!(result.files_read <= 64);
+        assert!(!result.complete);
+
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn duplicate_session_ids_prefer_the_first_claude_root() {
+        let preferred = temp_claude_root("duplicate-preferred");
+        let fallback = temp_claude_root("duplicate-fallback");
+        write_user_jsonl(
+            &preferred.join("projects").join("-tmp-probe"),
+            "shared-session",
+            "preferred",
+        );
+        write_user_jsonl(
+            &fallback.join("projects").join("-tmp-probe"),
+            "shared-session",
+            "fallback",
+        );
+        let roots = [preferred.clone(), fallback.clone()];
+
+        let sessions = scan_claude_dirs(&roots).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages[0].content, "preferred");
+
+        let store = setup_store();
+        let result = scan_claude_dirs_for_sync(
+            &roots,
+            &AdapterSyncContext::from_store_for_test(&store, "claude-code").unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].messages[0].content, "preferred");
+
+        let _ = fs::remove_dir_all(preferred);
+        let _ = fs::remove_dir_all(fallback);
     }
 
     #[test]
