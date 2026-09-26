@@ -29,6 +29,11 @@ It never auto-merges the PR, never resets fork main to upstream, and never
 creates a release tag. Release and Scoop publication remain a separate,
 deliberate step after the sync PR has been reviewed.
 
+Repository settings required by this workflow are enabled on nonlog/Recall:
+GitHub Issues are enabled for conflict reports, and GitHub Actions is allowed to
+create pull requests. The workflow itself still requests only the contents,
+pull-requests, and issues permissions it needs.
+
 ## Conflict and regression behavior
 
 Synchronization is fail-closed.

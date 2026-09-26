@@ -21,6 +21,10 @@ Release commit: see tag `v0.6.2.2`
   compaction, native titles, TUI branding and host behavior, shortcut bindings,
   and Windows Skill Audit landmarks.
 - FORK_MAINTENANCE.md documents the automated and manual maintenance flow.
+- Repository settings were aligned with the workflow: Issues are enabled for
+  conflict reports, and GitHub Actions may create pull requests; default token
+  permissions remain read unless a workflow explicitly requests narrower write
+  scopes.
 
 
 ### 2026-09-26 local-only host-label cleanup
