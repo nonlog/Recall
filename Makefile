@@ -19,9 +19,9 @@ release: ## Release build (LTO + strip)
 
 # ── Quality ──────────────────────────────────────────────────────────────────
 
-.PHONY: check audit test lint fmt
+.PHONY: check contract audit test lint fmt
 
-check: audit ## Full quality gate — dependency audit, format, lint, test
+check: contract audit ## Full quality gate — fork contract, dependency audit, format, lint, test
 	@printf '\n$(BOLD)[2/4] Checking format$(RESET)\n'
 	$(CARGO) fmt --all -- --check
 	@printf '\n$(BOLD)[3/4] Running clippy$(RESET)\n'
@@ -29,6 +29,10 @@ check: audit ## Full quality gate — dependency audit, format, lint, test
 	@printf '\n$(BOLD)[4/4] Running tests$(RESET)\n'
 	$(CARGO) test --workspace
 	@printf '\n$(GREEN)  ✓ All checks passed$(RESET)\n\n'
+
+contract: ## Verify nonlog fork invariants before expensive checks
+	@printf '\n$(BOLD)[fork] Checking nonlog fork contract$(RESET)\n'
+	./scripts/check-fork-contract.sh
 
 audit: ## Check locked Rust dependencies for known vulnerabilities
 	@printf '\n$(BOLD)[1/4] Auditing dependencies$(RESET)\n'

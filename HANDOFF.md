@@ -8,6 +8,21 @@ Release commit: see tag `v0.6.2.2`
 
 ## Current fork policy
 
+### 2026-09-26 automated upstream-sync contract
+
+- Restored the fork's historical upstream-sync automation, upgraded for the
+  current multi-feature fork. It now tracks upstream main, creates a dedicated
+  review branch and PR, and never auto-merges into fork main.
+- Merge conflicts abort and create or update a needs-fork-review issue. A clean
+  merge that fails the executable fork contract is pushed only as a draft PR
+  and the workflow fails.
+- Added scripts/check-fork-contract.sh and wired it into make check, so CI and
+  release validation protect safe deletion, Windows persistence, summary
+  compaction, native titles, TUI branding and host behavior, shortcut bindings,
+  and Windows Skill Audit landmarks.
+- FORK_MAINTENANCE.md documents the automated and manual maintenance flow.
+
+
 ### 2026-09-26 local-only host-label cleanup
 
 - Upstream 0.6.x renders a host badge for every TUI row. Sessions without

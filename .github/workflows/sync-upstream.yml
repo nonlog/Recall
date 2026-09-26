@@ -1,0 +1,251 @@
+name: Prepare Upstream Sync PR
+
+on:
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream branch/ref to merge
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: prepare-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: samzong/Recall
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_REF}"
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          short_sha="${upstream_sha:0:12}"
+          base_sha="$(git rev-parse HEAD)"
+          branch="sync/upstream-${short_sha}"
+
+          echo "sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "base_sha=${base_sha}" >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream ${UPSTREAM_REF} at $upstream_sha"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure fork commit identity
+        if: steps.upstream.outputs.needed == 'true'
+        shell: bash
+        run: |
+          git config user.name "Codex"
+          git config user.email "codex@openai.com"
+
+      - name: Merge upstream into review branch
+        if: steps.upstream.outputs.needed == 'true'
+        id: merge
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          set +e
+          git merge --no-ff --no-commit "$UPSTREAM_SHA"
+          rc=$?
+          set -e
+
+          if (( rc != 0 )); then
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "conflict_files<<EOF"
+              cat "$RUNNER_TEMP/upstream-conflicts.txt"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            exit 0
+          fi
+
+          git commit -m "chore(sync): merge upstream main at ${SHORT_SHA}"
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+
+      - name: Open conflict issue
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+        run: |
+          set -euo pipefail
+          gh label create upstream-sync --repo "$GITHUB_REPOSITORY" \
+            --color 1d76db --description "Automated upstream synchronization" --force
+          gh label create needs-fork-review --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Fork invariants need manual review" --force
+
+          title="Upstream sync conflict: ${SHORT_SHA}"
+          body="$RUNNER_TEMP/conflict-body.md"
+          cat > "$body" <<EOF_BODY
+          Automated merge of ${UPSTREAM_REPO}:${UPSTREAM_REF} at
+          ${UPSTREAM_SHA} into the customized fork failed.
+
+          The fork main branch was not changed.
+
+          Conflicting files:
+
+          ${CONFLICT_FILES}
+
+          Resolve this manually. Before resolving, read FORK_FEATURES.md and
+          HANDOFF.md; preserve the listed behavior or prove upstream is
+          equivalent. Do not use an ours merge strategy or reset fork main to
+          upstream.
+          EOF_BODY
+
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body-file "$body" --add-label upstream-sync --add-label needs-fork-review
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body-file "$body" --label upstream-sync --label needs-fork-review
+          fi
+          exit 1
+
+      - name: Fork contract preflight
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true'
+        id: contract
+        shell: bash
+        run: |
+          set +e
+          ./scripts/check-fork-contract.sh 2>&1 | tee "$RUNNER_TEMP/fork-contract.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if (( rc == 0 )); then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push review branch
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push --force origin "HEAD:refs/heads/${BRANCH}"
+
+      - name: Create or refresh upstream sync PR
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true'
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+          CONTRACT_STATUS: ${{ steps.contract.outputs.status }}
+        run: |
+          set -euo pipefail
+          gh label create upstream-sync --repo "$GITHUB_REPOSITORY" \
+            --color 1d76db --description "Automated upstream synchronization" --force
+          gh label create needs-fork-review --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Fork invariants need manual review" --force
+
+          commits="$RUNNER_TEMP/upstream-commits.txt"
+          files="$RUNNER_TEMP/upstream-files.txt"
+          git log --oneline --no-merges "${BASE_SHA}..${UPSTREAM_SHA}" | head -100 > "$commits" || true
+          git diff --name-only "${BASE_SHA}..HEAD" | head -250 > "$files"
+
+          body="$RUNNER_TEMP/upstream-pr.md"
+          {
+            echo "Automated merge candidate for ${UPSTREAM_REPO}:${UPSTREAM_REF}."
+            echo
+            echo "- upstream SHA: ${UPSTREAM_SHA}"
+            echo "- fork base SHA: ${BASE_SHA}"
+            echo "- fork-contract preflight: **${CONTRACT_STATUS}**"
+            echo "- merge policy: **manual review required; this workflow never auto-merges**"
+            echo
+            echo "Normal PR CI runs make check, which includes the executable fork contract."
+            echo "If upstream refactored a fork landmark, review FORK_FEATURES.md and"
+            echo "HANDOFF.md before resolving it."
+            echo
+            echo "<details><summary>Upstream commits not already in fork main</summary>"
+            echo
+            cat "$commits"
+            echo
+            echo "</details>"
+            echo
+            echo "<details><summary>Files changed by the merge candidate</summary>"
+            echo
+            cat "$files"
+            echo
+            echo "</details>"
+          } > "$body"
+
+          title="chore(sync): merge upstream main at ${SHORT_SHA}"
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --head "$BRANCH" --json number --jq '.[0].number // empty')"
+
+          if [[ -n "$existing" ]]; then
+            gh pr edit "$existing" --repo "$GITHUB_REPOSITORY" \
+              --title "$title" --body-file "$body" --add-label upstream-sync
+            pr_number="$existing"
+          else
+            args=(--repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "$title" --body-file "$body" --label upstream-sync)
+            if [[ "$CONTRACT_STATUS" != "pass" ]]; then
+              args+=(--draft)
+            fi
+            pr_url="$(gh pr create "${args[@]}")"
+            pr_number="$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          fi
+
+          if [[ "$CONTRACT_STATUS" != "pass" ]]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --add-label needs-fork-review
+          else
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --remove-label needs-fork-review \
+              >/dev/null 2>&1 || true
+          fi
+
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+          gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json url --jq .url
+
+      - name: Fail when fork contract preflight regressed
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status != 'pass'
+        shell: bash
+        run: |
+          echo "::error::The upstream merge was pushed as a draft PR, but the fork contract preflight failed."
+          exit 1
+
+      - name: No upstream changes
+        if: steps.upstream.outputs.needed != 'true'
+        run: echo "No upstream synchronization PR is needed."

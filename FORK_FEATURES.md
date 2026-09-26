@@ -22,6 +22,21 @@ Before merging or rebasing a new upstream release:
 6. For commits created by an agent, author and committer must both be
    `Codex <codex@openai.com>`.
 
+## Automated upstream-sync guard
+
+- .github/workflows/sync-upstream.yml checks upstream main daily and on demand,
+  merges it only into a dedicated review branch, and opens or refreshes a PR.
+  It never auto-merges or pushes upstream directly to fork main.
+- Merge conflicts abort and create or update a needs-fork-review issue instead
+  of guessing a resolution.
+- scripts/check-fork-contract.sh is part of make check. A clean Git merge that
+  removes a fork invariant therefore still fails CI; the sync workflow leaves
+  such a candidate as a draft PR for manual review.
+- Automated merge commits use Codex <codex@openai.com> as both author and
+  committer.
+- Landmarks: .github/workflows/sync-upstream.yml,
+  scripts/check-fork-contract.sh, FORK_MAINTENANCE.md.
+
 ## Retained fork features
 
 ### Safe session deletion
