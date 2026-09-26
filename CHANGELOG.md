@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2.2] (2026-09-26)
+
+### nonlog fork
+
+* Hide the TUI host badge when a session has no location metadata instead of rendering [unknown].
+* Keep real host labels visible for remote/multi-host sessions and preserve the +N versions indicator independently.
+
 ## [0.6.2.1] (2026-09-25)
 
 ### nonlog fork
