@@ -21,9 +21,10 @@ The workflow:
    branch;
 4. commits that merge as Codex <codex@openai.com>;
 5. runs the fast executable fork-contract preflight;
-6. pushes only the review branch and opens or refreshes a PR against fork main;
-7. relies on normal PR CI (make check) for the complete Rust audit, format,
-   clippy, tests, and fork contract.
+6. pushes only the review branch;
+7. runs the complete make check gate inside the sync workflow itself;
+8. opens or refreshes a PR against fork main, leaving failed candidates as
+   draft PRs labeled needs-fork-review.
 
 It never auto-merges the PR, never resets fork main to upstream, and never
 creates a release tag. Release and Scoop publication remain a separate,
@@ -47,8 +48,11 @@ candidate is still pushed for inspection, but its PR is opened as a draft,
 labeled needs-fork-review, and the sync workflow fails. This catches semantic
 fork regressions that do not produce textual merge conflicts.
 
-Normal CI also runs the contract checker through make check, so manually
-written PRs and release tags cannot silently bypass the fork contract.
+The sync workflow runs the complete make check itself because pull requests
+created by GITHUB_TOKEN do not recursively trigger ordinary pull_request
+workflows. Normal CI also runs the contract checker through make check, so
+manually written PRs and later pushes/releases cannot silently bypass the fork
+contract.
 
 ## Fork contract
 

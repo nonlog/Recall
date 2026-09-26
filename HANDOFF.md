@@ -16,10 +16,14 @@ Release commit: see tag `v0.6.2.2`
 - Merge conflicts abort and create or update a needs-fork-review issue. A clean
   merge that fails the executable fork contract is pushed only as a draft PR
   and the workflow fails.
-- Added scripts/check-fork-contract.sh and wired it into make check, so CI and
-  release validation protect safe deletion, Windows persistence, summary
-  compaction, native titles, TUI branding and host behavior, shortcut bindings,
-  and Windows Skill Audit landmarks.
+- Added scripts/check-fork-contract.sh and wired it into make check. The sync
+  workflow also runs the complete make check itself because GITHUB_TOKEN-created
+  PRs do not recursively trigger ordinary PR CI. Failed candidates stay as
+  draft PRs. Normal CI and release validation continue to protect manually
+  created PRs and later pushes/releases.
+- The contract protects safe deletion, Windows persistence, summary compaction,
+  native titles, TUI branding and host behavior, shortcut bindings, and Windows
+  Skill Audit landmarks.
 - FORK_MAINTENANCE.md documents the automated and manual maintenance flow.
 - Repository settings were aligned with the workflow: Issues are enabled for
   conflict reports, and GitHub Actions may create pull requests; default token

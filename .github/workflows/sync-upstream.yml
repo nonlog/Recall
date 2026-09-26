@@ -162,6 +162,34 @@ jobs:
           set -euo pipefail
           git push --force origin "HEAD:refs/heads/${BRANCH}"
 
+      # PRs created with GITHUB_TOKEN do not recursively trigger ordinary
+      # pull_request workflows. Validate the merge candidate here so automated
+      # syncs receive the same expensive gate without requiring a PAT.
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status == 'pass'
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status == 'pass'
+        with:
+          shared-key: upstream-sync
+          save-if: false
+
+      - name: Install audit tool
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status == 'pass'
+        continue-on-error: true
+        id: audit_tool
+        shell: bash
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Validate merged fork
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status == 'pass' && steps.audit_tool.outcome == 'success'
+        id: validate
+        continue-on-error: true
+        shell: bash
+        run: make check
+
       - name: Create or refresh upstream sync PR
         if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true'
         id: pr
@@ -173,12 +201,22 @@ jobs:
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
           SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
           CONTRACT_STATUS: ${{ steps.contract.outputs.status }}
+          AUDIT_TOOL_STATUS: ${{ steps.audit_tool.outcome }}
+          VALIDATION_STATUS: ${{ steps.validate.outcome }}
         run: |
           set -euo pipefail
           gh label create upstream-sync --repo "$GITHUB_REPOSITORY" \
             --color 1d76db --description "Automated upstream synchronization" --force
           gh label create needs-fork-review --repo "$GITHUB_REPOSITORY" \
             --color d93f0b --description "Fork invariants need manual review" --force
+
+          if [[ "$CONTRACT_STATUS" == "pass" \
+             && "$AUDIT_TOOL_STATUS" == "success" \
+             && "$VALIDATION_STATUS" == "success" ]]; then
+            overall_status="pass"
+          else
+            overall_status="fail"
+          fi
 
           commits="$RUNNER_TEMP/upstream-commits.txt"
           files="$RUNNER_TEMP/upstream-files.txt"
@@ -189,25 +227,33 @@ jobs:
           {
             echo "Automated merge candidate for ${UPSTREAM_REPO}:${UPSTREAM_REF}."
             echo
-            echo "- upstream SHA: ${UPSTREAM_SHA}"
-            echo "- fork base SHA: ${BASE_SHA}"
+            echo "- upstream SHA: \`${UPSTREAM_SHA}\`"
+            echo "- fork base SHA: \`${BASE_SHA}\`"
             echo "- fork-contract preflight: **${CONTRACT_STATUS}**"
+            echo "- audit-tool setup: **${AUDIT_TOOL_STATUS:-skipped}**"
+            echo "- full \`make check\`: **${VALIDATION_STATUS:-skipped}**"
+            echo "- overall automated validation: **${overall_status}**"
             echo "- merge policy: **manual review required; this workflow never auto-merges**"
             echo
-            echo "Normal PR CI runs make check, which includes the executable fork contract."
-            echo "If upstream refactored a fork landmark, review FORK_FEATURES.md and"
-            echo "HANDOFF.md before resolving it."
+            echo "The sync workflow runs the complete \`make check\` itself because PRs"
+            echo "created by \`GITHUB_TOKEN\` do not recursively trigger ordinary PR CI."
+            echo "Normal CI still protects manually created PRs and later pushes/releases."
+            echo
+            echo "If upstream refactored a fork landmark, review \`FORK_FEATURES.md\` and"
+            echo "\`HANDOFF.md\` before resolving it."
             echo
             echo "<details><summary>Upstream commits not already in fork main</summary>"
             echo
+            echo '```'
             cat "$commits"
-            echo
+            echo '```'
             echo "</details>"
             echo
             echo "<details><summary>Files changed by the merge candidate</summary>"
             echo
+            echo '```'
             cat "$files"
-            echo
+            echo '```'
             echo "</details>"
           } > "$body"
 
@@ -222,28 +268,31 @@ jobs:
           else
             args=(--repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
               --title "$title" --body-file "$body" --label upstream-sync)
-            if [[ "$CONTRACT_STATUS" != "pass" ]]; then
+            if [[ "$overall_status" != "pass" ]]; then
               args+=(--draft)
             fi
             pr_url="$(gh pr create "${args[@]}")"
             pr_number="$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
           fi
 
-          if [[ "$CONTRACT_STATUS" != "pass" ]]; then
+          if [[ "$overall_status" != "pass" ]]; then
             gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --add-label needs-fork-review
+            gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY" --undo >/dev/null 2>&1 || true
           else
             gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --remove-label needs-fork-review \
               >/dev/null 2>&1 || true
+            gh pr ready "$pr_number" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
           fi
 
           echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "overall_status=$overall_status" >> "$GITHUB_OUTPUT"
           gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json url --jq .url
 
-      - name: Fail when fork contract preflight regressed
-        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status != 'pass'
+      - name: Fail when automated validation regressed
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.pr.outputs.overall_status != 'pass'
         shell: bash
         run: |
-          echo "::error::The upstream merge was pushed as a draft PR, but the fork contract preflight failed."
+          echo "::error::The upstream merge candidate is preserved as a draft PR because fork validation failed or could not run."
           exit 1
 
       - name: No upstream changes
