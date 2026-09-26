@@ -103,7 +103,9 @@ when title parsing changes so unchanged files backfill correctly.
 
 - Keep per-source colors/icons with terminal-safe fallbacks.
 - `RECALL_ICON_STYLE` remains the user fallback control.
-- Landmark: `src/tui/source_brand.rs` and its callers/tests.
+- Do not render an `[unknown]` host badge when a session has no location
+  metadata. Real host labels remain visible when location metadata exists.
+- Landmarks: `src/tui/source_brand.rs`, `src/tui/ui/search.rs`, and their callers/tests.
 
 ### Shortcut UX
 

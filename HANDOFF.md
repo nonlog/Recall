@@ -1,12 +1,22 @@
 # Recall fork handoff
 
-Last updated: 2026-09-25
+Last updated: 2026-09-26
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall main at `eac6975ff652b6f750b440979f55d20574b64790` (version 0.6.2)
 Fork release: `v0.5.8.7`
 Release commit: `ed37095b31e0c7b80f4913d50c0f75865dcf49cc`
 
 ## Current fork policy
+
+### 2026-09-26 local-only host-label cleanup
+
+- Upstream 0.6.x renders a host badge for every TUI row. Sessions without
+  `session_locations` therefore showed `[unknown]` on LOG even though the
+  session source/title metadata was intact.
+- Fork behavior now suppresses the host badge when `locations` is empty, while
+  retaining real host labels for remote/multi-host sessions and retaining the
+  `+N versions` indicator independently.
+
 
 ### 2026-09-25 upstream-main migration and Codex completeness
 

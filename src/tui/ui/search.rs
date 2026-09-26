@@ -11,7 +11,7 @@ use crate::tui::search_state::{FilterFocus, PanelFocus};
 use crate::tui::source_brand::source_brand;
 use crate::tui::text_layout::wrap_visual_rows;
 use crate::tui::theme::THEME;
-use crate::types::Role;
+use crate::types::{Role, Session};
 
 use super::popups::render_status_bar;
 use super::{render_vertical_scrollbar, row_visible, truncate_label};
@@ -155,6 +155,18 @@ pub(super) fn render_filter_overview(f: &mut Frame, app: &App) {
     f.render_widget(widget, popup);
 }
 
+fn session_metadata_prefix(session: &Session) -> String {
+    let mut prefix = String::new();
+    if !session.locations.is_empty() {
+        let host = crate::host::label(&session.locations).chars().take(18).collect::<String>();
+        prefix.push_str(&format!("[{host}] "));
+    }
+    if session.alternative_versions > 0 {
+        prefix.push_str(&format!("+{} versions ", session.alternative_versions));
+    }
+    prefix
+}
+
 fn filter_overview_line(
     label: &'static str,
     value: &str,
@@ -241,15 +253,7 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    format!(
-                        "[{}] {}",
-                        crate::host::label(&s.locations).chars().take(18).collect::<String>(),
-                        if s.alternative_versions > 0 {
-                            format!("+{} versions ", s.alternative_versions)
-                        } else {
-                            String::new()
-                        }
-                    ),
+                    session_metadata_prefix(s),
                     if selected {
                         selected_text_style
                     } else {
@@ -381,4 +385,42 @@ pub(super) fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     let p = Paragraph::new(lines).block(block).scroll((viewport_start as u16, 0));
     f.render_widget(p, area);
     render_vertical_scrollbar(f, area, pane.total_rows(), inner.height as usize, viewport_start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::{Host, Location};
+    use crate::types::test_support;
+
+    #[test]
+    fn session_metadata_prefix_hides_missing_host() {
+        let session = test_support::session("s1");
+        assert!(session.locations.is_empty());
+        assert_eq!(session_metadata_prefix(&session), "");
+    }
+
+    #[test]
+    fn session_metadata_prefix_keeps_real_host_and_versions() {
+        let mut session = test_support::session("s1");
+        session.locations.push(Location {
+            host: Host {
+                id: "00000000-0000-0000-0000-000000000001".into(),
+                name: "Log".into(),
+                revision: 1,
+            },
+            directory: None,
+            source_file_path: None,
+            observed_at: 0,
+        });
+        session.alternative_versions = 2;
+        assert_eq!(session_metadata_prefix(&session), "[Log] +2 versions ");
+    }
+
+    #[test]
+    fn session_metadata_prefix_keeps_versions_without_host() {
+        let mut session = test_support::session("s1");
+        session.alternative_versions = 2;
+        assert_eq!(session_metadata_prefix(&session), "+2 versions ");
+    }
 }
