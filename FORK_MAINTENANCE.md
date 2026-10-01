@@ -36,12 +36,14 @@ create pull requests. The workflow itself still requests only the contents,
 pull-requests, and issues permissions it needs.
 
 The review-branch push uses a repository-scoped write deploy key stored as the
-Actions secret `UPSTREAM_SYNC_DEPLOY_KEY`. This is required because
+single-line base64 Actions secret `UPSTREAM_SYNC_DEPLOY_KEY_B64`. Base64 is
+intentional: it preserves the exact OpenSSH private-key bytes across secret
+transport and avoids newline/encoding corruption. This is required because
 `GITHUB_TOKEN` cannot create or update commits that modify
 `.github/workflows/*`. Checkout uses `persist-credentials: false`; the deploy
-key is materialized only for the single review-branch push step and is deleted
-before the merged candidate runs `make check`. Do not reuse this key for
-release, main-branch, or runtime deployment operations.
+key is decoded and validated only for the single review-branch push step, then
+deleted before the merged candidate runs `make check`. Do not reuse this key
+for release, main-branch, or runtime deployment operations.
 
 ## Conflict and regression behavior
 

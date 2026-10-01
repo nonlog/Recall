@@ -20,7 +20,13 @@ Release commit: see tag `v0.6.2.2`
   written to a temporary file only in the review-branch push step, removed
   immediately afterward, and is not available while merged candidate code runs
   `make check`.
-- Fork contract now verifies these authentication-isolation landmarks.
+- The first multiline private-key secret attempt was rejected by Linux OpenSSH
+  with `error in libcrypto` after secret transport altered the key bytes. The
+  production secret is now `UPSTREAM_SYNC_DEPLOY_KEY_B64`: a single-line
+  base64 encoding that the workflow decodes and validates with `ssh-keygen -y`
+  before push.
+- Fork contract now verifies these authentication-isolation and key-integrity
+  landmarks.
 
 
 ### 2026-09-26 automated upstream-sync contract

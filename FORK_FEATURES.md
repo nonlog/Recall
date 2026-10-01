@@ -34,8 +34,9 @@ Before merging or rebasing a new upstream release:
   such a candidate as a draft PR for manual review.
 - Automated merge commits use Codex <codex@openai.com> as both author and
   committer.
-- Review-branch pushes use the dedicated `UPSTREAM_SYNC_DEPLOY_KEY` SSH deploy
-  key so upstream changes to `.github/workflows/*` can be represented without
+- Review-branch pushes use the dedicated `UPSTREAM_SYNC_DEPLOY_KEY_B64` SSH
+  deploy-key secret so upstream changes to `.github/workflows/*` can be
+  represented without
   granting the merged candidate persistent `GITHUB_TOKEN` git credentials.
 - Landmarks: .github/workflows/sync-upstream.yml,
   scripts/check-fork-contract.sh, FORK_MAINTENANCE.md.
