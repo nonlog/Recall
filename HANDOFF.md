@@ -8,6 +8,21 @@ Release commit: see tag `v0.6.2.2`
 
 ## Current fork policy
 
+### 2026-10-01 upstream workflow-file push authentication
+
+- Scheduled upstream sync failed when upstream commit `b44103999f6d...`
+  modified `.github/workflows/build-binaries.yml` and `.github/workflows/ci.yml`.
+  GitHub rejected the review-branch push because `GITHUB_TOKEN` cannot be
+  granted the GitHub App `Workflows` repository permission.
+- Added the repository-scoped write deploy key `Recall upstream sync workflow
+  writer`, stored only as Actions secret `UPSTREAM_SYNC_DEPLOY_KEY`.
+- `actions/checkout` now uses `persist-credentials: false`. The deploy key is
+  written to a temporary file only in the review-branch push step, removed
+  immediately afterward, and is not available while merged candidate code runs
+  `make check`.
+- Fork contract now verifies these authentication-isolation landmarks.
+
+
 ### 2026-09-26 automated upstream-sync contract
 
 - Restored the fork's historical upstream-sync automation, upgraded for the

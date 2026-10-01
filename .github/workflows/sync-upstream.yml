@@ -33,6 +33,9 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # Do not leave GITHUB_TOKEN credentials in git config. The merged
+          # upstream candidate is untrusted until validation completes.
+          persist-credentials: false
 
       - name: Fetch upstream
         id: upstream
@@ -158,9 +161,35 @@ jobs:
         shell: bash
         env:
           BRANCH: ${{ steps.upstream.outputs.branch }}
+          UPSTREAM_SYNC_DEPLOY_KEY: ${{ secrets.UPSTREAM_SYNC_DEPLOY_KEY }}
         run: |
           set -euo pipefail
+
+          if [[ -z "${UPSTREAM_SYNC_DEPLOY_KEY:-}" ]]; then
+            echo "::error::UPSTREAM_SYNC_DEPLOY_KEY is not configured."
+            exit 1
+          fi
+
+          # GITHUB_TOKEN cannot push commits that add or modify
+          # .github/workflows/*. Use the repository-scoped write deploy key
+          # only for this review-branch push, then remove it before any merged
+          # candidate code is executed by make check.
+          key_file="$RUNNER_TEMP/upstream-sync-deploy-key"
+          cleanup() {
+            rm -f "$key_file"
+          }
+          trap cleanup EXIT
+
+          umask 077
+          printf '%s\n' "$UPSTREAM_SYNC_DEPLOY_KEY" > "$key_file"
+          chmod 600 "$key_file"
+
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           git push --force origin "HEAD:refs/heads/${BRANCH}"
+
+          cleanup
+          trap - EXIT
 
       # PRs created with GITHUB_TOKEN do not recursively trigger ordinary
       # pull_request workflows. Validate the merge candidate here so automated

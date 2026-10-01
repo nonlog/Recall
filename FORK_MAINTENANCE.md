@@ -35,6 +35,14 @@ GitHub Issues are enabled for conflict reports, and GitHub Actions is allowed to
 create pull requests. The workflow itself still requests only the contents,
 pull-requests, and issues permissions it needs.
 
+The review-branch push uses a repository-scoped write deploy key stored as the
+Actions secret `UPSTREAM_SYNC_DEPLOY_KEY`. This is required because
+`GITHUB_TOKEN` cannot create or update commits that modify
+`.github/workflows/*`. Checkout uses `persist-credentials: false`; the deploy
+key is materialized only for the single review-branch push step and is deleted
+before the merged candidate runs `make check`. Do not reuse this key for
+release, main-branch, or runtime deployment operations.
+
 ## Conflict and regression behavior
 
 Synchronization is fail-closed.
