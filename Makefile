@@ -68,24 +68,13 @@ doc: ## Generate API documentation
 
 install: ## Install binaries to ~/.cargo/bin
 	$(CARGO) install --path . --locked
-	$(CARGO) install --path crates/rx --locked
-	ln -sfn rx "$(HOME)/.cargo/bin/rxc"
-	ln -sfn rx "$(HOME)/.cargo/bin/rxx"
-	ln -sfn rx "$(HOME)/.cargo/bin/rxo"
-	ln -sfn rx "$(HOME)/.cargo/bin/rxp"
-	ln -sfn rx "$(HOME)/.cargo/bin/rxd"
-	ln -sfn rx "$(HOME)/.cargo/bin/rxk"
 	@if [ -d "$(HOME)/.zsh/completions" ]; then \
 		"$(HOME)/.cargo/bin/recall" completions zsh > "$(HOME)/.zsh/completions/_recall"; \
 		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_recall$(RESET)\n'; \
-		"$(HOME)/.cargo/bin/rx" completions zsh > "$(HOME)/.zsh/completions/_rx"; \
-		printf '$(GREEN)  ✓ Updated ~/.zsh/completions/_rx$(RESET)\n'; \
 	fi
 
 uninstall: ## Remove installed binaries
 	$(CARGO) uninstall recall
-	$(CARGO) uninstall rx
-	rm -f "$(HOME)/.cargo/bin/rxc" "$(HOME)/.cargo/bin/rxx" "$(HOME)/.cargo/bin/rxo" "$(HOME)/.cargo/bin/rxp" "$(HOME)/.cargo/bin/rxd" "$(HOME)/.cargo/bin/rxk"
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 
@@ -127,6 +116,6 @@ clean: ## Remove build artifacts
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*## "; printf "\n$(BOLD)Recall$(RESET) — local-first AI session search\n"} \
-		/^# ── / {n = $$0; gsub(/(^# ── | ─+$$)/, "", n); printf "\n$(BOLD)%s$(RESET)\n", n} \
+		/^# ── / {n = $$0; gsub(/(^# ── | (─)+$$)/, "", n); printf "\n$(BOLD)%s$(RESET)\n", n} \
 		/^[a-zA-Z_-]+:.*## / {printf "  $(CYAN)make %-12s$(RESET) %s\n", $$1, $$2} \
 		END {printf "\n"}' $(MAKEFILE_LIST)
