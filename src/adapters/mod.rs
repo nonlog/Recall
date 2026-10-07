@@ -37,6 +37,7 @@ pub(crate) mod roo;
 pub(crate) mod sync_state;
 pub(crate) mod trae_cli;
 pub(crate) mod usage;
+pub(crate) mod warp;
 pub(crate) mod zcode;
 pub(crate) mod zed;
 
@@ -455,6 +456,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(trae_cli::TraeCliAdapter),
         Box::new(junie::JunieAdapter),
         Box::new(zed::ZedAdapter),
+        Box::new(warp::WarpAdapter),
     ]
 }
 
@@ -505,6 +507,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "trae-cli"
             | "junie"
             | "zed"
+            | "warp"
     )
 }
 
