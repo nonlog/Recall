@@ -33,6 +33,7 @@ mod pi_session;
 pub(crate) mod qwen;
 pub(crate) mod roo;
 pub(crate) mod sync_state;
+pub(crate) mod trae_cli;
 pub(crate) mod usage;
 pub(crate) mod zcode;
 
@@ -445,6 +446,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(devin::DevinAdapter),
         Box::new(muse_code::MuseCodeAdapter),
         Box::new(codebuddy::CodeBuddyAdapter),
+        Box::new(trae_cli::TraeCliAdapter),
     ]
 }
 
@@ -491,6 +493,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "omp"
             | "muse-code"
             | "codebuddy"
+            | "trae-cli"
     )
 }
 
