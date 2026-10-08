@@ -1,10 +1,10 @@
 # Recall fork handoff
 
-Last updated: 2026-09-26
+Last updated: 2026-10-08
 Repository: https://github.com/nonlog/Recall
-Upstream baseline: samzong/Recall main at `eac6975ff652b6f750b440979f55d20574b64790` (version 0.6.2)
-Fork release: `v0.6.2.2`
-Release commit: see tag `v0.6.2.2`
+Upstream baseline: samzong/Recall main at `a1f0ba53e714f2de2add48b43040135b94662d3e` (version 0.6.3)
+Fork release: `v0.6.3.1`
+Release commit: see tag `v0.6.3.1`
 
 ## Current fork policy
 
@@ -23,9 +23,14 @@ Release commit: see tag `v0.6.2.2`
   are refreshed after scanning. Tests cover state/index precedence, Trae
   isolation, streaming, and rename backfill.
 - Upstream moved rx to `samzong/rx` and no longer packages `rx.exe` with Recall.
-  The `nonlog/scoop-www` bucket must publish a standalone `www/rx` manifest with
-  the existing seven command aliases and update `www/recall` only when the new
-  release artifact is published. `persist: [trash, data]` must be retained.
+  The `nonlog/scoop-www` bucket now publishes standalone `www/rx` v0.1.0 with
+  all seven command aliases (PR #1; Windows Actions validated). Update
+  `www/recall` only after the new release asset is published, remove its old
+  rx.exe shims, and depend on `www/rx` to preserve existing users' commands.
+  `persist: [trash, data]` must be retained.
+- Initial GitHub PR #29 failed when the upstream Zed adapter omitted the fork's
+  `SourceObservation.custom_title`. Fixed the initializer with `None`; the
+  follow-up GitHub `make check` passed at commit `b800c598`.
 - GitHub Actions is the exclusive build/test system for this integration.
   The integration and release status must be confirmed from CI and release
   metadata before updating the deployed manifest.

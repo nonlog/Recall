@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.3.1] (2026-10-08)
+
+### nonlog fork
+
+* Integrate upstream Recall main on 0.6.3, including the shared Codex/Trae rollout parser and new agent adapters.
+* Preserve Codex native titles from `state_5.sqlite` and the latest `session_index.jsonl` rename, including streamed sessions and unchanged-session metadata refresh.
+* Retain native-safe deletion, TUI source branding, Windows persisted `data`/`trash`, and the other fork contracts.
+* Include the upstream Zed adapter fix for the fork's `custom_title` observation field.
+* Separate `rx` into the independent `www/rx` Scoop package, keeping the seven original harness command aliases.
+* Continue strict CodSpeed benchmark compilation while skipping the fork's unauthorized cloud upload.
+
 ## [0.6.2.2] (2026-09-26)
 
 ### nonlog fork
