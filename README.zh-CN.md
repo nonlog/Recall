@@ -30,6 +30,27 @@ recall share unpublish <share-id> --yes  # 下线一个公开页面
 recall info  # 索引统计与 worker 状态
 ```
 
+### 终端中的 Agent 图标
+
+`nonlog/Recall` 分支支持与 [herdr-radar](https://github.com/hhdebb/herdr-radar)
+一致的 Agent Logo。终端已能正确显示 **Herdr Agent Icons Max** 字体的
+`U+E1A0–U+E1BA` 图标时，可启用：
+
+```powershell
+$env:RECALL_ICON_STYLE = 'herdr'
+recall
+```
+
+若需要在以后启动的 Windows Terminal 会话中持续启用，可运行
+`[Environment]::SetEnvironmentVariable('RECALL_ICON_STYLE', 'herdr', 'User')`，
+再新开终端。Windows Terminal 不支持按 Unicode 码位指定字体，需要使用确实能
+显示这些图标的主字体／后备字体配置；herdr-radar 提供的合并字体
+`JetBrains Mono Herdr` 是一种选择。**仅安装独立图标字体不保证 WT 能正确选中它。**
+
+此模式需要显式启用，因为 Recall 无法可靠检测终端的字体回退行为。Herdr 未覆盖
+的 Agent 继续显示原有 Unicode 图标，默认 Nerd Font 模式与
+`RECALL_ICON_STYLE=plain` 都不改变。Recall 不安装或再分发 Herdr 字体。
+
 ### 删除会话
 
 `recall session delete` 会从 Recall 删除指定会话；当来源存在安全的原生删除方式时，也会同步删除对应 Agent 的原始会话。

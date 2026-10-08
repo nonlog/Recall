@@ -8,6 +8,19 @@ Release commit: see tag `v0.6.3.1`
 
 ## Current fork policy
 
+### 2026-10-08 optional Herdr agent icons for the Windows TUI
+
+- Map exact agent IDs to the `hhdebb/herdr-radar` `lib/logos.js` PUA glyphs
+  (U+E1A0–U+E1BA), guarded behind `RECALL_ICON_STYLE=herdr`.
+- The existing default Nerd/unicode source icons, colours, search rows and
+  delete dialogs remain unchanged. Unmapped sources fall back to plain Unicode
+  rather than emitting an unrelated vendor's mark.
+- Herdr and JetBrains Mono Herdr are *user-installed terminal fonts*, not
+  bundled application dependencies. Windows Terminal cannot force per-codepoint
+  font mapping; a configured and working icon-capable font is required.
+- Regression tests guard 22 exact source-to-glyph mappings, cell width, missing
+  vendor fallback, and the existing icon-style aliases. Only CI builds/tests.
+
 ### 2026-10-08 upstream 0.6.3 integration and rx separation
 
 - Integration target: upstream `samzong/Recall:main` at

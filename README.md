@@ -35,6 +35,31 @@ recall share unpublish <share-id> --yes  # take down one public page
 recall info  # index stats and worker status
 ```
 
+### Agent icons in terminal UI
+
+The customized `nonlog/Recall` fork can show the same agent logos as
+[herdr-radar](https://github.com/hhdebb/herdr-radar). If your terminal is
+configured to render the **Herdr Agent Icons Max** glyphs (U+E1A0–U+E1BA),
+opt into the additional TUI icon style:
+
+```powershell
+$env:RECALL_ICON_STYLE = 'herdr'
+recall
+```
+
+To retain this choice for future Windows Terminal sessions, use
+`[Environment]::SetEnvironmentVariable('RECALL_ICON_STYLE', 'herdr', 'User')`
+and open a new terminal. Windows Terminal does not support codepoint-specific
+font mappings; its configured primary/fallback font must actually render those
+characters. `JetBrains Mono Herdr` is one compatible merged font provided by
+herdr-radar. Installing the icon-only font does **not** guarantee that Windows
+Terminal will select it; test your terminal font first.
+
+The style is opt-in because Recall cannot reliably inspect a terminal's glyph
+fallback chain. Unsupported agent logos use the existing plain Unicode marks;
+the default Nerd Font style and `RECALL_ICON_STYLE=plain` remain unchanged.
+Recall neither installs nor redistributes the Herdr font.
+
 ### Delete sessions
 
 `recall session delete` removes one selected session from Recall and, when the source has a safe native deletion path, from the source agent as well.

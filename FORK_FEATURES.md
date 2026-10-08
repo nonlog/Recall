@@ -133,6 +133,12 @@ when title parsing changes so unchanged files backfill correctly.
 
 - Keep per-source colors/icons with terminal-safe fallbacks.
 - `RECALL_ICON_STYLE` remains the user fallback control.
+- `RECALL_ICON_STYLE=herdr` opts into the third-party Herdr Agent Icons Max
+  U+E1A0–U+E1BA logo mapping where a source has an exact supported vendor.
+  Unmapped agents must keep their Unicode fallback; do not autodetect solely
+  from an installed font since terminals can render a different PUA glyph.
+  Existing Nerd/default and plain/unicode choices must remain unchanged.
+  Recall does not bundle or install third-party fonts.
 - Do not render an `[unknown]` host badge when a session has no location
   metadata. Real host labels remain visible when location metadata exists.
 - Landmarks: `src/tui/source_brand.rs`, `src/tui/ui/search.rs`, and their callers/tests.

@@ -77,6 +77,9 @@ require_text "src/adapters/pi_session.rs" '"session_info" if format == Format::P
 
 require_file "src/tui/source_brand.rs"
 require_text "src/tui/source_brand.rs" "RECALL_ICON_STYLE" "source icon fallback remains configurable"
+require_text "src/tui/source_brand.rs" 'Some("herdr" | "herdr-agent-icons")' "Herdr icon mode remains opt-in"
+require_text "src/tui/source_brand.rs" "herdr_agent_icons_match_the_upstream_private_use_mapping" "Herdr vendor glyph mappings remain regression-tested"
+require_text "src/tui/source_brand.rs" "herdr_mode_keeps_unicode_fallbacks_for_unmapped_agents" "Herdr missing-agent fallback remains regression-tested"
 require_text "src/tui/ui/search.rs" "if !session.locations.is_empty()" "empty host/location metadata remains hidden"
 require_text "src/tui/ui/search.rs" "session_metadata_prefix_hides_missing_host" "missing-host regression test remains present"
 require_text "src/tui/app.rs" "ctrl_s_from_search_requests_sync_instead_of_settings" "Ctrl+S Sync regression test remains present"
