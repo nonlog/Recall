@@ -87,6 +87,31 @@
 * Restore the upstream bottom shortcut bar and show the complete shortcut reference in Ctrl+S Settings.
 
 
+## [0.6.3](https://github.com/samzong/Recall/compare/v0.6.2...v0.6.3) (2026-10-07)
+
+
+### Features
+
+* **sync:** refresh a single native session ([#270](https://github.com/samzong/Recall/issues/270))
+* **adapters:** add Devin CLI session adapter ([#271](https://github.com/samzong/Recall/issues/271))
+* **adapters:** add Muse Code session adapter ([#275](https://github.com/samzong/Recall/issues/275))
+* **adapters:** add CodeBuddy Code session adapter ([#276](https://github.com/samzong/Recall/issues/276))
+* **adapters:** add TRAE CLI session adapter ([#277](https://github.com/samzong/Recall/issues/277))
+
+
+### Fixes
+
+* **sync:** quiet unstable skips and serialize log output ([#268](https://github.com/samzong/Recall/issues/268))
+* **adapters:** index all Devin sessions from sessions.db ([#272](https://github.com/samzong/Recall/issues/272))
+* **makefile:** strip header dashes from make help in C locale ([#273](https://github.com/samzong/Recall/issues/273))
+* **sync:** stream file-scan sessions to bound sync memory ([#274](https://github.com/samzong/Recall/issues/274))
+
+
+### Refactors
+
+* extract rx into standalone repository
+
+
 ## [0.6.2](https://github.com/samzong/Recall/compare/v0.6.1...v0.6.2) (2026-09-20)
 
 

@@ -95,6 +95,17 @@ Before merging or rebasing a new upstream release:
 - Landmarks: `src/session_delete.rs`, `src/db/store.rs`, `nonlog/scoop-www`'s
   `bucket/recall.json`.
 
+### Independent rx harness package
+
+- Upstream extracted `rx` into `samzong/rx` after Recall 0.6.2. The Recall
+  Windows release no longer contains `rx.exe`; its Scoop manifest must only
+  create shims for binaries actually present in that archive.
+- Preserve the previously bundled `rx`, `rxc`, `rxx`, `rxo`, `rxp`, `rxd`, and
+  `rxk` commands through an independently versioned `www/rx` Scoop manifest.
+- Recall's persisted `data` and `trash` directories must remain intact when
+  migrating from the bundled rx installer to separate packages.
+- Landmark: `nonlog/scoop-www`'s `bucket/rx.json` and `bucket/recall.json`.
+
 ### Database bloat protection
 
 - `session_events.summary` is capped at 4096 characters at write time.

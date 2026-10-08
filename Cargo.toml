@@ -8,12 +8,12 @@ repository = "https://github.com/samzong/Recall"
 publish = false
 
 [workspace]
-members = [".", "crates/rx", "extensions/recall-probe", "extensions/recall-reflect", "extensions/recall-powercontext", "extensions/recall-r2", "extensions/recall-publish"]
+members = [".", "extensions/recall-probe", "extensions/recall-reflect", "extensions/recall-powercontext", "extensions/recall-r2", "extensions/recall-publish"]
 default-members = ["."]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.2"
+version = "0.6.3"
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore(release): bump to v{{version}}"
@@ -55,6 +55,7 @@ fs2 = "0.4"
 pulldown-cmark = "0.13"
 zip = { version = "7", default-features = false, features = ["deflate"] }
 zstd = { version = "0.13", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
@@ -80,13 +81,11 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# Benchmarks are compiled with the release profile; thin LTO keeps build times
-# reasonable in CI without giving up cross-crate inlining.
 [profile.bench]
 lto = "thin"
 
 [dev-dependencies]
-divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+divan = "0.1.21"
 
 [[bench]]
 name = "recall"

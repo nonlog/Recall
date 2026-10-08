@@ -8,6 +8,28 @@ Release commit: see tag `v0.6.2.2`
 
 ## Current fork policy
 
+### 2026-10-08 upstream 0.6.3 integration and rx separation
+
+- Integration target: upstream `samzong/Recall:main` at
+  `a1f0ba53e714f2de2add48b43040135b94662d3e` (Cargo 0.6.3).
+- A normal Git merge of upstream into fork main found two conflicts:
+  `src/adapters/codex.rs` (native-title fork extension versus the new shared
+  Codex/Trae rollout scanner) and `.github/workflows/codspeed.yml` (deleted
+  upstream, retained by the fork for benchmark compilation without unauthorized
+  CodSpeed uploads).
+- The merge candidate retains upstream `RolloutDialect` and streamed file scans.
+  Only the Codex dialect reads `state_5.sqlite` and `session_index.jsonl` titles;
+  parsed sessions are titled before streaming and unchanged-session observations
+  are refreshed after scanning. Tests cover state/index precedence, Trae
+  isolation, streaming, and rename backfill.
+- Upstream moved rx to `samzong/rx` and no longer packages `rx.exe` with Recall.
+  The `nonlog/scoop-www` bucket must publish a standalone `www/rx` manifest with
+  the existing seven command aliases and update `www/recall` only when the new
+  release artifact is published. `persist: [trash, data]` must be retained.
+- GitHub Actions is the exclusive build/test system for this integration.
+  The integration and release status must be confirmed from CI and release
+  metadata before updating the deployed manifest.
+
 ### 2026-10-01 upstream workflow-file push authentication
 
 - Scheduled upstream sync failed when upstream commit `b44103999f6d...`

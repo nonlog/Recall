@@ -244,6 +244,7 @@ fn scan_for_sync_claimed(
         context,
         since_ts,
         file_scan::FileScanOptions {
+            stream_sessions: true,
             usage_parser_version: Some(USAGE_PARSER_VERSION),
             event_parser_version: include_events.then_some(EVENT_PARSER_VERSION),
             metadata_parser_version: include_events.then_some(METADATA_PARSER_VERSION),
@@ -472,6 +473,7 @@ fn parse_claude_session_file(
         thread_role,
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
+        refresh_session_metadata: false,
         refresh_session_on_metadata_backfill: true,
     }))
 }

@@ -2,6 +2,7 @@ pub(crate) mod amp;
 pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod cline;
+pub(crate) mod codebuddy;
 pub(crate) mod codex;
 pub(crate) mod copilot;
 pub(crate) mod copilot_chat;
@@ -17,23 +18,30 @@ pub(crate) mod goose;
 pub(crate) mod grok;
 pub(crate) mod invocation_probe;
 pub(crate) mod json_util;
+pub(crate) mod junie;
 pub(crate) mod kilo;
 pub(crate) mod kimi_code;
 pub(crate) mod kiro;
 pub(crate) mod mimo_code;
 pub(crate) mod minimax_code;
+pub(crate) mod muse_code;
 pub(crate) mod omp;
 pub(crate) mod opencode;
 pub(crate) mod openhands;
 pub(crate) mod paths;
 pub(crate) mod pi;
 mod pi_session;
+pub(crate) mod qoder;
 pub(crate) mod qwen;
 pub(crate) mod roo;
 pub(crate) mod sync_state;
+pub(crate) mod trae_cli;
 pub(crate) mod usage;
+pub(crate) mod warp;
 pub(crate) mod zcode;
+pub(crate) mod zed;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
@@ -82,7 +90,9 @@ pub(crate) trait SourceAdapter {
     }
 }
 
-pub(crate) struct AdapterSyncContext {
+pub(crate) type SessionSink<'a> = dyn FnMut(RawSession) -> anyhow::Result<()> + 'a;
+
+pub(crate) struct AdapterSyncContext<'a> {
     source: String,
     target_source_id: Option<String>,
     session_meta: HashMap<String, IndexedSessionMeta>,
@@ -91,6 +101,7 @@ pub(crate) struct AdapterSyncContext {
     usage_state: HashMap<String, ParserStateMeta>,
     event_state: HashMap<String, ParserStateMeta>,
     metadata_state: HashMap<String, ParserStateMeta>,
+    session_sink: Option<RefCell<&'a mut SessionSink<'a>>>,
 }
 
 pub(crate) struct AdapterSyncContextParts {
@@ -102,7 +113,7 @@ pub(crate) struct AdapterSyncContextParts {
     pub(crate) metadata_state: HashMap<String, ParserStateMeta>,
 }
 
-impl AdapterSyncContext {
+impl<'a> AdapterSyncContext<'a> {
     pub(crate) fn new(
         source: String,
         session_meta: HashMap<String, IndexedSessionMeta>,
@@ -121,6 +132,19 @@ impl AdapterSyncContext {
             usage_state,
             event_state,
             metadata_state,
+            session_sink: None,
+        }
+    }
+
+    pub(crate) fn with_session_sink(mut self, sink: &'a mut SessionSink<'a>) -> Self {
+        self.session_sink = Some(RefCell::new(sink));
+        self
+    }
+
+    pub(crate) fn stream_session(&self, raw: RawSession) -> anyhow::Result<Option<RawSession>> {
+        match &self.session_sink {
+            Some(sink) => (sink.borrow_mut())(raw).map(|()| None),
+            None => Ok(Some(raw)),
         }
     }
 
@@ -231,6 +255,7 @@ pub(crate) struct RawSession {
     pub(crate) parent_links: Vec<ParentLink>,
     pub(crate) metadata_parser_version: Option<u32>,
     pub(crate) refresh_session_on_metadata_backfill: bool,
+    pub(crate) refresh_session_metadata: bool,
 }
 
 impl RawSession {
@@ -261,6 +286,7 @@ impl RawSession {
             parent_links: Vec::new(),
             metadata_parser_version: None,
             refresh_session_on_metadata_backfill: false,
+            refresh_session_metadata: false,
         }
     }
 
@@ -418,6 +444,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(deepseek_harness::DeepSeekHarnessAdapter),
         Box::new(kimi_code::KimiCodeAdapter),
         Box::new(qwen::QwenAdapter),
+        Box::new(qoder::QoderAdapter),
         Box::new(kilo::KiloCodeAdapter),
         Box::new(crush::CrushAdapter),
         Box::new(mimo_code::MimoCodeAdapter),
@@ -428,6 +455,12 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(amp::AmpAdapter),
         Box::new(openhands::OpenHandsAdapter),
         Box::new(devin::DevinAdapter),
+        Box::new(muse_code::MuseCodeAdapter),
+        Box::new(codebuddy::CodeBuddyAdapter),
+        Box::new(trae_cli::TraeCliAdapter),
+        Box::new(junie::JunieAdapter),
+        Box::new(zed::ZedAdapter),
+        Box::new(warp::WarpAdapter),
     ]
 }
 
@@ -473,9 +506,17 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "cline"
             | "roo"
             | "qwen-code"
+            | "qoder"
             | "gemini-cli"
             | "pi"
             | "omp"
+            | "muse-code"
+            | "codebuddy"
+            | "trae-cli"
+            | "junie"
+            | "zed"
+            | "warp"
+            | "devin"
     )
 }
 
