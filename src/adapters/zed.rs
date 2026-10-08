@@ -159,6 +159,7 @@ fn scan_database(
             result.observations.push(SourceObservation {
                 source_id: meta.id,
                 source_file_path: Some(path.to_string_lossy().into_owned()),
+                custom_title: None,
             });
             continue;
         }
