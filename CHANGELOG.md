@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.3.2] (2026-10-08)
+
+### nonlog fork
+
+* Add opt-in `RECALL_ICON_STYLE=herdr` for authentic Herdr Agent Icons Max logos in the TUI.
+* Map 22 Recall source identifiers to the matching U+E1A0–U+E1BA vendor glyphs while retaining brand colours.
+* Keep plain Unicode fallback for unmatched sources and preserve the existing Nerd Font/default and plain modes.
+* Document Windows Terminal font selection, preserve the upstream-sync fork contract, and add glyph/fallback regression tests; no third-party fonts are bundled.
+
 ## [0.6.3.1] (2026-10-08)
 
 ### nonlog fork
