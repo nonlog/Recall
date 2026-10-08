@@ -45,6 +45,9 @@ require_text ".github/workflows/sync-upstream.yml" "base64 --decode" "upstream s
 require_text ".github/workflows/sync-upstream.yml" "ssh-keygen -y -f" "upstream sync validates the decoded OpenSSH private key before push"
 require_text ".github/workflows/sync-upstream.yml" "GIT_SSH_COMMAND" "upstream sync review-branch push is isolated to SSH deploy-key auth"
 
+require_text ".github/workflows/codspeed.yml" "cargo codspeed build --features bench" "fork CI still compiles the CodSpeed benchmark suite"
+require_text ".github/workflows/codspeed.yml" "if: github.repository == 'samzong/Recall'" "fork CodSpeed upload remains upstream-only"
+
 require_file "src/session_delete.rs"
 require_text "src/session_delete.rs" "pub(crate) enum DeleteMode" "delete modes remain implemented"
 require_text "src/session_delete.rs" "TransactionBehavior::Immediate" "Recall deletion stages under an IMMEDIATE transaction"
