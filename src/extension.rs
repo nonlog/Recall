@@ -550,13 +550,15 @@ mod tests {
     use super::{
         Catalog, CatalogExtension, CatalogTarget, CatalogVersion, ExtensionManifest,
         InstalledExtension, InstalledState, format_installed_help, load_installed_state,
-        managed_binary_path, run_external_with_root, save_installed_state, select_latest,
-        validate_manifest,
+        save_installed_state, select_latest, validate_manifest,
     };
+    #[cfg(unix)]
+    use super::{managed_binary_path, run_external_with_root};
     use std::collections::BTreeMap;
-    use std::ffi::OsString;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::{ffi::OsString, path::Path};
 
     #[test]
     #[cfg(unix)]

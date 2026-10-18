@@ -160,7 +160,7 @@ impl Store {
             let install_dir = executable
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("cannot determine Recall install directory"))?;
-            return Ok(install_dir.join("data").join("recall.db"));
+            Ok(install_dir.join("data").join("recall.db"))
         }
 
         #[cfg(not(windows))]
