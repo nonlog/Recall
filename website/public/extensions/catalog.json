@@ -1,5 +1,32 @@
 {
   "extensions": {
+    "opendal": {
+      "description": "Recall remote storage provider powered by Apache OpenDAL",
+      "versions": {
+        "0.1.0": {
+          "min_recall": "0.6.5",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "14a230da59c6f6d43a743ca4f053217132848cb735e7637f473c5c44ad9a105e",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "10905b6c90eeb20f87fd318421ed1c7eb4c64a2de12f6587c36c494a3b82ac7d",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "9860956216229dd0dd2eb39fc8b4689ed91c31dfe14d10c3eb0f2470ec3ea10f",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "96ec03e503456f90774548187cf7b2e46ee167c972577fbd621268d49a6ca1a5",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        }
+      }
+    },
     "powercontext": {
       "description": "Backfill Recall sessions into PowerContext Content Sources",
       "versions": {
