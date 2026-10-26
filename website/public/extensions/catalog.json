@@ -8,20 +8,20 @@
           "protocol": 2,
           "targets": {
             "aarch64-apple-darwin": {
-              "sha256": "14a230da59c6f6d43a743ca4f053217132848cb735e7637f473c5c44ad9a105e",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-aarch64-apple-darwin.tar.gz"
+              "sha256": "6dd33d671c66bafa351ad41ebe331d27810fbf1d264e15bf7bca67658d0fe011",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-aarch64-apple-darwin.tar.gz"
             },
             "x86_64-apple-darwin": {
-              "sha256": "10905b6c90eeb20f87fd318421ed1c7eb4c64a2de12f6587c36c494a3b82ac7d",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-apple-darwin.tar.gz"
+              "sha256": "e9d78d90565d3291243d313b68f25a850c5ec876a4d6fe07d054fb29f0c243d9",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-apple-darwin.tar.gz"
             },
             "x86_64-pc-windows-msvc": {
-              "sha256": "9860956216229dd0dd2eb39fc8b4689ed91c31dfe14d10c3eb0f2470ec3ea10f",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-pc-windows-msvc.zip"
+              "sha256": "0ad7d524c7d65e8b6bd59a4b7019e2cb761d129c2a0f090e00e2c72957101648",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-pc-windows-msvc.zip"
             },
             "x86_64-unknown-linux-gnu": {
-              "sha256": "96ec03e503456f90774548187cf7b2e46ee167c972577fbd621268d49a6ca1a5",
-              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+              "sha256": "c8b4336970a2b6999e27f246d4ced21dbee43f2d5d40a84b0006e8f352c8c82f",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
         }
