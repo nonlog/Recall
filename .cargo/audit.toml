@@ -1,9 +1,2 @@
 [advisories]
-# Candle uses zip only to read NumPy/Pickle entries with `by_index`/`by_name`;
-# it never calls the vulnerable archive extraction APIs covered by these
-# advisories. Keep the audit gate active for all other advisories.
-ignore = [
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
-]
+ignore = ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"]

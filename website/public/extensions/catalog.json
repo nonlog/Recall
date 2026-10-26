@@ -1,5 +1,32 @@
 {
   "extensions": {
+    "opendal": {
+      "description": "Recall remote storage provider powered by Apache OpenDAL",
+      "versions": {
+        "0.1.0": {
+          "min_recall": "0.6.5",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "14a230da59c6f6d43a743ca4f053217132848cb735e7637f473c5c44ad9a105e",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "10905b6c90eeb20f87fd318421ed1c7eb4c64a2de12f6587c36c494a3b82ac7d",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "9860956216229dd0dd2eb39fc8b4689ed91c31dfe14d10c3eb0f2470ec3ea10f",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "96ec03e503456f90774548187cf7b2e46ee167c972577fbd621268d49a6ca1a5",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-opendal-v0.1.0/recall-opendal-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        }
+      }
+    },
     "powercontext": {
       "description": "Backfill Recall sessions into PowerContext Content Sources",
       "versions": {
@@ -44,6 +71,28 @@
             "x86_64-unknown-linux-gnu": {
               "sha256": "005edf3d50eecedd464155ddecf48bf61b88337c9671740d4a5eb3700b8c58f9",
               "url": "https://github.com/nonlog/Recall/releases/download/recall-powercontext-v0.1.1/recall-powercontext-v0.1.1-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        },
+        "0.1.2": {
+          "min_recall": "0.4.0",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "2f56dd97ac5d3b7b3419f5ca41096e7af099ca90c2d4fa5f5f2b56806233bf19",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "678c5a90e21b13544b42888ff43f24059cb5c0389125c992b2bd8f160dc28943",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "487b1689939ec1d0554abb04f83cc91a023ea9248346cccf74409f74ce0660c5",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "894e9f8a449da9b4cabaf85e04880351bc73fecf73fb6068106cf2f7373066e5",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
         }
@@ -125,6 +174,28 @@
             "x86_64-unknown-linux-gnu": {
               "sha256": "19440e15322e6b82b62bad1972dd1710f0de5f34864320fa6818ff92dd6cfdd4",
               "url": "https://github.com/nonlog/Recall/releases/download/recall-r2-v0.1.0/recall-r2-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        },
+        "0.1.1": {
+          "min_recall": "0.6.0",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "cddc4e1cc78f7c4d9de37a8b2bb6b4b46d13d63bd1ba31ad10a50be30ea93bc1",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.1/recall-r2-v0.1.1-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "992ae58c80506b97ef35853ff36bc3793b63a649a97d825f031cd0519114a6f0",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.1/recall-r2-v0.1.1-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "9bc3a830009aa2a23f02ba2ca6b175d3b5204d4d56fb5d74c1748cad5cf2cac9",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.1/recall-r2-v0.1.1-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "87ea052dc35b0ed267a2e7a7492bcf4a40981a8c49ea9aa533b65a4c158cef54",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-r2-v0.1.1/recall-r2-v0.1.1-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
         }
