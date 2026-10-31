@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
@@ -6,15 +6,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::session_store::{clear_session_contents_tx, persist_session_with_usage_and_events_tx};
-use super::store::{SessionTopologyWrite, Store};
+use super::store::Store;
 use crate::host::Location;
 use crate::project_scope::ProjectScope;
 use crate::types::Session;
 
+mod codec;
+mod merge;
+
+pub(crate) use codec::{decode_zstd, encode_delta};
+
 const SQLITE_MAX_LENGTH: usize = 1_000_000_000;
 pub(crate) const OBJECT_LIMIT: usize = 512 * 1024 * 1024;
 const _: () = assert!(OBJECT_LIMIT < SQLITE_MAX_LENGTH);
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+pub(crate) const ZSTD_LEVEL: i32 = 3;
+const PREPARE_STATE: &str = "prepare_version";
+const MERGE_STATE: &str = "merge_version";
+
+pub(crate) fn decode_stored(body: Vec<u8>) -> Result<Vec<u8>> {
+    if body.starts_with(&ZSTD_MAGIC) { decode_zstd(&body, None) } else { Ok(body) }
+}
 
 pub(crate) fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -102,65 +114,106 @@ impl Store {
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        let sessions =
-            self.list_export_sessions(None, super::search::TimeRange::All, scope, None, None)?;
-        for session in &sessions {
-            self.remote_identity(&session.id)?;
-        }
+        let state = format!("{} {}", env!("CARGO_PKG_VERSION"), serde_json::to_string(scope)?);
+        let full = !self.sync_state_current(PREPARE_STATE, &state)?;
+        let pending: HashSet<String> = self
+            .conn
+            .prepare(
+                "SELECT session_id FROM sync_pending_snapshots
+                 UNION SELECT s.id FROM sessions s
+                 LEFT JOIN session_sync y ON y.session_id = s.id
+                 WHERE y.current_revision IS NULL",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let sessions: Vec<Session> = self
+            .list_export_sessions(None, super::search::TimeRange::All, scope, None, None)?
+            .into_iter()
+            .filter(|session| full || pending.contains(&session.id))
+            .collect();
         let total = sessions.len();
         for (index, session) in sessions.into_iter().enumerate() {
             on_progress(index + 1, total);
-            let id = session.id.clone();
-            let sync_id = self.remote_identity(&id)?;
-            let current: Option<String> = self.conn.query_row(
-                "SELECT current_revision FROM session_sync WHERE session_id = ?1",
-                [&id],
-                |row| row.get(0),
-            )?;
-            let mut parent_sessions = Vec::new();
-            for parent in self.session_topology(&id)?.parents {
-                let identity = self
-                    .resolve_parent(&id, &parent)?
-                    .map(|session| self.remote_identity(&session.id))
-                    .transpose()?;
-                parent_sessions.push(identity);
-            }
-            let locations = session.locations.clone();
-            let record = self.remote_snapshot(session)?;
-            let unchanged = current
-                .as_deref()
-                .map(|hash| self.remote_revision(hash))
-                .transpose()?
-                .flatten()
-                .is_some_and(|revision| {
-                    revision.record == record && revision.parent_sessions == parent_sessions
-                });
-            let locally_indexed: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM native_bindings WHERE session_id = ?1)",
-                [&id],
-                |row| row.get(0),
-            )?;
-            if !unchanged && (current.is_none() || locally_indexed) {
-                let revision = Revision {
-                    version: 1,
-                    sync_id: sync_id.clone(),
-                    parent: current,
-                    parent_sessions,
-                    record,
-                };
-                let body = serde_json::to_vec(&revision)?;
-                let hash = digest(&body);
-                self.cache_remote(&format!("v1/revisions/{hash}.json"), &body)?;
-                self.conn.execute(
-                    "UPDATE session_sync SET current_revision = ?2 WHERE session_id = ?1",
-                    params![id, hash],
-                )?;
-            }
-            if !locations.is_empty() {
-                self.cache_metadata(&Metadata::Locations { version: 1, sync_id, locations })?;
-            }
+            self.prepare_session(session)?;
         }
+        self.conn.execute(
+            "DELETE FROM sync_pending_snapshots
+             WHERE session_id NOT IN (SELECT id FROM sessions)",
+            [],
+        )?;
+        self.mark_sync_state(PREPARE_STATE, &state)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    fn prepare_session(&self, session: Session) -> Result<()> {
+        let id = session.id.clone();
+        let sync_id = self.remote_identity(&id)?;
+        let current: Option<String> = self.conn.query_row(
+            "SELECT current_revision FROM session_sync WHERE session_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )?;
+        let mut parent_sessions = Vec::new();
+        for parent in self.session_topology(&id)?.parents {
+            let identity = self
+                .resolve_parent(&id, &parent)?
+                .map(|session| self.remote_identity(&session.id))
+                .transpose()?;
+            parent_sessions.push(identity);
+        }
+        let locations = session.locations.clone();
+        let record = self.remote_snapshot(session)?;
+        let unchanged = current
+            .as_deref()
+            .map(|hash| self.remote_revision(hash))
+            .transpose()?
+            .flatten()
+            .is_some_and(|revision| {
+                revision.record == record && revision.parent_sessions == parent_sessions
+            });
+        let locally_indexed: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_bindings WHERE session_id = ?1)",
+            [&id],
+            |row| row.get(0),
+        )?;
+        if !unchanged && (current.is_none() || locally_indexed) {
+            let revision = Revision {
+                version: 1,
+                sync_id: sync_id.clone(),
+                parent: current,
+                parent_sessions,
+                record,
+            };
+            let body = serde_json::to_vec(&revision)?;
+            let hash = digest(&body);
+            self.cache_remote(&format!("v1/revisions/{hash}.json"), &body)?;
+            self.conn.execute(
+                "UPDATE session_sync SET current_revision = ?2 WHERE session_id = ?1",
+                params![id, hash],
+            )?;
+        }
+        if !locations.is_empty() {
+            self.cache_metadata(&Metadata::Locations { version: 1, sync_id, locations })?;
+        }
+        self.conn.execute("DELETE FROM sync_pending_snapshots WHERE session_id = ?1", [&id])?;
+        Ok(())
+    }
+
+    fn sync_state_current(&self, key: &str, state: &str) -> Result<bool> {
+        let value: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |row| row.get(0))
+            .optional()?;
+        Ok(value.as_deref() == Some(state))
+    }
+
+    fn mark_sync_state(&self, key: &str, state: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_state(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, state],
+        )?;
         Ok(())
     }
 
@@ -176,10 +229,14 @@ impl Store {
                 row.get(0)
             })
             .optional()?;
-        body.map(|body| serde_json::from_slice(&body).map_err(Into::into)).transpose()
+        body.map(|body| Ok(serde_json::from_slice(&decode_stored(body)?)?)).transpose()
     }
 
     pub(crate) fn cached_remote(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.cached_stored(key)?.map(decode_stored).transpose()
+    }
+
+    pub(crate) fn cached_stored(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let (table, hash) = object_parts(key)?;
         Ok(self
             .conn
@@ -189,12 +246,13 @@ impl Store {
             .optional()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_remote_size(&self, key: &str) -> Result<Option<u64>> {
         let (table, hash) = object_parts(key)?;
         Ok(self
             .conn
             .query_row(
-                &format!("SELECT LENGTH(body) FROM {table} WHERE digest = ?1"),
+                &format!("SELECT COALESCE(size, LENGTH(body)) FROM {table} WHERE digest = ?1"),
                 [hash],
                 |row| row.get(0),
             )
@@ -202,9 +260,23 @@ impl Store {
     }
 
     pub(crate) fn cache_remote(&self, key: &str, body: &[u8]) -> Result<()> {
+        self.cache_encoded(key, body, None)
+    }
+
+    pub(crate) fn cache_encoded(
+        &self,
+        key: &str,
+        body: &[u8],
+        stored: Option<&[u8]>,
+    ) -> Result<()> {
         ensure!(body.len() <= OBJECT_LIMIT, "remote object exceeds 512 MiB");
+        let stored = match stored.filter(|stored| stored.starts_with(&ZSTD_MAGIC)) {
+            Some(stored) => stored.to_vec(),
+            None => zstd::encode_all(body, ZSTD_LEVEL)?,
+        };
         let (table, hash) = object_parts(key)?;
         ensure!(digest(body) == hash, "remote object content hash mismatch");
+        let size = body.len() as i64;
         if table == "sync_revisions" {
             let revision: Revision = serde_json::from_slice(body)?;
             ensure!(revision.version == 1, "unsupported remote revision version");
@@ -222,8 +294,8 @@ impl Store {
                 "invalid portable parent links"
             );
             self.conn.execute(
-                "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body) VALUES (?1, ?2, ?3)",
-                params![hash, revision.sync_id, body],
+                "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body, size) VALUES (?1, ?2, ?3, ?4)",
+                params![hash, revision.sync_id, stored, size],
             )?;
         } else {
             let metadata: Metadata = serde_json::from_slice(body)?;
@@ -248,251 +320,20 @@ impl Store {
                 }
             }
             self.conn.execute(
-                "INSERT OR IGNORE INTO sync_objects(digest, body) VALUES (?1, ?2)",
-                params![hash, body],
+                "INSERT OR IGNORE INTO sync_objects(digest, body, size) VALUES (?1, ?2, ?3)",
+                params![hash, stored, size],
             )?;
         }
         Ok(())
     }
-
-    fn alias_session(&self, sync_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT session_id FROM sync_aliases WHERE sync_id = ?1", [sync_id], |row| {
-                row.get(0)
-            })
-            .optional()?)
-    }
-
-    fn legacy_match(&self, revision: &Revision) -> Result<Option<String>> {
-        let record = &revision.record["session"];
-        let mut stmt = self.conn.prepare("SELECT s.id FROM sessions s JOIN native_bindings n ON n.session_id = s.id WHERE s.is_import = 1 AND n.confirmed = 0 AND s.source = ?1 AND s.source_id = ?2")?;
-        let candidates = stmt
-            .query_map(params![record["source"].as_str(), record["source_id"].as_str()], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut matches = Vec::new();
-        for id in candidates {
-            if let Some(session) = self.get_session_by_id(&id)?
-                && self.remote_snapshot(session)? == revision.record
-            {
-                matches.push(id);
-            }
-        }
-        Ok(if matches.len() == 1 { matches.pop() } else { None })
-    }
-
-    fn write_remote_projection(
-        &self,
-        tx: &rusqlite::Transaction<'_>,
-        id: &str,
-        revision: &Revision,
-    ) -> Result<()> {
-        ensure!(!self.has_native_binding(id)?, "remote cannot replace a native session");
-        let data = crate::import::decode_remote(revision.record.clone(), id.to_string())?;
-        clear_session_contents_tx(tx, id)?;
-        persist_session_with_usage_and_events_tx(
-            tx,
-            &data.session,
-            &data.messages,
-            &data.usage_events,
-            None,
-            &data.events,
-            None,
-            &SessionTopologyWrite {
-                thread_role: data.topology.thread_role,
-                parents: &data.topology.parents,
-                parser_version: None,
-            },
-            self.trigram_message_flag,
-        )?;
-        for (parent, identity) in data.topology.parents.iter().zip(&revision.parent_sessions) {
-            tx.execute("UPDATE session_parent_links SET parent_sync_id = ?5 WHERE session_id = ?1 AND relation = ?2 AND parent_source = ?3 AND parent_source_id = ?4",
-                params![id, parent.relation.as_str(), parent.source, parent.source_id, identity])?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn merge_remote(&self) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
-        let hashes = self
-            .conn
-            .prepare(
-                "SELECT digest FROM sync_revisions r
-                 WHERE NOT EXISTS (SELECT 1 FROM sync_aliases a WHERE a.sync_id = r.sync_id)
-                 ORDER BY digest",
-            )?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for hash in &hashes {
-            let revision = self.remote_revision(hash)?.context("missing cached revision")?;
-            if self.alias_session(&revision.sync_id)?.is_some() {
-                continue;
-            }
-            let id = if let Some(id) = self.legacy_match(&revision)? {
-                let old: Option<String> = tx
-                    .query_row(
-                        "SELECT current_revision FROM session_sync WHERE session_id = ?1",
-                        [&id],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                if let Some(old) = old {
-                    self.cache_metadata(&Metadata::Association {
-                        version: 1,
-                        left: old,
-                        right: hash.clone(),
-                    })?;
-                }
-                id
-            } else {
-                let id = uuid::Uuid::new_v4().to_string();
-                self.write_remote_projection(&tx, &id, &revision)?;
-                id
-            };
-            tx.execute(
-                "INSERT OR IGNORE INTO session_sync(session_id, sync_id) VALUES (?1, ?2)",
-                params![id, revision.sync_id],
-            )?;
-            tx.execute(
-                "INSERT INTO sync_aliases(sync_id, session_id) VALUES (?1, ?2)",
-                params![revision.sync_id, id],
-            )?;
-        }
-        let metadata = self
-            .conn
-            .prepare("SELECT body FROM sync_objects ORDER BY digest")?
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for body in &metadata {
-            if let Metadata::Association { left, right, .. } = serde_json::from_slice(body)? {
-                self.apply_association(&tx, &left, &right)?;
-            }
-        }
-        for body in &metadata {
-            if let Metadata::Locations { sync_id, locations, .. } = serde_json::from_slice(body)?
-                && let Some(id) = self.alias_session(&sync_id)?
-            {
-                for location in locations {
-                    crate::host::merge_location(&tx, &id, &location)?;
-                }
-            }
-        }
-        let sessions = tx
-            .prepare("SELECT session_id, current_revision FROM session_sync")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut conflicts = 0;
-        for (id, current) in sessions {
-            let revisions = self.session_revisions(&id)?;
-            let session = self.get_session_by_id(&id)?.context("missing remote session")?;
-            for revision in revisions.values() {
-                ensure!(
-                    revision.record["session"]["source"].as_str() == Some(&session.source)
-                        && revision.record["session"]["source_id"].as_str()
-                            == Some(&session.source_id),
-                    "remote identity contains different native session IDs"
-                );
-                if let Some(parent) = &revision.parent
-                    && let Some(parent_revision) = self.remote_revision(parent)?
-                {
-                    ensure!(
-                        self.alias_session(&parent_revision.sync_id)?.as_deref() == Some(&id),
-                        "remote parent belongs to another session"
-                    );
-                }
-            }
-            let heads = revision_heads(&revisions);
-            let alternatives = heads
-                .iter()
-                .filter(|head| {
-                    current
-                        .as_ref()
-                        .and_then(|hash| revisions.get(hash))
-                        .is_none_or(|selected| selected.record != revisions[**head].record)
-                })
-                .count();
-            tx.execute(
-                "UPDATE session_sync SET alternative_versions = ?2 WHERE session_id = ?1",
-                params![id, alternatives],
-            )?;
-            if heads.len() > 1 {
-                conflicts += 1;
-            }
-            if self.has_native_binding(&id)? {
-                continue;
-            }
-            let chosen = if let Some(current) = current.as_ref() {
-                let descendants: Vec<_> =
-                    heads.iter().filter(|head| descends_from(head, current, &revisions)).collect();
-                if descendants.len() == 1 { Some((*descendants[0]).clone()) } else { None }
-            } else {
-                heads.first().map(|head| (*head).clone())
-            };
-            if let Some(chosen) = chosen
-                && Some(&chosen) != current.as_ref()
-            {
-                self.write_remote_projection(&tx, &id, &revisions[&chosen])?;
-                tx.execute(
-                    "UPDATE session_sync SET current_revision = ?2 WHERE session_id = ?1",
-                    params![id, chosen],
-                )?;
-                tx.execute(
-                    "UPDATE session_sync SET alternative_versions = ?2 WHERE session_id = ?1",
-                    params![id, heads.len().saturating_sub(1)],
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(conflicts)
-    }
-
-    fn apply_association(
-        &self,
-        tx: &rusqlite::Transaction<'_>,
-        left: &str,
-        right: &str,
-    ) -> Result<()> {
-        let (Some(left), Some(right)) = (self.remote_revision(left)?, self.remote_revision(right)?)
-        else {
-            return Ok(());
-        };
-        ensure!(
-            left.record == right.record && left.sync_id != right.sync_id,
-            "legacy association proof does not match"
-        );
-        let (Some(a), Some(b)) =
-            (self.alias_session(&left.sync_id)?, self.alias_session(&right.sync_id)?)
-        else {
-            return Ok(());
-        };
-        if a == b {
-            return Ok(());
-        }
-        let a_native = self.has_native_binding(&a)?;
-        let b_native = self.has_native_binding(&b)?;
-        ensure!(!(a_native && b_native), "legacy association cannot combine two native bindings");
-        let (keep, remove) = if b_native || (!a_native && b < a) { (b, a) } else { (a, b) };
-        for location in crate::host::locations(tx, &remove)? {
-            crate::host::merge_location(tx, &keep, &location)?;
-        }
-        tx.execute(
-            "UPDATE sync_aliases SET session_id = ?1 WHERE session_id = ?2",
-            params![keep, remove],
-        )?;
-        clear_session_contents_tx(tx, &remove)?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", [remove])?;
-        Ok(())
-    }
-
     pub(crate) fn session_revisions(&self, id: &str) -> Result<BTreeMap<String, Revision>> {
-        let mut stmt = self.conn.prepare("SELECT r.digest, r.body FROM sync_revisions r JOIN sync_aliases a ON a.sync_id = r.sync_id WHERE a.session_id = ?1 ORDER BY r.digest")?;
+        let mut stmt = self.conn.prepare("SELECT r.digest, r.body FROM sync_revisions r JOIN sync_aliases a ON a.sync_id = r.sync_id WHERE a.session_id = ?1")?;
         let rows = stmt
             .query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(|(hash, body)| Ok((hash, serde_json::from_slice(&body)?))).collect()
+        rows.into_iter()
+            .map(|(hash, body)| Ok((hash, serde_json::from_slice(&decode_stored(body)?)?)))
+            .collect()
     }
 
     pub(crate) fn revision_summaries(&self, id: &str) -> Result<Vec<Value>> {
@@ -526,52 +367,72 @@ impl Store {
             .collect())
     }
 
-    pub(crate) fn remote_uploads(&self, scope: &ProjectScope) -> Result<Vec<String>> {
-        let sessions =
-            self.list_export_sessions(None, super::search::TimeRange::All, scope, None, None)?;
-        let mut identities = HashSet::new();
-        let mut keys = Vec::new();
-        for session in sessions {
-            let aliases = self
-                .conn
-                .prepare("SELECT sync_id FROM sync_aliases WHERE session_id = ?1")?
-                .query_map([&session.id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            identities.extend(aliases);
-            let digests = self
-                .conn
-                .prepare(
-                    "SELECT r.digest FROM sync_revisions r
-                     JOIN sync_aliases a ON a.sync_id = r.sync_id
-                     WHERE a.session_id = ?1",
-                )?
-                .query_map([&session.id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            keys.extend(digests.into_iter().map(|hash| format!("v1/revisions/{hash}.json")));
-        }
-        let metadata = self
+    pub(crate) fn remote_uploads(
+        &self,
+        scope: &ProjectScope,
+        listed: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let scoped: HashSet<String> = self
+            .list_export_sessions(None, super::search::TimeRange::All, scope, None, None)?
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        let identities: HashSet<String> = self
             .conn
-            .prepare("SELECT digest, body FROM sync_objects")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (hash, body) in metadata {
-            let include = match serde_json::from_slice(&body)? {
+            .prepare("SELECT sync_id, session_id FROM sync_aliases")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .filter_map(|row| match row {
+                Ok((sync_id, session)) => scoped.contains(&session).then_some(Ok(sync_id)),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<rusqlite::Result<_>>()?;
+        let mut owners = HashMap::new();
+        let mut keys = Vec::new();
+        let mut stmt = self.conn.prepare("SELECT digest, sync_id FROM sync_revisions")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let (hash, sync_id): (String, String) = (row.get(0)?, row.get(1)?);
+            let key = format!("v1/revisions/{hash}.json");
+            if identities.contains(&sync_id) && !listed.contains(&key) {
+                keys.push(key);
+            }
+            owners.insert(hash, sync_id);
+        }
+        let owned = |hash: &str| owners.get(hash).is_some_and(|id| identities.contains(id));
+        let mut stmt = self.conn.prepare("SELECT digest, body FROM sync_objects")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            let key = format!("v1/metadata/{hash}.json");
+            if listed.contains(&key) {
+                continue;
+            }
+            let include = match serde_json::from_slice(&decode_stored(row.get(1)?)?)? {
                 Metadata::Locations { sync_id, .. } => identities.contains(&sync_id),
-                Metadata::Association { left, right, .. } => {
-                    self.remote_revision(&left)?
-                        .is_some_and(|revision| identities.contains(&revision.sync_id))
-                        && self
-                            .remote_revision(&right)?
-                            .is_some_and(|revision| identities.contains(&revision.sync_id))
-                }
+                Metadata::Association { left, right, .. } => owned(&left) && owned(&right),
             };
             if include {
-                keys.push(format!("v1/metadata/{hash}.json"));
+                keys.push(key);
             }
         }
         keys.sort();
-        keys.dedup();
         Ok(keys)
+    }
+
+    pub(crate) fn cached_sizes(&self) -> Result<HashMap<String, u64>> {
+        let mut sizes = HashMap::new();
+        for (table, prefix) in
+            [("sync_revisions", "v1/revisions/"), ("sync_objects", "v1/metadata/")]
+        {
+            let mut stmt = self
+                .conn
+                .prepare(&format!("SELECT digest, COALESCE(size, LENGTH(body)) FROM {table}"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                sizes.insert(format!("{prefix}{}.json", row.get::<_, String>(0)?), row.get(1)?);
+            }
+        }
+        Ok(sizes)
     }
 }
 
@@ -612,6 +473,10 @@ pub(crate) fn revision_heads(revisions: &BTreeMap<String, Revision>) -> Vec<&Str
             !heads.iter().any(|other| other != hash && descends_from(other, hash, revisions))
         })
         .collect()
+}
+
+pub(crate) fn validate_object_key(key: &str) -> Result<()> {
+    object_parts(key).map(|_| ())
 }
 
 fn object_parts(key: &str) -> Result<(&'static str, &str)> {
