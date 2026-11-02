@@ -2,9 +2,9 @@
 
 Last updated: 2026-11-02
 Repository: https://github.com/nonlog/Recall
-Upstream baseline: samzong/Recall main at `a1f0ba53e714f2de2add48b43040135b94662d3e` (version 0.6.3)
-Fork release: `v0.6.3.2`
-Release commit: see tag `v0.6.3.2`
+Upstream baseline: samzong/Recall main at `fcc3f214015e69f27f0c5952a21ec0c316e1642c` (version 0.6.5)
+Fork release: `v0.6.5.1`
+Release commit: see tag `v0.6.5.1`
 
 ## Current fork policy
 

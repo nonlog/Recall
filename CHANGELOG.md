@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.5.1] (2026-11-02)
+
+### nonlog fork
+
+* Add safe local Droid CLI session deletion with UUID and `session_start.id` validation; only remove the selected JSONL transcript and exact settings/backup sidecars, retaining all unrelated Factory data.
+* Preserve Trash backup/rollback, permanent delete and explicit index-only behavior. Reject ambiguous sessions and unsafe paths; allow verified already-missing local Droid sessions to be removed from the Recall index.
+* Make Droid visible in the TUI with a distinct single-cell `◈` mark for Herdr/plain and a Nerd Font robot for the default style. Herdr Agent Icons Max has no Droid vendor logo.
+* Warn that local deletion does not delete Factory cloud-synced sessions.
+* Fix seven newly reported RustSec dependency vulnerabilities by updating Candle, Markdown, ZIP, Zstandard, and Tokenizers dependencies; keep the full security audit enabled.
+
 ## [0.6.3.2] (2026-10-08)
 
 ### nonlog fork
