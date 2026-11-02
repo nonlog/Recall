@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.5.2] (2026-11-02)
+
+### nonlog fork
+
+* Use the user's patched Herdr Agent Icons Max **Droid logo U+E1BB** in the TUI when `RECALL_ICON_STYLE=herdr`, matching the locally installed `herdr-radar` plugin. Plain-mode fallback is `❋`; the default Nerd Font robot remains unchanged.
+* Remove macOS build targets from Recall and official extension GitHub Actions release matrices. Windows x86_64 and Linux x86_64 remain supported and release verification stays mandatory.
+* Supersede the incomplete `v0.6.5.1` release that passed Windows/Linux builds but failed to publish because its two macOS jobs never acquired GitHub-hosted runners.
+
 ## [0.6.5.1] (2026-11-02)
 
 ### nonlog fork
