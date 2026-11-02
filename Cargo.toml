@@ -52,20 +52,20 @@ ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
 fs2 = "0.4"
-pulldown-cmark = "0.13"
+pulldown-cmark = "0.13.5"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.10", features = ["metal"] }
-candle-nn = { version = "0.10", features = ["metal"] }
-candle-transformers = { version = "0.10", features = ["metal"] }
+candle-core = { version = "0.11", features = ["metal"] }
+candle-nn = { version = "0.11", features = ["metal"] }
+candle-transformers = { version = "0.11", features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 
 [features]
 default = []

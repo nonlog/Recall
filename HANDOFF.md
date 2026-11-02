@@ -25,6 +25,11 @@ Release commit: see tag `v0.6.3.2`
   in default mode; do not impersonate an unrelated vendor's PUA glyph.
 - GitHub Actions must compile/test all changes, including safe multi-file
   trash rollback and source-brand regression tests. No PC/VPS builds.
+- Existing upstream Cargo.lock triggered seven newly reported RustSec issues in
+  pulldown-cmark, zip 7, and zstd 0.13/zstd-safe 7/zstd-sys 2.0.16. The
+  remediation upgrades pulldown-cmark 0.13.6, zstd 0.14.3 and Candle 0.11.1
+  (which removes zip 7 from the graph). Dependency lock resolution is local
+  metadata-only; all compilation, audit and tests remain GitHub Actions-only.
 
 ### 2026-10-08 optional Herdr agent icons for the Windows TUI
 
