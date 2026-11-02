@@ -59,9 +59,11 @@ The style is opt-in because Recall cannot reliably inspect a terminal's glyph
 fallback chain. Unsupported agent logos use the existing plain Unicode marks;
 the default Nerd Font style and `RECALL_ICON_STYLE=plain` remain unchanged.
 Recall neither installs nor redistributes the Herdr font.
-Herdr Agent Icons Max does not currently ship a Droid/Factory logo; Recall uses
-a distinct single-cell `◈` marker for Droid in Herdr/plain mode, and a robot
-Nerd Font glyph in the default icon mode. It never assigns another vendor's logo.
+The user's patched Herdr Agent Icons Max font includes a Droid logo at
+`U+E1BB` (also mapped in the locally patched `herdr-radar` plugin). With that
+font installed, `RECALL_ICON_STYLE=herdr` displays the same Droid icon as
+Herdr. `plain` uses the plugin's `❋` text fallback, while the default Nerd
+Font style keeps its robot mark. Unpatched fonts may not contain `U+E1BB`.
 
 ### Delete sessions
 

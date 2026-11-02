@@ -50,9 +50,11 @@ recall
 此模式需要显式启用，因为 Recall 无法可靠检测终端的字体回退行为。Herdr 未覆盖
 的 Agent 继续显示原有 Unicode 图标，默认 Nerd Font 模式与
 `RECALL_ICON_STYLE=plain` 都不改变。Recall 不安装或再分发 Herdr 字体。
-Herdr Agent Icons Max 目前不含 Droid/Factory 专属 Logo，因此 Recall 在
-Herdr/纯 Unicode 模式使用独立的单字符 `◈` 标记，默认 Nerd Font 模式使用
-机器人图标；不会冒用其他 Agent 的标识。
+你安装的 Herdr Agent Icons Max 已通过本地补丁增加 Droid 专属图标
+`U+E1BB`，本机 `herdr-radar` 插件也使用相同码位。启用
+`RECALL_ICON_STYLE=herdr` 后，Recall 会显示相同的 Droid 图标；
+`plain` 模式使用对应的 `❋` 文本回退，默认 Nerd Font 模式保留机器人标记。
+**未安装 Droid 字体补丁的旧版 Herdr 字体可能无法显示 `U+E1BB`。**
 
 ### 删除会话
 

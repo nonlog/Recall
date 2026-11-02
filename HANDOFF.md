@@ -8,7 +8,7 @@ Release commit: see tag `v0.6.5.1`
 
 ## Current fork policy
 
-### 2026-11-02 Droid native file deletion and safe source branding
+### 2026-11-02 Droid native deletion, patched Herdr font and Windows/Linux releases
 
 - Droid CLI v1.1.0 saves per-project sessions under `~/.factory/sessions`,
   with `<UUID>.jsonl` (first record: `session_start.id`), optional
@@ -20,9 +20,19 @@ Release commit: see tag `v0.6.5.1`
   Recall SQLite delete. No project directory or shared Factory files are
   modified. Local file deletion does not remove Factory cloud copies when
   Droid's `cloudSessionSync` is enabled.
-- `hhdebb/herdr-radar` intentionally has no Droid/Factory vendor glyph. Use
-  a distinct single-cell Unicode fallback in Herdr mode and a Nerd robot mark
-  in default mode; do not impersonate an unrelated vendor's PUA glyph.
+- On Nov 1, the user patched their installed `hhdebb/herdr-radar` plugin and
+  `HerdrAgentIconsMax-Regular.ttf` to add Droid at U+E1BB (`droid: '\\ue1bb'`
+  in `lib/logos.js`), text fallback `❋`, display name `Droid`. The upstream
+  public GitHub `lib/logos.js` still lacks this local extension, which caused
+  the original incorrect claim that Droid had no icon. In Herdr mode use the
+  exact patched U+E1BB; plain mode uses `❋`, default Nerd mode the robot.
+  Do not bundle the patched font; hosts without it may lack this glyph.
+- User explicitly requires Windows and Linux binaries only. Drop both macOS
+  targets from the reusable build-binaries workflow and the extension release
+  workflow; keep release commit verification and GitHub Actions builds.
+- v0.6.5.1 GitHub Release workflow passed `make check`, Windows and Linux
+  builds but failed because both macOS runner jobs never started. Do not
+  rewrite or move that tag; supersede with v0.6.5.2 after CI.
 - GitHub Actions must compile/test all changes, including safe multi-file
   trash rollback and source-brand regression tests. No PC/VPS builds.
 - Existing upstream Cargo.lock triggered seven newly reported RustSec issues in
@@ -34,14 +44,15 @@ Release commit: see tag `v0.6.5.1`
 ### 2026-10-08 optional Herdr agent icons for the Windows TUI
 
 - Map exact agent IDs to the `hhdebb/herdr-radar` `lib/logos.js` PUA glyphs
-  (U+E1A0–U+E1BA), guarded behind `RECALL_ICON_STYLE=herdr`.
+  (U+E1A0–U+E1BA, plus local Droid extension U+E1BB), guarded behind
+  `RECALL_ICON_STYLE=herdr`.
 - The existing default Nerd/unicode source icons, colours, search rows and
   delete dialogs remain unchanged. Unmapped sources fall back to plain Unicode
   rather than emitting an unrelated vendor's mark.
 - Herdr and JetBrains Mono Herdr are *user-installed terminal fonts*, not
   bundled application dependencies. Windows Terminal cannot force per-codepoint
   font mapping; a configured and working icon-capable font is required.
-- Regression tests guard 22 exact source-to-glyph mappings, cell width, missing
+- Regression tests guard 23 exact source-to-glyph mappings, cell width, missing
   vendor fallback, and the existing icon-style aliases. Only CI builds/tests.
 
 ### 2026-10-08 upstream 0.6.3 integration and rx separation

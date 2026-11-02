@@ -32,6 +32,17 @@ require_text() {
   fi
 }
 
+forbid_text() {
+  local path="$1"
+  local text="$2"
+  local label="$3"
+  if [[ -f "$path" ]] && ! grep -Fq -- "$text" "$path"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
 printf 'Checking nonlog/Recall fork contract...\n'
 
 require_file "FORK_FEATURES.md"
@@ -47,6 +58,10 @@ require_text ".github/workflows/sync-upstream.yml" "GIT_SSH_COMMAND" "upstream s
 
 require_text ".github/workflows/codspeed.yml" "cargo codspeed build --features bench" "fork CI still compiles the CodSpeed benchmark suite"
 require_text ".github/workflows/codspeed.yml" "if: github.repository == 'samzong/Recall'" "fork CodSpeed upload remains upstream-only"
+require_text ".github/workflows/build-binaries.yml" "x86_64-pc-windows-msvc" "Windows binary release remains supported"
+require_text ".github/workflows/build-binaries.yml" "x86_64-unknown-linux-gnu" "Linux binary release remains supported"
+forbid_text ".github/workflows/build-binaries.yml" "apple-darwin" "main binary release does not require macOS runners"
+forbid_text ".github/workflows/extension-release.yml" "apple-darwin" "extension release does not require macOS runners"
 
 require_file "src/session_delete.rs"
 require_text "src/session_delete.rs" "pub(crate) enum DeleteMode" "delete modes remain implemented"
@@ -84,7 +99,8 @@ require_text "src/tui/source_brand.rs" "RECALL_ICON_STYLE" "source icon fallback
 require_text "src/tui/source_brand.rs" 'Some("herdr" | "herdr-agent-icons")' "Herdr icon mode remains opt-in"
 require_text "src/tui/source_brand.rs" "herdr_agent_icons_match_the_upstream_private_use_mapping" "Herdr vendor glyph mappings remain regression-tested"
 require_text "src/tui/source_brand.rs" "herdr_mode_keeps_unicode_fallbacks_for_unmapped_agents" "Herdr missing-agent fallback remains regression-tested"
-require_text "src/tui/source_brand.rs" "droid_has_distinct_one_cell_icon_without_misusing_herdr_vendor_glyph" "Droid source icon and non-impersonation regression test remains present"
+require_text "src/tui/source_brand.rs" '"droid" => "\u{e1bb}"' "Droid maps to the user's patched Herdr glyph U+E1BB"
+require_text "src/tui/source_brand.rs" "droid_uses_patched_herdr_logo_with_a_text_fallback" "Droid patched font and plain fallback regression test remains present"
 require_text "src/tui/ui/popups.rs" "Droid files are removed locally only; Factory cloud copies may remain." "Droid cloud deletion limitation remains visible in the TUI"
 require_text "src/tui/ui/search.rs" "if !session.locations.is_empty()" "empty host/location metadata remains hidden"
 require_text "src/tui/ui/search.rs" "session_metadata_prefix_hides_missing_host" "missing-host regression test remains present"

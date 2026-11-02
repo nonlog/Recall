@@ -53,9 +53,9 @@ fn source_brand_with_style(source: &str, style: IconStyle) -> SourceBrand {
         "cline" => make(Some(""), "◈", 238, 105, 80),
         "roo" => make(None, "◒", 62, 180, 137),
         "deepseek-harness" => make(None, "◫", 77, 107, 254),
-        // Herdr Agent Icons Max does not include a Droid/Factory logo. Use a
-        // recognizable one-cell mark instead of an unrelated vendor's PUA.
-        "droid" => make(Some("󰚩"), "◈", 36, 200, 157),
+        // The user's patched Herdr font provides Droid at U+E1BB. Without
+        // that font, plain mode uses the same ❋ fallback as herdr-radar.
+        "droid" => make(Some("󰚩"), "❋", 36, 200, 157),
         "kimi-code" => make(Some(""), "☾", 105, 102, 255),
         "qwen-code" => make(None, "Q", 99, 102, 241),
         "kilo-code" => make(None, "K", 0, 188, 212),
@@ -97,7 +97,8 @@ fn brand(
     SourceBrand { mark, color: Color::Rgb(r, g, b) }
 }
 
-// From hhdebb/herdr-radar lib/logos.js (HerdrAgentIconsMax-Regular.ttf).
+// From hhdebb/herdr-radar lib/logos.js (HerdrAgentIconsMax-Regular.ttf),
+// extended by the user's locally installed Droid patch (U+E1BB).
 // Only emit mapped vendor logos: a missing mark must use the plain Unicode
 // fallback, never a PUA glyph that represents a different agent.
 fn herdr_logo(source: &str) -> Option<&'static str> {
@@ -123,6 +124,7 @@ fn herdr_logo(source: &str) -> Option<&'static str> {
         "qoder" => "\u{e1b6}",
         "muse-code" => "\u{e1b9}",
         "crush" => "\u{e1ba}",
+        "droid" => "\u{e1bb}",
         _ => return None,
     })
 }
@@ -191,7 +193,7 @@ mod tests {
 
     #[test]
     fn herdr_agent_icons_match_the_upstream_private_use_mapping() {
-        // Expected codepoints from hhdebb/herdr-radar lib/logos.js PUA table.
+        // Upstream codepoints plus the locally patched Droid logo at U+E1BB.
         let logos = [
             ("claude-code", 0xe1a0),
             ("codex", 0xe1a1),
@@ -215,6 +217,7 @@ mod tests {
             ("qoder", 0xe1b6),
             ("muse-code", 0xe1b9),
             ("crush", 0xe1ba),
+            ("droid", 0xe1bb),
         ];
         for (source, codepoint) in logos {
             let glyph = source_brand_with_style(source, IconStyle::Herdr);
@@ -251,17 +254,18 @@ mod tests {
     }
 
     #[test]
-    fn droid_has_distinct_one_cell_icon_without_misusing_herdr_vendor_glyph() {
+    fn droid_uses_patched_herdr_logo_with_a_text_fallback() {
         let plain = source_brand_with_style("droid", IconStyle::Plain);
         let herdr = source_brand_with_style("droid", IconStyle::Herdr);
         let nerd = source_brand_with_style("droid", IconStyle::Nerd);
-        assert_eq!(plain.mark, "◈");
-        assert_eq!(herdr, plain);
+        assert_eq!(plain.mark, "❋");
+        assert_eq!(herdr.mark, "\u{e1bb}");
         assert_eq!(nerd.mark, "󰚩");
         assert_ne!(plain.mark, source_brand_with_style("unknown", IconStyle::Plain).mark);
         assert_eq!(unicode_width::UnicodeWidthStr::width(plain.mark), 1);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(herdr.mark), 1);
         assert_eq!(unicode_width::UnicodeWidthStr::width(nerd.mark), 1);
         assert_eq!(herdr.color, nerd.color);
-        assert!(herdr_logo("droid").is_none());
+        assert_eq!(herdr_logo("droid"), Some("\u{e1bb}"));
     }
 }
