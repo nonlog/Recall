@@ -50,6 +50,9 @@ recall
 此模式需要显式启用，因为 Recall 无法可靠检测终端的字体回退行为。Herdr 未覆盖
 的 Agent 继续显示原有 Unicode 图标，默认 Nerd Font 模式与
 `RECALL_ICON_STYLE=plain` 都不改变。Recall 不安装或再分发 Herdr 字体。
+Herdr Agent Icons Max 目前不含 Droid/Factory 专属 Logo，因此 Recall 在
+Herdr/纯 Unicode 模式使用独立的单字符 `◈` 标记，默认 Nerd Font 模式使用
+机器人图标；不会冒用其他 Agent 的标识。
 
 ### 删除会话
 
@@ -62,7 +65,14 @@ recall session delete --id <session-id> --permanent  # 不保留 Recall 回收�
 recall session delete --id <session-id> --index-only # 保留原 Agent 数据，只删 Recall 索引
 ```
 
-Codex 与 OpenCode 使用各自官方删除命令，从而保持它们自己的会话元数据一致。Claude Code、Pi、OMP、Antigravity、Gemini、Grok、Copilot CLI、Cline、DeepSeek Harness 与 Kimi Code 会使用经过验证的独立会话文件或目录。没有稳定原生删除 API 的共享数据库来源需要显式使用 `--index-only`；Recall 不会猜测性地修改这些数据库。
+Codex 与 OpenCode 使用各自官方删除命令，从而保持它们自己的会话元数据一致。Claude Code、Pi、OMP、Antigravity、Gemini、Grok、Copilot CLI、Cline、DeepSeek Harness、Droid 与 Kimi Code 会使用经过验证的独立会话文件或目录。没有稳定原生删除 API 的共享数据库来源需要显式使用 `--index-only`；Recall 不会猜测性地修改这些数据库。
+
+Droid 的原生删除**仅涉及本地文件**：校验 `~/.factory/sessions`（或
+`DROID_SESSIONS_DIR`）中的会话 UUID 与 `session_start.id`，仅处理对应
+`.jsonl`、`.settings.json`、`.settings.json.bak` 文件。重复、路径不可信
+或不匹配时拒绝删除；建议先使用 `--dry-run` 预览。Droid 默认启用
+`cloudSessionSync`，Factory 云端副本不会被 Recall 的本地删除功能清除，
+仍可能在 Factory 中显示或被同步回来。
 
 Windows 下默认回收备份位于已安装 `recall.exe` 同目录的 `trash` 目录；Scoop 包会通过 persist 在升级间保留该目录。也可使用 `RECALL_TRASH_DIR` 覆盖位置。其他平台仍回退到 Recall 数据目录。对于带官方原生删除命令的来源，Recall 会先创建安全备份再调用原生命令；对于文件型来源，则把原始会话数据移动到回收目录。导入的会话始终只删除 Recall 索引。
 

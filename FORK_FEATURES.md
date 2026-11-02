@@ -76,6 +76,15 @@ Before merging or rebasing a new upstream release:
   a verified SQLite snapshot under Recall Trash, enables foreign keys, removes unconstrained
   `input_history` rows, then deletes the target `session` so native cascades/SET NULL rules run.
   Permanent mode skips the backup. Other ZCode sessions are never selected by the delete query.
+- Droid deletion searches only its configured `~/.factory/sessions` (or
+  `DROID_SESSIONS_DIR`) root for a unique UUID-named JSONL transcript whose
+  `session_start.id` matches the selected session. Include only its exact
+  `.settings.json` and `.settings.json.bak` sidecars; never delete a project
+  directory, global Factory settings, or `.favorites`. Ambiguity, malformed
+  headers, symlinks and unsafe paths fail closed. Verified stale-index cleanup
+  needs an indexed path in a trusted existing root, a complete scan and no
+  orphan settings. Re-check the native path set inside the staged transaction.
+  The operation is local-only, not a Factory cloud session deletion.
 - Native-aware deletion stages the Recall index deletion inside an IMMEDIATE SQLite
   transaction before native data is touched. SQLite lock/constraint/vector cleanup
   failures therefore happen first; native failure rolls the staged index change back.
@@ -139,6 +148,9 @@ when title parsing changes so unchanged files backfill correctly.
   from an installed font since terminals can render a different PUA glyph.
   Existing Nerd/default and plain/unicode choices must remain unchanged.
   Recall does not bundle or install third-party fonts.
+- Herdr currently has no official Droid logo. Droid receives a recognizable
+  one-cell Unicode fallback (`◈`) in Herdr/plain mode and a Nerd Font robot
+  glyph in the default mode, never an unrelated vendor's PUA codepoint.
 - Do not render an `[unknown]` host badge when a session has no location
   metadata. Real host labels remain visible when location metadata exists.
 - Landmarks: `src/tui/source_brand.rs`, `src/tui/ui/search.rs`, and their callers/tests.

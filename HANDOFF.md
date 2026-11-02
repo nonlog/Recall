@@ -1,12 +1,30 @@
 # Recall fork handoff
 
-Last updated: 2026-10-08
+Last updated: 2026-11-02
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall main at `a1f0ba53e714f2de2add48b43040135b94662d3e` (version 0.6.3)
 Fork release: `v0.6.3.2`
 Release commit: see tag `v0.6.3.2`
 
 ## Current fork policy
+
+### 2026-11-02 Droid native file deletion and safe source branding
+
+- Droid CLI v1.1.0 saves per-project sessions under `~/.factory/sessions`,
+  with `<UUID>.jsonl` (first record: `session_start.id`), optional
+  `<UUID>.settings.json` and `<UUID>.settings.json.bak`. The adapter honors
+  `DROID_SESSIONS_DIR`; deletion must resolve the exact same root.
+- Native deletion only touches one unique validated UUID transcript and its
+  settings sidecars; stale-index deletion needs a trusted indexed file path,
+  full root scan and no orphan settings. Repeat the lookup after staging the
+  Recall SQLite delete. No project directory or shared Factory files are
+  modified. Local file deletion does not remove Factory cloud copies when
+  Droid's `cloudSessionSync` is enabled.
+- `hhdebb/herdr-radar` intentionally has no Droid/Factory vendor glyph. Use
+  a distinct single-cell Unicode fallback in Herdr mode and a Nerd robot mark
+  in default mode; do not impersonate an unrelated vendor's PUA glyph.
+- GitHub Actions must compile/test all changes, including safe multi-file
+  trash rollback and source-brand regression tests. No PC/VPS builds.
 
 ### 2026-10-08 optional Herdr agent icons for the Windows TUI
 

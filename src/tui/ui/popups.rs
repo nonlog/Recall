@@ -622,6 +622,12 @@ pub(super) fn render_confirm_delete(f: &mut Frame, app: &App) {
             ("Recall only", "Only Recall index entries are removed.", THEME.info)
         }
     };
+    let mode_note = if pending.mode != DeleteMode::IndexOnly && source_counts.contains_key("droid")
+    {
+        "Droid files are removed locally only; Factory cloud copies may remain."
+    } else {
+        mode_note
+    };
     let deleting = app.delete_rx.is_some();
     let block = Block::default()
         .title(if pending.sessions.len() == 1 {

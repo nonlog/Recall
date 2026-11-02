@@ -59,6 +59,9 @@ The style is opt-in because Recall cannot reliably inspect a terminal's glyph
 fallback chain. Unsupported agent logos use the existing plain Unicode marks;
 the default Nerd Font style and `RECALL_ICON_STYLE=plain` remain unchanged.
 Recall neither installs nor redistributes the Herdr font.
+Herdr Agent Icons Max does not currently ship a Droid/Factory logo; Recall uses
+a distinct single-cell `◈` marker for Droid in Herdr/plain mode, and a robot
+Nerd Font glyph in the default icon mode. It never assigns another vendor's logo.
 
 ### Delete sessions
 
@@ -71,7 +74,15 @@ recall session delete --id <session-id> --permanent # no Recall trash backup
 recall session delete --id <session-id> --index-only # leave source-agent data untouched
 ```
 
-Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, OMP, Antigravity, Gemini, Grok, Copilot CLI, Cline, DeepSeek Harness, and Kimi Code use validated per-session files or directories. Shared-database sources without a stable native delete API require `--index-only`; Recall deliberately does not guess writes into their databases.
+Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, OMP, Antigravity, Gemini, Grok, Copilot CLI, Cline, DeepSeek Harness, Droid, and Kimi Code use validated per-session files or directories. Shared-database sources without a stable native delete API require `--index-only`; Recall deliberately does not guess writes into their databases.
+
+Droid native deletion is **local-only**: Recall validates the UUID and native
+`session_start.id` under `~/.factory/sessions` (or `DROID_SESSIONS_DIR`), then
+moves/removes only that session's `.jsonl`, `.settings.json`, and
+`.settings.json.bak`. Ambiguous or unsafe matches fail closed; use `--dry-run`
+to inspect paths before deleting. Droid can mirror sessions to Factory cloud
+(`cloudSessionSync` defaults to `true`); deleting local files does **not**
+delete cloud copies, which may still appear in Factory or be re-synced.
 
 On Windows, the default trash is the `trash` directory beside the installed `recall.exe`; the Scoop package persists that directory across upgrades. `RECALL_TRASH_DIR` can override the location. On other platforms Recall falls back to its data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
 

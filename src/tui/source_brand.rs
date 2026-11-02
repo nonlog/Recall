@@ -53,6 +53,9 @@ fn source_brand_with_style(source: &str, style: IconStyle) -> SourceBrand {
         "cline" => make(Some(""), "◈", 238, 105, 80),
         "roo" => make(None, "◒", 62, 180, 137),
         "deepseek-harness" => make(None, "◫", 77, 107, 254),
+        // Herdr Agent Icons Max does not include a Droid/Factory logo. Use a
+        // recognizable one-cell mark instead of an unrelated vendor's PUA.
+        "droid" => make(Some("󰚩"), "◈", 36, 200, 157),
         "kimi-code" => make(Some(""), "☾", 105, 102, 255),
         "qwen-code" => make(None, "Q", 99, 102, 241),
         "kilo-code" => make(None, "K", 0, 188, 212),
@@ -144,6 +147,7 @@ mod tests {
         "cline",
         "roo",
         "deepseek-harness",
+        "droid",
         "kimi-code",
         "qwen-code",
         "kilo-code",
@@ -244,5 +248,20 @@ mod tests {
             source_brand_with_style("claude-code", IconStyle::Herdr).mark,
             source_brand_with_style("claude-code", IconStyle::Plain).mark
         );
+    }
+
+    #[test]
+    fn droid_has_distinct_one_cell_icon_without_misusing_herdr_vendor_glyph() {
+        let plain = source_brand_with_style("droid", IconStyle::Plain);
+        let herdr = source_brand_with_style("droid", IconStyle::Herdr);
+        let nerd = source_brand_with_style("droid", IconStyle::Nerd);
+        assert_eq!(plain.mark, "◈");
+        assert_eq!(herdr, plain);
+        assert_eq!(nerd.mark, "󰚩");
+        assert_ne!(plain.mark, source_brand_with_style("unknown", IconStyle::Plain).mark);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(plain.mark), 1);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(nerd.mark), 1);
+        assert_eq!(herdr.color, nerd.color);
+        assert!(herdr_logo("droid").is_none());
     }
 }

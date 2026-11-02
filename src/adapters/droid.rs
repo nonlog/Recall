@@ -80,7 +80,7 @@ impl SourceAdapter for DroidAdapter {
     }
 }
 
-fn resolve_sessions_dir() -> Option<PathBuf> {
+pub(crate) fn resolve_sessions_dir() -> Option<PathBuf> {
     resolve_sessions_dir_from(std::env::var("DROID_SESSIONS_DIR").ok(), dirs::home_dir())
 }
 

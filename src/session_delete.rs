@@ -100,6 +100,9 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
         || (session.source == "grok"
             && native_roots.is_empty()
             && grok_native_absence_confirmed(session)?)
+        || (session.source == "droid"
+            && native_roots.is_empty()
+            && droid_native_absence_confirmed(session)?)
         || (session.source == "zcode" && zcode_native_exists == Some(false));
     if native_command.is_none()
         && native_roots.is_empty()
@@ -203,6 +206,10 @@ pub(crate) fn execute(
                         let current_roots = grok_session_roots(session)?;
                         current_roots.is_empty() && grok_native_absence_confirmed(session)?
                     }
+                    "droid" => {
+                        let current_roots = droid_session_roots(session)?;
+                        current_roots.is_empty() && droid_native_absence_confirmed(session)?
+                    }
                     "zcode" => match (
                         plan.native_database.as_ref(),
                         adapters::zcode::resolve_zcode_db_path().as_ref(),
@@ -220,6 +227,13 @@ pub(crate) fn execute(
                 anyhow::bail!(
                     "native {} session data is no longer confirmed absent; retry deletion after its native state is available",
                     session.source
+                );
+            }
+            if session.source == "droid"
+                && droid_session_roots(session)? != plan.native_roots
+            {
+                anyhow::bail!(
+                    "Droid session files changed since deletion was planned; retry to avoid deleting the wrong native session"
                 );
             }
             match plan.mode {
@@ -384,6 +398,7 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     let roots = match session.source.as_str() {
         "codex" => codex_session_roots(session)?,
         "pi" => pi_session_roots(session)?,
+        "droid" => droid_session_roots(session)?,
         "omp" => {
             source_path.map(|path| omp_session_roots(&path, &session.source_id)).unwrap_or_default()
         }
@@ -420,6 +435,145 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
     };
 
     normalize_roots(roots)
+}
+
+/// Droid CLI keeps each session under ~/.factory/sessions/<project>/<uuid>.jsonl,
+/// with an optional settings file and settings backup beside its transcript.
+/// Never delete a shared project directory, favourites file, or unrelated
+/// Factory configuration. Honour DROID_SESSIONS_DIR just like the adapter.
+fn droid_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let Some(root) = adapters::droid::resolve_sessions_dir() else {
+        return Ok(Vec::new());
+    };
+    droid_session_roots_under(&session.source_id, &root)
+}
+
+fn droid_session_roots_under(source_id: &str, root: &Path) -> Result<Vec<PathBuf>> {
+    if uuid::Uuid::try_parse(source_id).is_err() {
+        anyhow::bail!("Droid session ID is not a UUID: {source_id}");
+    }
+    let mut transcripts = Vec::new();
+    let root_meta = match fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to inspect Droid session root"),
+    };
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        anyhow::bail!("Droid session root is not a trusted directory: {}", root.display());
+    }
+
+    let name = format!("{source_id}.jsonl");
+    for entry in WalkDir::new(root).min_depth(1).max_depth(3).follow_links(false) {
+        let entry = entry
+            .with_context(|| format!("failed to scan Droid sessions in {}", root.display()))?;
+        if entry.file_name().to_str() != Some(name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().is_file() || !canonical_path_is_within(path, root) {
+            anyhow::bail!("unsafe Droid transcript path: {}", path.display());
+        }
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to inspect Droid transcript {}", path.display()))?;
+        let first = BufReader::new(file)
+            .lines()
+            .next()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("Droid transcript is empty: {}", path.display()))?;
+        let header: serde_json::Value = serde_json::from_str(first.trim_start_matches('\u{feff}'))
+            .with_context(|| format!("invalid Droid session header: {}", path.display()))?;
+        if header.get("type").and_then(|value| value.as_str()) != Some("session_start")
+            || header.get("id").and_then(|value| value.as_str()) != Some(source_id)
+        {
+            anyhow::bail!("Droid session header does not match {source_id}: {}", path.display());
+        }
+        transcripts.push(path.to_path_buf());
+    }
+    if transcripts.len() > 1 {
+        anyhow::bail!(
+            "multiple Droid transcripts matched session {source_id}; refusing ambiguous native deletion"
+        );
+    }
+
+    let Some(transcript) = transcripts.pop() else {
+        return Ok(Vec::new());
+    };
+    let mut roots = vec![transcript.clone()];
+    let parent = transcript.parent().expect("Droid transcript has a parent");
+    for suffix in ["settings.json", "settings.json.bak"] {
+        let sidecar = parent.join(format!("{source_id}.{suffix}"));
+        match fs::symlink_metadata(&sidecar) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                if !canonical_path_is_within(&sidecar, root) {
+                    anyhow::bail!(
+                        "Droid settings file escapes trusted session root: {}",
+                        sidecar.display()
+                    );
+                }
+                roots.push(sidecar);
+            }
+            Ok(_) => anyhow::bail!("unsafe Droid settings path: {}", sidecar.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to inspect Droid settings file"),
+        }
+    }
+    normalize_roots(roots)
+}
+
+fn droid_native_absence_confirmed(session: &Session) -> Result<bool> {
+    let Some(root) = adapters::droid::resolve_sessions_dir() else {
+        return Ok(false);
+    };
+    droid_native_absence_confirmed_under(
+        &session.source_id,
+        session.source_file_path.as_deref().map(Path::new),
+        &root,
+    )
+}
+
+fn droid_native_absence_confirmed_under(
+    source_id: &str,
+    indexed_path: Option<&Path>,
+    root: &Path,
+) -> Result<bool> {
+    if uuid::Uuid::try_parse(source_id).is_err() {
+        return Ok(false);
+    }
+    let Some(path) = indexed_path else {
+        return Ok(false);
+    };
+    if path.file_name().and_then(|name| name.to_str())
+        != Some(format!("{source_id}.jsonl").as_str())
+    {
+        return Ok(false);
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(false);
+    };
+    let parts = relative.components().collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts.len() > 3
+        || !parts.iter().all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    if !droid_session_roots_under(source_id, root)?.is_empty() {
+        return Ok(false);
+    }
+    // A transcript may have been removed manually while Droid still retains
+    // session-specific settings. Do not mistake those orphaned native files
+    // for a completely absent session.
+    for entry in WalkDir::new(root).min_depth(1).max_depth(3).follow_links(false) {
+        let entry = entry
+            .with_context(|| format!("failed to scan Droid sessions in {}", root.display()))?;
+        let file_name = entry.file_name().to_string_lossy();
+        if file_name == format!("{source_id}.settings.json")
+            || file_name == format!("{source_id}.settings.json.bak")
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn copilot_chat_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
@@ -1539,6 +1693,114 @@ mod tests {
             locations: Vec::new(),
             alternative_versions: 0,
         }
+    }
+
+    fn write_droid_session(root: &Path, project: &str, id: &str, header_id: &str) -> PathBuf {
+        let project_dir = root.join(project);
+        fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join(format!("{id}.jsonl"));
+        fs::write(&transcript, format!("{{\"type\":\"session_start\",\"id\":\"{header_id}\"}}\n"))
+            .unwrap();
+        transcript
+    }
+
+    #[test]
+    fn droid_delete_collects_only_one_validated_session_and_its_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "98000000-0000-4000-8000-000000000001";
+        let other = "98000000-0000-4000-8000-000000000002";
+        let transcript = write_droid_session(&root, "-project-a", id, id);
+        let other_transcript = write_droid_session(&root, "-project-a", other, other);
+        let parent = transcript.parent().unwrap();
+        let settings = parent.join(format!("{id}.settings.json"));
+        let backup = parent.join(format!("{id}.settings.json.bak"));
+        fs::write(&settings, "{}").unwrap();
+        fs::write(&backup, "{} backup").unwrap();
+        let shared_favourites = root.join(".favorites");
+        fs::write(&shared_favourites, "[]").unwrap();
+
+        let mut found = droid_session_roots_under(id, &root).unwrap();
+        found.sort();
+        let mut expected = vec![transcript.clone(), settings.clone(), backup.clone()];
+        expected.sort();
+        assert_eq!(found, expected);
+
+        let source = session("droid", id, Some(transcript.to_string_lossy().into_owned()));
+        let trash = dir.path().join("trash");
+        let moved = move_to_trash_at(&source, &found, &trash, 1_700_000_000_000, None).unwrap();
+        assert!(!transcript.exists());
+        assert!(!settings.exists());
+        assert!(!backup.exists());
+        assert!(other_transcript.exists());
+        assert!(shared_favourites.exists());
+        assert_eq!(moved.moved.len(), 3);
+        rollback_trash_move(&moved).unwrap();
+        assert!(transcript.exists());
+        assert!(settings.exists());
+        assert!(backup.exists());
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn droid_rejects_transcript_with_mismatched_native_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "98000000-0000-4000-8000-000000000003";
+        let path = write_droid_session(&root, "-project-a", id, "wrong-id");
+        let error = droid_session_roots_under(id, &root).unwrap_err();
+        assert!(error.to_string().contains("header does not match"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn droid_rejects_duplicate_transcripts_across_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "98000000-0000-4000-8000-000000000004";
+        let left = write_droid_session(&root, "-project-a", id, id);
+        let right = write_droid_session(&root, "-project-b", id, id);
+        assert!(
+            droid_session_roots_under(id, &root)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple Droid transcripts")
+        );
+        assert!(left.exists());
+        assert!(right.exists());
+    }
+
+    #[test]
+    fn droid_rejects_invalid_ids_and_untrusted_root_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "98000000-0000-4000-8000-000000000005";
+        let indexed = write_droid_session(&root, "-project-a", id, id);
+        assert!(droid_session_roots_under("../not-a-uuid", &root).is_err());
+        assert!(!droid_native_absence_confirmed_under(id, Some(&indexed), &root).unwrap());
+        assert!(
+            !droid_native_absence_confirmed_under(
+                id,
+                Some(&dir.path().join(format!("{id}.jsonl"))),
+                &root
+            )
+            .unwrap()
+        );
+        assert!(!droid_native_absence_confirmed_under(id, None, &root).unwrap());
+    }
+
+    #[test]
+    fn droid_stale_index_requires_complete_absence_of_native_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "98000000-0000-4000-8000-000000000006";
+        let transcript = write_droid_session(&root, "-project-a", id, id);
+        let settings = transcript.parent().unwrap().join(format!("{id}.settings.json"));
+        fs::write(&settings, "{}").unwrap();
+        fs::remove_file(&transcript).unwrap();
+        assert!(!droid_native_absence_confirmed_under(id, Some(&transcript), &root).unwrap());
+        fs::remove_file(&settings).unwrap();
+        assert!(droid_native_absence_confirmed_under(id, Some(&transcript), &root).unwrap());
     }
 
     #[test]
