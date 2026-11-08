@@ -129,7 +129,7 @@ fn load_session_indexes(claude_dir: &Path) -> SessionIndexes {
     SessionIndexes { live: load_session_index(claude_dir), project_summaries: HashMap::new() }
 }
 
-fn resolve_claude_dirs() -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn resolve_claude_dirs() -> anyhow::Result<Vec<PathBuf>> {
     if let Some(dir) = paths::env_path_dir("CLAUDE_CONFIG_DIR") {
         let Some(dir) = paths::existing_dir(dir) else {
             debug!("CLAUDE_CONFIG_DIR not found, skipping Claude Code");

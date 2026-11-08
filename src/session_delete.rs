@@ -91,6 +91,9 @@ pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
             && native_roots.is_empty()
             && codex_native_absence_confirmed(session)?
             && adapters::codex::native_session_exists(&session.source_id)? == Some(false))
+        || (session.source == "claude-code"
+            && native_roots.is_empty()
+            && claude_native_absence_confirmed(session)?)
         || (session.source == "copilot-chat"
             && native_roots.is_empty()
             && copilot_chat_native_absence_confirmed(session)?)
@@ -193,6 +196,10 @@ pub(crate) fn execute(
                             && codex_native_absence_confirmed(session)?
                             && adapters::codex::native_session_exists(&session.source_id)?
                                 == Some(false)
+                    }
+                    "claude-code" => {
+                        let current_roots = claude_session_roots(session)?;
+                        current_roots.is_empty() && claude_native_absence_confirmed(session)?
                     }
                     "copilot-chat" => {
                         let current_roots = copilot_chat_session_roots(session)?;
@@ -321,6 +328,9 @@ pub(crate) fn execute(
                 DeleteMode::IndexOnly => unreachable!("index-only handled before native phase"),
             }
 
+            if session.source == "codex" && plan.native_roots.iter().any(|root| root.exists()) {
+                let _ = reconcile_failed_codex_delete(session, &plan.native_roots)?;
+            }
             for root in &plan.native_roots {
                 if root.exists() {
                     anyhow::bail!(
@@ -406,7 +416,7 @@ fn native_roots_for_session(session: &Session) -> Result<Vec<PathBuf>> {
             .and_then(|path| gemini_session_file(&path, &session.source_id))
             .into_iter()
             .collect(),
-        "claude-code" => claude_session_roots(session, source_path.as_deref())?,
+        "claude-code" => claude_session_roots(session)?,
         "grok" => grok_session_roots(session)?,
         "copilot-cli" => copilot_cli_session_roots(session)?,
         "copilot-chat" => copilot_chat_session_roots(session)?,
@@ -955,13 +965,14 @@ fn codex_session_roots_under(
 }
 
 fn codex_session_file(path: &Path, source_id: &str) -> Option<PathBuf> {
-    if !path.is_file()
-        || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl" | "json"))
-    {
+    if !path.is_file() || uuid::Uuid::try_parse(source_id).is_err() {
         return None;
     }
-    let stem = path.file_stem()?.to_str()?;
-    if !stem.starts_with("rollout-") || uuid::Uuid::try_parse(source_id).is_err() {
+    let name = path.file_name()?.to_str()?;
+    let stem = [".jsonl.zst", ".jsonl.zstd", ".jsonl", ".json"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))?;
+    if !stem.starts_with("rollout-") {
         return None;
     }
     let prefix = stem.strip_suffix(source_id)?;
@@ -1277,53 +1288,174 @@ fn antigravity_session_roots(path: &Path, source_id: &str) -> Vec<PathBuf> {
     roots
 }
 
-fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    let Some(home) = dirs::home_dir() else {
-        return Ok(roots);
+fn claude_session_roots(session: &Session) -> Result<Vec<PathBuf>> {
+    let claude_dirs = adapters::claude_code::resolve_claude_dirs()?;
+    claude_session_roots_under(
+        &session.source_id,
+        session.source_file_path.as_deref().map(Path::new),
+        &claude_dirs,
+    )
+}
+
+fn claude_native_absence_confirmed(session: &Session) -> Result<bool> {
+    let claude_dirs = adapters::claude_code::resolve_claude_dirs()?;
+    claude_native_absence_confirmed_under(
+        &session.source_id,
+        session.source_file_path.as_deref().map(Path::new),
+        &claude_dirs,
+    )
+}
+
+fn claude_native_absence_confirmed_under(
+    source_id: &str,
+    indexed_path: Option<&Path>,
+    claude_dirs: &[PathBuf],
+) -> Result<bool> {
+    let Some(path) = indexed_path else {
+        return Ok(false);
     };
-    let claude_dir = home.join(".claude");
-    if let Some(path) = indexed_path
-        && claude_indexed_path_is_allowed(path, &session.source_id, &claude_dir)
+    if claude_dirs.is_empty()
+        || !claude_dirs
+            .iter()
+            .any(|claude_dir| claude_indexed_path_has_trusted_shape(path, source_id, claude_dir))
     {
-        roots.push(path.to_path_buf());
+        return Ok(false);
     }
-    for base in [claude_dir.join("projects"), claude_dir.join("transcripts")] {
-        if !base.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(base).into_iter().filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
+    Ok(claude_session_roots_under(source_id, Some(path), claude_dirs)?.is_empty())
+}
+
+fn claude_session_roots_under(
+    source_id: &str,
+    indexed_path: Option<&Path>,
+    claude_dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if !claude_source_id_is_safe(source_id) {
+        return Ok(Vec::new());
+    }
+    let mut roots = Vec::new();
+    for claude_dir in claude_dirs {
+        let dir_meta = match fs::symlink_metadata(claude_dir) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", claude_dir.display()));
             }
-            if path.file_stem().and_then(|stem| stem.to_str()) == Some(session.source_id.as_str()) {
+        };
+        if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Claude session root is not a trusted directory: {}",
+                claude_dir.display()
+            );
+        }
+
+        if let Some(path) = indexed_path {
+            if claude_indexed_path_is_allowed(path, source_id, claude_dir) {
                 roots.push(path.to_path_buf());
+                push_claude_transcript_sidecars(path, source_id, claude_dir, &mut roots)?;
+            } else if claude_indexed_path_has_trusted_shape(path, source_id, claude_dir) {
+                push_claude_transcript_sidecars(path, source_id, claude_dir, &mut roots)?;
             }
         }
-    }
 
-    let live_meta = claude_dir.join("sessions").join(format!("{}.json", session.source_id));
-    if live_meta.is_file() {
-        roots.push(live_meta);
-    }
+        for base in [claude_dir.join("projects"), claude_dir.join("transcripts")] {
+            let base_meta = match fs::symlink_metadata(&base) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect {}", base.display()));
+                }
+            };
+            if !base_meta.is_dir() || base_meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "Claude transcript root is not a trusted directory: {}",
+                    base.display()
+                );
+            }
+            let is_projects = base.file_name().and_then(|name| name.to_str()) == Some("projects");
+            for entry in WalkDir::new(&base).follow_links(false) {
+                let entry = entry.with_context(|| {
+                    format!("failed to scan Claude transcript root {}", base.display())
+                })?;
+                let path = entry.path();
+                if entry.file_type().is_file()
+                    && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                    && path.file_stem().and_then(|stem| stem.to_str()) == Some(source_id)
+                {
+                    if !canonical_path_is_within(path, &base) {
+                        anyhow::bail!("unsafe Claude transcript path: {}", path.display());
+                    }
+                    roots.push(path.to_path_buf());
+                    push_claude_transcript_sidecars(path, source_id, claude_dir, &mut roots)?;
+                } else if is_projects
+                    && entry.depth() == 2
+                    && entry.file_type().is_dir()
+                    && uuid::Uuid::try_parse(source_id).is_ok()
+                    && entry.file_name().to_str() == Some(source_id)
+                {
+                    if !canonical_path_is_within(path, &base) {
+                        anyhow::bail!("unsafe Claude session directory: {}", path.display());
+                    }
+                    roots.push(path.to_path_buf());
+                }
+            }
+        }
 
-    let jobs_dir = claude_dir.join("jobs");
-    if let Ok(entries) = fs::read_dir(&jobs_dir) {
-        for entry in entries.flatten() {
-            let job_dir = entry.path();
-            let state_path = job_dir.join("state.json");
-            let Ok(state) = fs::read_to_string(state_path) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&state) else {
-                continue;
-            };
-            if value.get("sessionId").and_then(|value| value.as_str())
-                == Some(session.source_id.as_str())
-                && job_dir.is_dir()
-            {
-                roots.push(job_dir);
+        let live_meta = claude_dir.join("sessions").join(format!("{source_id}.json"));
+        match fs::symlink_metadata(&live_meta) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                if !canonical_path_is_within(&live_meta, claude_dir) {
+                    anyhow::bail!("unsafe Claude session metadata path: {}", live_meta.display());
+                }
+                roots.push(live_meta);
+            }
+            Ok(_) => anyhow::bail!("unsafe Claude session metadata path: {}", live_meta.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", live_meta.display()));
+            }
+        }
+
+        let jobs_dir = claude_dir.join("jobs");
+        let entries = match fs::read_dir(&jobs_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to scan {}", jobs_dir.display()));
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("failed to scan {}", jobs_dir.display()))?;
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                let job_dir = entry.path();
+                let state_path = job_dir.join("state.json");
+                let state = match fs::read_to_string(&state_path) {
+                    Ok(state) => state,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("failed to read {}", state_path.display()));
+                    }
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&state) else {
+                    continue;
+                };
+                if value.get("sessionId").and_then(|value| value.as_str()) == Some(source_id) {
+                    if !canonical_path_is_within(&job_dir, &jobs_dir) {
+                        anyhow::bail!("unsafe Claude job directory: {}", job_dir.display());
+                    }
+                    roots.push(job_dir);
+                }
             }
         }
     }
@@ -1331,10 +1463,103 @@ fn claude_session_roots(session: &Session, indexed_path: Option<&Path>) -> Resul
     normalize_roots(roots)
 }
 
-fn claude_indexed_path_is_allowed(path: &Path, source_id: &str, claude_dir: &Path) -> bool {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-        || path.file_stem().and_then(|stem| stem.to_str()) != Some(source_id)
+fn push_claude_transcript_sidecars(
+    transcript_path: &Path,
+    source_id: &str,
+    claude_dir: &Path,
+    roots: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let projects_dir = claude_dir.join("projects");
+    if !transcript_path.starts_with(&projects_dir) {
+        return Ok(());
+    }
+    let is_subagent = transcript_path.components().any(|c| c.as_os_str() == "subagents");
+    if !is_subagent && uuid::Uuid::try_parse(source_id).is_ok() {
+        let artifact_dir = transcript_path.with_extension("");
+        match fs::symlink_metadata(&artifact_dir) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                if !canonical_path_is_within(&artifact_dir, &projects_dir) {
+                    anyhow::bail!(
+                        "unsafe Claude session artifact directory: {}",
+                        artifact_dir.display()
+                    );
+                }
+                roots.push(artifact_dir);
+            }
+            Ok(_) => {
+                anyhow::bail!(
+                    "unsafe Claude session artifact directory: {}",
+                    artifact_dir.display()
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", artifact_dir.display()));
+            }
+        }
+    } else if is_subagent {
+        let meta_path = transcript_path.with_extension("meta.json");
+        match fs::symlink_metadata(&meta_path) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                if !canonical_path_is_within(&meta_path, &projects_dir) {
+                    anyhow::bail!("unsafe Claude subagent metadata path: {}", meta_path.display());
+                }
+                roots.push(meta_path);
+            }
+            Ok(_) => {
+                anyhow::bail!("unsafe Claude subagent metadata path: {}", meta_path.display());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", meta_path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn claude_source_id_is_safe(source_id: &str) -> bool {
+    if source_id.is_empty() || source_id == "memory" {
+        return false;
+    }
+    let mut components = Path::new(source_id).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+fn claude_indexed_path_has_trusted_shape(path: &Path, source_id: &str, claude_dir: &Path) -> bool {
+    if !claude_source_id_is_safe(source_id) {
+        return false;
+    }
+    if !fs::symlink_metadata(claude_dir)
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
     {
+        return false;
+    }
+    if path.file_name().and_then(|name| name.to_str())
+        != Some(format!("{source_id}.jsonl").as_str())
+    {
+        return false;
+    }
+    for (base, min_parts) in
+        [(claude_dir.join("projects"), 2usize), (claude_dir.join("transcripts"), 1usize)]
+    {
+        if let Ok(relative) = path.strip_prefix(&base) {
+            let parts = relative.components().collect::<Vec<_>>();
+            if parts.len() >= min_parts
+                && parts.iter().all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn claude_indexed_path_is_allowed(path: &Path, source_id: &str, claude_dir: &Path) -> bool {
+    if !claude_indexed_path_has_trusted_shape(path, source_id, claude_dir) {
         return false;
     }
 
@@ -2152,6 +2377,100 @@ mod tests {
     }
 
     #[test]
+    fn claude_delete_includes_transcript_artifact_dir_live_meta_and_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let project = claude_dir.join("projects").join("D--Workspace-General");
+        let memory = project.join("memory");
+        let id = "95aa7744-ddb9-4a3e-9637-c02c587c3308";
+        let transcript = project.join(format!("{id}.jsonl"));
+        let artifact = project.join(id);
+        let sessions = claude_dir.join("sessions");
+        let live_meta = sessions.join(format!("{id}.json"));
+        let job_dir = claude_dir.join("jobs").join("job-1");
+        fs::create_dir_all(&memory).unwrap();
+        fs::create_dir_all(artifact.join("tool-results")).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&job_dir).unwrap();
+        fs::write(&transcript, "{}\n").unwrap();
+        fs::write(&live_meta, "{}\n").unwrap();
+        fs::write(job_dir.join("state.json"), format!(r#"{{"sessionId":"{id}"}}"#)).unwrap();
+
+        let mut roots =
+            claude_session_roots_under(id, Some(&transcript), std::slice::from_ref(&claude_dir))
+                .unwrap();
+        roots.sort();
+        let mut expected = vec![transcript, artifact, live_meta, job_dir];
+        expected.sort();
+        assert_eq!(roots, expected);
+        assert!(memory.exists());
+    }
+
+    #[test]
+    fn claude_missing_native_requires_trusted_indexed_path_and_complete_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let project = claude_dir.join("projects").join("D--Workspace-General");
+        fs::create_dir_all(&project).unwrap();
+        let id = "95aa7744-ddb9-4a3e-9637-c02c587c3308";
+        let missing_transcript = project.join(format!("{id}.jsonl"));
+        let outside = dir.path().join("outside").join(format!("{id}.jsonl"));
+
+        assert!(
+            claude_native_absence_confirmed_under(
+                id,
+                Some(&missing_transcript),
+                std::slice::from_ref(&claude_dir),
+            )
+            .unwrap()
+        );
+        assert!(
+            !claude_native_absence_confirmed_under(
+                id,
+                Some(&outside),
+                std::slice::from_ref(&claude_dir),
+            )
+            .unwrap()
+        );
+        assert!(
+            !claude_native_absence_confirmed_under(id, Some(&missing_transcript), &[]).unwrap()
+        );
+        assert!(
+            !claude_native_absence_confirmed_under(id, None, std::slice::from_ref(&claude_dir),)
+                .unwrap()
+        );
+
+        let orphan_artifact = project.join(id);
+        fs::create_dir_all(orphan_artifact.join("tool-results")).unwrap();
+        assert!(
+            !claude_native_absence_confirmed_under(
+                id,
+                Some(&missing_transcript),
+                std::slice::from_ref(&claude_dir),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            claude_session_roots_under(
+                id,
+                Some(&missing_transcript),
+                std::slice::from_ref(&claude_dir),
+            )
+            .unwrap(),
+            vec![orphan_artifact.clone()]
+        );
+        fs::remove_dir_all(&orphan_artifact).unwrap();
+        assert!(
+            claude_native_absence_confirmed_under(
+                id,
+                Some(&missing_transcript),
+                std::slice::from_ref(&claude_dir),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn codex_uses_native_delete_command_and_validates_trusted_rollout_path() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
@@ -2165,6 +2484,15 @@ mod tests {
         let command = adapters::delete_command_for("codex", id).unwrap();
 
         assert_eq!(roots, vec![path]);
+
+        let compressed = sessions.join(format!("rollout-2026-09-11T00-00-00-{id}.jsonl.zst"));
+        fs::remove_file(&roots[0]).unwrap();
+        fs::write(&compressed, "zst-data").unwrap();
+        assert_eq!(
+            codex_session_roots_under(Some(&roots[0]), id, std::slice::from_ref(&sessions))
+                .unwrap(),
+            vec![compressed]
+        );
         #[cfg(target_os = "windows")]
         {
             assert_eq!(command.program, "cmd.exe");

@@ -1,12 +1,33 @@
 # Recall fork handoff
 
-Last updated: 2026-11-02
+Last updated: 2026-11-08
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall main at `fcc3f214015e69f27f0c5952a21ec0c316e1642c` (version 0.6.5)
 Fork release: `v0.6.5.2`
 Release commit: see tag `v0.6.5.2`
 
 ## Current fork policy
+
+### 2026-11-08 Claude Code stale-index deletion and session artifact directory cleanup
+
+- Deleting Claude Code sessions whose native `.jsonl` files were already purged
+  from `~/.claude/projects/...` previously failed with `native deletion is not
+  supported for source claude-code` because `claude-code` lacked a
+  `native_already_missing` trusted-absence predicate and staged-transaction
+  re-check.
+- `claude_session_roots` now resolves the adapter's configured Claude roots
+  (`CLAUDE_CONFIG_DIR`, `$XDG_CONFIG_HOME/claude-code`, `~/.claude`), propagates
+  directory/file scan errors instead of swallowing them, includes per-session
+  sibling artifact directories (`projects/<project>/<uuid>`) and subagent
+  `.meta.json` sidecars while protecting shared `memory` directories, and
+  confirms native absence when a trusted indexed path's native transcript and
+  sidecars are all absent.
+- Codex deletion now also resolves compressed `.jsonl.zst` / `.jsonl.zstd`
+  rollout files inside `~/.codex/sessions` and `~/.codex/archived_sessions`
+  (covering 142 compressed Codex sessions on LOG that previously failed Trash
+  planning because their `.jsonl` had been compressed in-place), and reconciles
+  remaining validated compressed rollouts if `codex delete --force` removes the
+  `state_5.sqlite` thread row without removing the `.zst` file.
 
 ### 2026-11-02 Droid native deletion, patched Herdr font and Windows/Linux releases
 

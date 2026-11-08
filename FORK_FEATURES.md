@@ -57,7 +57,8 @@ Before merging or rebasing a new upstream release:
   mean native data is already absent and an explicitly confirmed delete removes the stale
   Recall index only. Multiple matches, unavailable roots, traversal/file-read errors, or
   other incomplete scans fail closed instead of guessing.
-- Codex deletion validates and re-resolves rollout files only inside the configured
+- Codex deletion validates and re-resolves rollout files (including compressed
+  `.jsonl.zst` / `.jsonl.zstd` rollouts) only inside the configured
   Codex `sessions` / `archived_sessions` roots. A missing rollout becomes safe stale-index
   cleanup only when the trusted-root scan finds no match and `state_5.sqlite` also confirms
   the thread id is absent. If `codex delete --force` exits nonzero, Recall rechecks both
@@ -67,6 +68,15 @@ Before merging or rebasing a new upstream release:
   Codex rows with no stored `source_file_path` may still be classified as native-missing, but only
   when the source id is a valid UUID, at least one trusted Codex root is available and fully scanned,
   no rollout matches, and the native thread registry explicitly confirms the id is absent.
+- Claude Code deletion resolves configured Claude roots (`CLAUDE_CONFIG_DIR`,
+  `$XDG_CONFIG_HOME/claude-code`, `~/.claude`), removes the session transcript,
+  any sibling per-session artifact directory (`projects/<project>/<uuid>`),
+  subagent `.meta.json` sidecar, `sessions/<id>.json` live metadata, and
+  matching `jobs/*/state.json` job directories while never touching project
+  `memory` directories. When native files are already absent, stale-index
+  deletion succeeds only when the indexed path has a trusted `projects` or
+  `transcripts` shape inside an existing configured Claude root and a complete
+  scan finds no remaining native artifacts.
 - VS Code Copilot Chat deletion removes only exact session-id JSON/JSONL files from known
   `User/globalStorage/emptyWindowChatSessions` and `User/workspaceStorage/*/chatSessions`
   locations. Copilot CLI and Grok deletion re-resolve whole session directories inside their

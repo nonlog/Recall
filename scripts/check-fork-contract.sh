@@ -72,6 +72,8 @@ require_text "src/session_delete.rs" '"droid" => droid_session_roots(session)?' 
 require_text "src/session_delete.rs" "droid_delete_collects_only_one_validated_session_and_its_sidecars" "Droid safe trash and sidecar regression test remains present"
 require_text "src/session_delete.rs" "droid_rejects_duplicate_transcripts_across_projects" "Droid ambiguous native paths fail closed"
 require_text "src/session_delete.rs" "droid_stale_index_requires_complete_absence_of_native_sidecars" "Droid stale-index safety remains protected"
+require_text "src/session_delete.rs" "claude_native_absence_confirmed" "Claude Code stale-index deletion remains supported"
+require_text "src/session_delete.rs" "claude_missing_native_requires_trusted_indexed_path_and_complete_absence" "Claude Code stale-index safety remains regression-tested"
 require_text "src/session.rs" "SessionCommands::Delete" "session delete CLI dispatch remains present"
 require_text "src/cli/session_args.rs" "permanent: bool" "session delete --permanent remains present"
 require_text "src/cli/session_args.rs" "index_only: bool" "session delete --index-only remains present"
