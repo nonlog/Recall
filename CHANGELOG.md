@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.5.3] (2026-11-08)
+
+### nonlog fork
+
+* Support Claude Code stale-index deletion when native `.jsonl` transcripts and sidecars have already been removed under configured Claude roots (`CLAUDE_CONFIG_DIR`, `$XDG_CONFIG_HOME/claude-code`, `~/.claude`), re-checking absence inside the staged SQLite transaction.
+* Include per-session Claude Code artifact directories (`projects/<project>/<uuid>`) and subagent `.meta.json` sidecars in native deletion while protecting shared project `memory` directories.
+* Resolve compressed Codex rollout files (`.jsonl.zst` / `.jsonl.zstd`) inside `sessions` and `archived_sessions` for Trash and permanent deletion, and reconcile remaining validated rollouts after `codex delete --force`.
+
 ## [0.6.5.2] (2026-11-02)
 
 ### nonlog fork
