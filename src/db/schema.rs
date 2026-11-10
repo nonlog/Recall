@@ -871,7 +871,9 @@ mod tests {
         assert_eq!(backups.len(), 1);
         let backup = Connection::open(&backups[0]).unwrap();
         let restored = root.path().join("restored.db");
-        backup.backup(rusqlite::DatabaseName::Main, &restored, None).unwrap();
+        backup
+            .backup(rusqlite::MAIN_DB, &restored, None::<fn(rusqlite::backup::Progress)>)
+            .unwrap();
         let restored = Connection::open(restored).unwrap();
         assert_eq!(schema_version(&restored).unwrap(), 16);
         assert_eq!(
