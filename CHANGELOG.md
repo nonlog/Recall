@@ -1,9 +1,18 @@
 # Changelog
 
-## Unreleased
+## [0.6.5.4] (2026-11-12)
 
-* Default to Herdr agent icons and bundle the patched icon font and license in release archives.
-* Improve the settings popup with agent branding and scrollable shortcut help.
+### nonlog fork
+
+* Default to Herdr Agent Icons Max logos (`RECALL_ICON_STYLE=nerd` or `plain` to opt out) and bundle the patched icon font (Droid at U+E1BB) with its MIT license under `fonts/` in release archives; the Scoop package installs it for the current user.
+* Redesign the Settings popup: larger layout, agent icons with full names, and a scrollable, color-highlighted shortcut reference.
+* Without an explicit agent selection, enable only agents that have indexed sessions.
+* Nest subagent (spawn-linked) sessions under their parent in the session list, collapsed by default (`Ctrl+E` toggles); Pi `subagent-<role>-<uuid>` sessions are recorded as spawn links.
+* Add a clickable agent tab bar above the session list (`Alt+←/→` cycles) that drives the existing source filter.
+
+### Upstream
+
+* Upgrade rusqlite to 0.41 and rmcp to 3.9 for RustSec advisories (#353).
 
 ## [0.6.5.3] (2026-11-08)
 
