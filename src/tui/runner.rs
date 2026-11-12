@@ -35,6 +35,12 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     let mut config = AppConfig::load()?;
     config.normalize_sources(&known_sources);
     let store = Store::open()?;
+    let detected = store.indexed_source_stats()?.into_keys().collect();
+    let save_error = if config.initialize_default_sources(&known_sources, &detected) {
+        config.save().err()
+    } else {
+        None
+    };
     if !cfg!(debug_assertions) {
         semantic::ensure_background_worker(true)?;
     }
@@ -72,7 +78,9 @@ pub(crate) fn run(usage_start: Option<(Option<Vec<String>>, Option<TimeRange>)>)
     terminal.clear()?;
 
     let mut app = App::new(&store, sources, config);
-    if cfg!(debug_assertions) {
+    if let Some(error) = save_error {
+        app.status_message = Some(format!("Failed to save agent settings: {error:#}"));
+    } else if cfg!(debug_assertions) {
         app.status_message =
             Some("Debug builds do not start semantic indexing; run cargo run -- sync first".into());
     }

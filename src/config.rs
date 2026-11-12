@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,8 @@ impl SyncWindow {
 pub(crate) struct AppConfig {
     #[serde(default)]
     pub(crate) disabled_sources: Vec<String>,
+    #[serde(default)]
+    pub(crate) sources_initialized: bool,
     #[serde(default, rename = "enabled_sources", skip_serializing_if = "Vec::is_empty")]
     legacy_enabled_sources: Vec<String>,
     #[serde(default)]
@@ -140,6 +143,30 @@ impl AppConfig {
         self.disabled_sources.dedup();
     }
 
+    pub(crate) fn initialize_default_sources(
+        &mut self,
+        known: &[(String, String)],
+        detected: &HashSet<String>,
+    ) -> bool {
+        if self.sources_initialized {
+            return false;
+        }
+        if self.disabled_sources.is_empty() {
+            if detected.is_empty() {
+                return false;
+            }
+            self.disabled_sources = known
+                .iter()
+                .filter(|(id, _)| !detected.contains(id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            self.disabled_sources.sort();
+            self.disabled_sources.dedup();
+        }
+        self.sources_initialized = true;
+        true
+    }
+
     pub(crate) fn is_source_enabled(&self, source_id: &str) -> bool {
         !self.disabled_sources.iter().any(|id| id == source_id)
     }
@@ -171,6 +198,62 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialized_sources_are_unchanged() {
+        let mut config = AppConfig { sources_initialized: true, ..Default::default() };
+        assert!(!config.initialize_default_sources(
+            &[("codex".into(), "Codex".into())],
+            &HashSet::from(["pi".into()])
+        ));
+        assert!(config.disabled_sources.is_empty());
+    }
+
+    #[test]
+    fn explicit_disabled_sources_are_preserved() {
+        let mut config = AppConfig { disabled_sources: vec!["codex".into()], ..Default::default() };
+        assert!(config.initialize_default_sources(&[], &HashSet::new()));
+        assert!(config.sources_initialized);
+        assert_eq!(config.disabled_sources, ["codex"]);
+    }
+
+    #[test]
+    fn empty_index_defers_source_initialization() {
+        let mut config = AppConfig::default();
+        assert!(
+            !config
+                .initialize_default_sources(&[("codex".into(), "Codex".into())], &HashSet::new())
+        );
+        assert!(!config.sources_initialized);
+        assert!(config.disabled_sources.is_empty());
+    }
+
+    #[test]
+    fn detected_sources_initialize_sorted_unique_disabled_sources() {
+        let mut config = AppConfig::default();
+        let known = [
+            ("z".into(), "Z".into()),
+            ("pi".into(), "Pi".into()),
+            ("a".into(), "A".into()),
+            ("z".into(), "Z".into()),
+        ];
+        assert!(config.initialize_default_sources(&known, &HashSet::from(["pi".into()])));
+        assert!(config.sources_initialized);
+        assert_eq!(config.disabled_sources, ["a", "z"]);
+    }
+
+    #[test]
+    fn old_config_defaults_sources_initialized_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"disabled_sources":["codex"]}"#).unwrap();
+        let config = AppConfig::load_from(&path).unwrap();
+        assert!(!config.sources_initialized);
+        config.save_to(&path).unwrap();
+        let reloaded = AppConfig::load_from(&path).unwrap();
+        assert!(!reloaded.sources_initialized);
+        assert_eq!(reloaded.disabled_sources, ["codex"]);
+    }
 
     #[test]
     fn existing_invalid_config_fails_closed() {

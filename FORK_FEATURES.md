@@ -172,6 +172,7 @@ when title parsing changes so unchanged files backfill correctly.
   Settings. The Settings popup must contain the complete keyboard shortcut
   reference, including bulk selection, Trash, permanent delete, usage, viewer,
   and other supported modes.
+- Without an explicit agent selection, enable only agents with indexed sessions once the index is non-empty; agents installed later remain disabled until enabled in Settings (`Ctrl+P`).
 - Landmarks: `src/tui/app.rs`, `src/tui/ui/popups.rs`, `src/tui/ui/mod.rs` tests.
 
 ### Skill Audit discovery on Windows/multi-harness setups

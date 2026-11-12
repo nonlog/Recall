@@ -13,6 +13,7 @@ Release commit: see tag `v0.6.5.3`
 - Herdr icons are the default; release archives include the patched icon-only
   font and license. Set `RECALL_ICON_STYLE=nerd` or `plain` for alternatives.
 - Settings show branded agents and a scrollable shortcut reference.
+- Without an explicit agent selection, only agents with indexed sessions are enabled once the index is non-empty; agents installed later remain disabled until enabled in Settings (`Ctrl+P`).
 
 ### 2026-11-08 Claude Code stale-index deletion and session artifact directory cleanup
 
