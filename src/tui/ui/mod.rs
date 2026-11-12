@@ -251,6 +251,15 @@ mod tests {
     }
 
     #[test]
+    fn search_renders_indexed_source_tabs() {
+        let mut app = test_app();
+        app.indexed_sources.insert("codex".to_string());
+        let rendered = render_to_text(&app, 80, 24);
+        assert!(rendered.contains(" All "));
+        assert!(rendered.contains("CDX"));
+    }
+
+    #[test]
     fn render_scrollbar_thumb_touches_bottom_at_max_position() {
         let backend = TestBackend::new(2, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -320,6 +329,8 @@ mod tests {
             "Shortcuts",
             "Ctrl+C quit",
             "Tab/Ctrl+F filters",
+            "Alt+←/→ source",
+            "Ctrl+E expand/collapse children",
             "Ctrl+R resume",
             "Ctrl+O app",
             "Ctrl+S sync",

@@ -413,14 +413,14 @@ pub(crate) struct SessionUsageEventRecord {
     pub(crate) raw_usage_json: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum MatchSource {
     Fts,
     Vector,
     Hybrid,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SearchResult {
     pub(crate) session: Session,
     pub(crate) match_source: MatchSource,

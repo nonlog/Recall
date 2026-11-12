@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 pub(crate) struct SearchLayout {
     pub(crate) search_box: Rect,
     pub(crate) filters: Rect,
+    pub(crate) tabs: Rect,
     pub(crate) list: Rect,
     pub(crate) preview: Rect,
     pub(crate) status: Rect,
@@ -24,6 +25,7 @@ pub(crate) fn search_layout(area: Rect) -> SearchLayout {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -32,14 +34,15 @@ pub(crate) fn search_layout(area: Rect) -> SearchLayout {
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(outer[2]);
+        .split(outer[3]);
 
     SearchLayout {
         search_box: outer[0],
         filters: outer[1],
+        tabs: outer[2],
         list: main[0],
         preview: main[1],
-        status: outer[3],
+        status: outer[4],
     }
 }
 

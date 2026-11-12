@@ -426,9 +426,10 @@ fn shortcut_reference_lines() -> Vec<Line<'static>> {
     vec![
         shortcut_line("Global", "Ctrl+C quit (except while deleting)"),
         shortcut_line("Search", "↑/↓ move · PgUp/PgDn page · ←/→ cursor/preview"),
-        shortcut_line("", "Backspace edit · Enter detail · Tab/Ctrl+F filters"),
+        shortcut_line("", "Backspace edit · Enter detail · Tab/Ctrl+F filters · Alt+←/→ source"),
         shortcut_line("", "Ctrl+R resume · Ctrl+O app · Ctrl+S sync · Ctrl+P settings"),
-        shortcut_line("", "Ins/Ctrl+Space/Space select · Del trash · Ctrl+D purge"),
+        shortcut_line("", "Ctrl+E expand/collapse children · Ins/Ctrl+Space/Space select"),
+        shortcut_line("", "Del trash · Ctrl+D purge"),
         shortcut_line("", "Esc clear/back/quit · q quit(empty query)"),
         shortcut_line("Preview", "↑/↓/PgUp/PgDn · ← sessions · Enter detail · Esc back"),
         shortcut_line("Viewer", "↑/↓/j/k/PgUp/PgDn · Home/g first · End/G last"),

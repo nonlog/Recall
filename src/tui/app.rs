@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,10 @@ pub(crate) struct App {
     pub(crate) query: String,
     pub(crate) cursor_pos: usize,
     pub(crate) results: Vec<SearchResult>,
+    tree_results: Vec<SearchResult>,
+    tree_parents: HashMap<String, String>,
+    pub(crate) tree_subagents: HashSet<String>,
+    pub(crate) expanded_sessions: HashSet<String>,
     pub(crate) selected_index: usize,
     pub(crate) selected_session_ids: HashSet<String>,
     pub(crate) result_scroll_offset: usize,
@@ -63,6 +67,7 @@ pub(crate) struct App {
     pub(crate) preview_scroll_offset: usize,
     mouse_drag_target: Option<MouseDragTarget>,
     pub(crate) all_sources: Vec<(String, String)>,
+    pub(crate) indexed_sources: HashSet<String>,
     pub(crate) config: AppConfig,
     pub(crate) should_quit: bool,
     pub(crate) last_keystroke: Instant,
@@ -110,6 +115,8 @@ impl App {
         app.total_messages = total_messages;
         app.semantic_progress = semantic_progress;
         app.project_directories = store.list_project_directories().unwrap_or_default();
+        app.indexed_sources =
+            store.indexed_source_stats().unwrap_or_default().into_keys().collect();
         app.reset_search_defaults();
         app.update_scope_metrics(store);
         app.load_recent(store);
@@ -126,6 +133,10 @@ impl App {
             query: String::new(),
             cursor_pos: 0,
             results: Vec::new(),
+            tree_results: Vec::new(),
+            tree_parents: HashMap::new(),
+            tree_subagents: HashSet::new(),
+            expanded_sessions: HashSet::new(),
             selected_index: 0,
             selected_session_ids: HashSet::new(),
             result_scroll_offset: 0,
@@ -134,6 +145,7 @@ impl App {
             preview_scroll_offset: 0,
             mouse_drag_target: None,
             all_sources,
+            indexed_sources: HashSet::new(),
             config,
             should_quit: false,
             last_keystroke: Instant::now(),
@@ -182,6 +194,94 @@ impl App {
             None
         } else {
             Some(enabled.into_iter().map(|(id, _)| id.clone()).collect())
+        }
+    }
+
+    pub(crate) fn source_tabs(&self, area: Rect) -> Vec<(Option<String>, String, Rect)> {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut tabs = vec![(None, " All ".to_string())];
+        tabs.extend(
+            self.all_sources.iter().filter(|(id, _)| self.indexed_sources.contains(id)).map(
+                |(id, label)| {
+                    (
+                        Some(id.clone()),
+                        format!(" {} {label} ", crate::tui::source_brand::source_brand(id).mark),
+                    )
+                },
+            ),
+        );
+        let active = if self.filters.active.sources.len() == 1 {
+            tabs.iter()
+                .position(|(id, _)| id.as_ref() == self.filters.active.sources.first())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if area.width == 0 || area.height == 0 {
+            return Vec::new();
+        }
+        if UnicodeWidthStr::width(tabs[active].1.as_str()) + usize::from(active > 0)
+            > area.width as usize
+        {
+            use unicode_width::UnicodeWidthChar;
+            let mut label = String::new();
+            let mut width = 0;
+            let budget = area.width.saturating_sub(1) as usize;
+            for ch in tabs[active].1.trim().chars() {
+                let char_width = ch.width().unwrap_or(0);
+                if width + char_width > budget {
+                    break;
+                }
+                label.push(ch);
+                width += char_width;
+            }
+            label.push('…');
+            return vec![(
+                tabs[active].0.clone(),
+                label,
+                Rect::new(area.x, area.y, (width + 1) as u16, area.height),
+            )];
+        }
+        let mut start = active;
+        let mut width = UnicodeWidthStr::width(tabs[active].1.as_str());
+        while start > 0 {
+            let next = UnicodeWidthStr::width(tabs[start - 1].1.as_str());
+            if width + next + usize::from(start > 1) > area.width as usize {
+                break;
+            }
+            width += next;
+            start -= 1;
+        }
+        let mut x = area.x + u16::from(start > 0 && area.width > 0);
+        let mut visible = Vec::new();
+        let count = tabs.len();
+        for (index, (id, label)) in tabs.into_iter().enumerate().skip(start) {
+            let w = UnicodeWidthStr::width(label.as_str()) as u16;
+            let reserve = u16::from(index + 1 < count);
+            if x.saturating_add(w).saturating_add(reserve) > area.right() && index != active {
+                if index < active {
+                    continue;
+                }
+                break;
+            }
+            if x.saturating_add(w) > area.right() {
+                break;
+            }
+            visible.push((id, label, Rect::new(x, area.y, w, area.height)));
+            x += w;
+        }
+        visible
+    }
+
+    fn select_source_tab(&mut self, source: Option<String>, store: &Store) {
+        self.filters.active.sources = source.into_iter().collect();
+        self.invalidate_active_search();
+        self.update_scope_metrics(store);
+        if self.query.trim().is_empty() {
+            self.load_recent(store);
+        } else {
+            self.queue_search_now();
         }
     }
 
@@ -279,10 +379,17 @@ impl App {
                 200,
             )
             .unwrap_or_default();
-        self.results = recent
-            .into_iter()
-            .map(|session| SearchResult { session, match_source: MatchSource::Fts, snippet: None })
-            .collect();
+        self.set_tree_results(
+            store,
+            recent
+                .into_iter()
+                .map(|session| SearchResult {
+                    session,
+                    match_source: MatchSource::Fts,
+                    snippet: None,
+                })
+                .collect(),
+        );
         self.selected_index = 0;
         self.selected_session_ids.clear();
         self.result_scroll_offset = 0;
@@ -290,6 +397,101 @@ impl App {
         self.search_pending = false;
         self.search_in_flight = false;
         self.load_preview(store);
+    }
+
+    fn set_tree_results(&mut self, store: &Store, results: Vec<SearchResult>) {
+        let ids: HashSet<_> = results.iter().map(|result| result.session.id.clone()).collect();
+        self.tree_parents.clear();
+        self.tree_subagents.clear();
+        for result in &results {
+            let id = &result.session.id;
+            if let Ok(topology) = store.session_topology(id) {
+                if topology.thread_role == Some(crate::types::ThreadRole::Subagent)
+                    || topology
+                        .parents
+                        .iter()
+                        .any(|link| link.relation == crate::types::ParentRelation::Spawn)
+                {
+                    self.tree_subagents.insert(id.clone());
+                }
+                for link in topology
+                    .parents
+                    .iter()
+                    .filter(|link| link.relation == crate::types::ParentRelation::Spawn)
+                {
+                    if let Ok(Some(parent)) = store.resolve_parent(id, link)
+                        && parent.id != *id
+                        && ids.contains(&parent.id)
+                    {
+                        self.tree_parents.insert(id.clone(), parent.id);
+                        break;
+                    }
+                }
+            }
+        }
+        // Cyclic topology cannot form a tree; leave those sessions at the top level.
+        let parents = self.tree_parents.clone();
+        self.tree_parents.retain(|id, _| {
+            let mut seen = HashSet::new();
+            let mut current = id;
+            while let Some(parent) = parents.get(current) {
+                if !seen.insert(current.clone()) {
+                    return false;
+                }
+                current = parent;
+            }
+            true
+        });
+        self.tree_results = results;
+        self.rebuild_tree();
+    }
+
+    fn rebuild_tree(&mut self) {
+        fn append(
+            id: &str,
+            all: &[SearchResult],
+            parents: &HashMap<String, String>,
+            expanded: &HashSet<String>,
+            rows: &mut Vec<SearchResult>,
+        ) {
+            if let Some(result) = all.iter().find(|result| result.session.id == id) {
+                rows.push(result.clone());
+                if expanded.contains(id) {
+                    for child in all.iter().filter(|result| {
+                        parents.get(&result.session.id).is_some_and(|parent| parent == id)
+                    }) {
+                        append(&child.session.id, all, parents, expanded, rows);
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for result in &self.tree_results {
+            if !self.tree_parents.contains_key(&result.session.id) {
+                append(
+                    &result.session.id,
+                    &self.tree_results,
+                    &self.tree_parents,
+                    &self.expanded_sessions,
+                    &mut rows,
+                );
+            }
+        }
+        self.results = rows;
+    }
+
+    pub(crate) fn tree_depth(&self, id: &str) -> usize {
+        let mut depth = 0;
+        let mut current = id;
+        while let Some(parent) = self.tree_parents.get(current) {
+            depth += 1;
+            current = parent;
+        }
+        depth
+    }
+
+    pub(crate) fn tree_child_count(&self, id: &str) -> usize {
+        self.tree_parents.values().filter(|parent| parent.as_str() == id).count()
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, store: &Store) {
@@ -723,6 +925,16 @@ impl App {
         }
 
         let layout = search_layout(self.terminal_area);
+        if capture_scrollbar && layout.tabs.contains(Position { x: column, y: row }) {
+            if let Some((source, _, _)) = self
+                .source_tabs(layout.tabs)
+                .into_iter()
+                .find(|(_, _, rect)| rect.contains(Position { x: column, y: row }))
+            {
+                self.select_source_tab(source, store);
+            }
+            return;
+        }
         if let Some(target) = self.handle_search_scrollbar_down(column, row, &layout, store) {
             if capture_scrollbar {
                 self.mouse_drag_target = Some(target);
@@ -947,6 +1159,46 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent, store: &Store) {
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            let mut sources = vec![None];
+            sources.extend(
+                self.all_sources
+                    .iter()
+                    .filter(|(id, _)| self.indexed_sources.contains(id))
+                    .map(|(id, _)| Some(id.clone())),
+            );
+            let current = if self.filters.active.sources.len() == 1 {
+                self.filters.active.sources.first()
+            } else {
+                None
+            };
+            let index = sources.iter().position(|source| source.as_ref() == current).unwrap_or(0);
+            let next = if key.code == KeyCode::Right {
+                (index + 1) % sources.len()
+            } else {
+                (index + sources.len() - 1) % sources.len()
+            };
+            self.select_source_tab(sources[next].clone(), store);
+            return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('e')
+            && self.panel_focus == PanelFocus::SessionList
+        {
+            if let Some(id) =
+                self.results.get(self.selected_index).map(|result| result.session.id.clone())
+                && self.tree_child_count(&id) > 0
+            {
+                if !self.expanded_sessions.insert(id.clone()) {
+                    self.expanded_sessions.remove(&id);
+                }
+                self.rebuild_tree();
+                self.result_scroll_offset = self.result_scroll_offset.min(self.selected_index);
+                self.load_preview(store);
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
             self.open_filters();
             return;
@@ -1417,9 +1669,14 @@ impl App {
             DeleteOrigin::Search if !self.selected_session_ids.is_empty() => self
                 .results
                 .iter()
+                .chain(self.tree_results.iter())
                 .filter(|result| self.selected_session_ids.contains(&result.session.id))
-                .map(|result| result.session.clone())
-                .collect(),
+                .fold(Vec::new(), |mut sessions: Vec<Session>, result| {
+                    if !sessions.iter().any(|session| session.id == result.session.id) {
+                        sessions.push(result.session.clone());
+                    }
+                    sessions
+                }),
             DeleteOrigin::Search => self
                 .results
                 .get(self.selected_index)
@@ -1500,7 +1757,13 @@ impl App {
     }
 
     fn remove_deleted_sessions(&mut self, store: &Store, session_ids: &HashSet<&str>) {
-        self.results.retain(|result| !session_ids.contains(result.session.id.as_str()));
+        let mut remaining = if self.tree_results.is_empty() {
+            std::mem::take(&mut self.results)
+        } else {
+            std::mem::take(&mut self.tree_results)
+        };
+        remaining.retain(|result| !session_ids.contains(result.session.id.as_str()));
+        self.set_tree_results(store, remaining);
         self.selected_session_ids.retain(|session_id| !session_ids.contains(session_id.as_str()));
         if self.results.is_empty() {
             self.selected_index = 0;
@@ -1888,6 +2151,8 @@ impl App {
 
     fn reload_after_sync(&mut self, store: &Store) {
         self.project_directories = store.list_project_directories().unwrap_or_default();
+        self.indexed_sources =
+            store.indexed_source_stats().unwrap_or_default().into_keys().collect();
         self.update_scope_metrics(store);
         if matches!(self.mode, AppMode::Viewing) && self.viewing.search_input.is_none() {
             let selected = self.viewing.selected_msg;
@@ -1949,7 +2214,7 @@ impl App {
         match response.result {
             Ok(mut results) => {
                 self.apply_sort(&mut results);
-                self.results = results;
+                self.set_tree_results(store, results);
                 self.selected_index = 0;
                 self.selected_session_ids.clear();
                 self.result_scroll_offset = 0;
@@ -1970,6 +2235,9 @@ impl App {
             Err(error) => {
                 if response.phase == SearchPhase::Text {
                     self.results.clear();
+                    self.tree_results.clear();
+                    self.tree_parents.clear();
+                    self.tree_subagents.clear();
                     self.preview_messages.clear();
                 } else {
                     self.embedding_unavailable = true;
@@ -2137,14 +2405,17 @@ impl App {
             }
             Ok(sessions) => {
                 let count = sessions.len();
-                self.results = sessions
-                    .into_iter()
-                    .map(|session| SearchResult {
-                        session,
-                        match_source: MatchSource::Fts,
-                        snippet: None,
-                    })
-                    .collect();
+                self.set_tree_results(
+                    store,
+                    sessions
+                        .into_iter()
+                        .map(|session| SearchResult {
+                            session,
+                            match_source: MatchSource::Fts,
+                            snippet: None,
+                        })
+                        .collect(),
+                );
                 self.selected_index = 0;
                 self.result_scroll_offset = 0;
                 self.panel_focus = PanelFocus::SessionList;
@@ -2478,6 +2749,82 @@ mod tests {
         )
     }
 
+    #[test]
+    fn source_tabs_hit_test_and_apply_filter() {
+        let (mut app, store) = app_and_store();
+        app.indexed_sources = ["codex".to_string(), "claude".to_string()].into_iter().collect();
+        let layout = search_layout(app.terminal_area);
+        let tabs = app.source_tabs(layout.tabs);
+        assert_eq!(tabs.len(), 3);
+        let codex = tabs.iter().find(|(id, _, _)| id.as_deref() == Some("codex")).unwrap().2;
+        app.handle_mouse_down(codex.x, codex.y, &store);
+        assert_eq!(app.filters.active.sources, vec!["codex"]);
+        let narrow = app.source_tabs(Rect::new(0, 0, 10, 1));
+        assert!(narrow.iter().any(|(id, _, _)| id.as_deref() == Some("codex")));
+        let tiny = app.source_tabs(Rect::new(3, 4, 3, 1));
+        assert_eq!(tiny[0].0.as_deref(), Some("codex"));
+        assert!(tiny[0].1.ends_with('…'));
+        assert!(!tiny[0].2.contains(Position { x: 3, y: 5 }));
+        app.handle_search_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &store);
+        assert!(app.filters.active.sources.is_empty());
+    }
+
+    #[test]
+    fn spawn_tree_collapses_expands_and_preserves_orphans_and_forks() {
+        let (mut app, store) = app_and_store();
+        let make = |id: &str| {
+            let mut result = codex_search_result();
+            result.session.id = id.into();
+            result.session.source_id = id.into();
+            result.session.title = id.into();
+            result
+        };
+        let parent = make("parent");
+        let child = make("child");
+        let orphan = make("orphan");
+        let fork = make("fork");
+        for result in [&parent, &child, &orphan, &fork] {
+            store.insert_session(&result.session).unwrap();
+        }
+        for (id, relation, parent_id) in [
+            ("child", "spawn", "parent"),
+            ("orphan", "spawn", "missing"),
+            ("fork", "fork", "parent"),
+        ] {
+            store.conn.execute(
+                "INSERT INTO session_parent_links (session_id, relation, parent_source, parent_source_id) VALUES (?1, ?2, 'codex', ?3)",
+                rusqlite::params![id, relation, parent_id],
+            ).unwrap();
+        }
+        app.set_tree_results(&store, vec![child, orphan, parent, fork]);
+        let ids = |app: &App| app.results.iter().map(|r| r.session.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app), ["orphan", "parent", "fork"]);
+        assert!(app.tree_subagents.contains("orphan"));
+        app.selected_index = 1;
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &store);
+        assert_eq!(ids(&app), ["orphan", "parent", "child", "fork"]);
+        assert_eq!(app.tree_depth("child"), 1);
+        app.indexed_sources.insert("codex".into());
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::tui::ui::render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("All"));
+        assert!(rendered.contains("Codex"));
+        assert!(rendered.contains("▾ 1"));
+        assert!(rendered.contains("└"));
+        app.selected_index = 2;
+        app.toggle_current_session_selection();
+        app.selected_index = 1;
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &store);
+        assert_eq!(ids(&app), ["orphan", "parent", "fork"]);
+        assert_eq!(app.delete_targets(DeleteOrigin::Search)[0].id, "child");
+    }
+
     fn app_and_store() -> (App, Store) {
         crate::db::schema::register_sqlite_vec();
         (app_with_sources(), Store::open_in_memory().unwrap())
@@ -2577,7 +2924,7 @@ mod tests {
     #[test]
     fn list_up_keeps_viewport_while_selection_remains_visible() {
         let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 12);
+        app.set_terminal_size(80, 13);
         app.results = numbered_results(6);
         app.selected_index = 5;
         app.result_scroll_offset = 1;
@@ -2604,7 +2951,7 @@ mod tests {
         app.set_terminal_size(22, 12);
         app.results = numbered_results(6);
 
-        app.handle_mouse_down(2, 6, &store);
+        app.handle_mouse_down(2, 7, &store);
 
         assert!(app.panel_focus == PanelFocus::SessionList);
         assert_eq!(app.selected_index, 1);
@@ -2618,7 +2965,7 @@ mod tests {
         app.preview_messages =
             vec![message(Role::User, None, 0), message(Role::Assistant, None, 1)];
 
-        app.handle_mouse_down(40, 8, &store);
+        app.handle_mouse_down(40, 9, &store);
 
         assert!(app.panel_focus == PanelFocus::Preview);
         assert_eq!(app.preview_selected_msg, 1);
@@ -2627,7 +2974,7 @@ mod tests {
     #[test]
     fn page_keys_move_session_list_by_visible_rows() {
         let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 12);
+        app.set_terminal_size(80, 13);
         app.results = numbered_results(12);
 
         let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
@@ -2649,7 +2996,7 @@ mod tests {
     #[test]
     fn page_keys_move_preview_by_visible_message_viewport() {
         let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 13);
+        app.set_terminal_size(80, 14);
         app.results = numbered_results(1);
         app.preview_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
         app.panel_focus = PanelFocus::Preview;
@@ -2740,7 +3087,7 @@ mod tests {
     #[test]
     fn search_scrollbar_bottom_selects_last_session() {
         let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 12);
+        app.set_terminal_size(80, 13);
         app.results = numbered_results(20);
 
         let layout = search_layout(app.terminal_area);
@@ -2755,7 +3102,7 @@ mod tests {
     #[test]
     fn search_scrollbar_drag_keeps_capture_outside_scrollbar_column() {
         let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 12);
+        app.set_terminal_size(80, 13);
         app.results = numbered_results(20);
 
         let layout = search_layout(app.terminal_area);
@@ -2776,7 +3123,7 @@ mod tests {
     #[test]
     fn preview_scrollbar_bottom_selects_last_message() {
         let (mut app, store) = app_and_store();
-        app.set_terminal_size(80, 12);
+        app.set_terminal_size(80, 13);
         app.results = numbered_results(1);
         app.preview_messages = (0..5).map(|n| message(Role::User, None, n)).collect();
 

@@ -322,6 +322,44 @@ pub(crate) fn scan_for_sync_skips_unchanged_session_when_usage_state_is_current(
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn pi_subagent_name_marks_spawn_without_changing_ordinary_forks() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, relation, role) in [
+        (
+            "subagent-worker-019e5af2-5528-7d10-888a-b299c21d0e2e",
+            ParentRelation::Spawn,
+            ThreadRole::Subagent,
+        ),
+        (
+            "subagent-worker-019e5af2-5528-7d10-888a-b299c21d0e2e-1",
+            ParentRelation::Spawn,
+            ThreadRole::Subagent,
+        ),
+        ("ordinary fork", ParentRelation::Fork, ThreadRole::Primary),
+        ("subagent-not-a-uuid", ParentRelation::Fork, ThreadRole::Primary),
+    ] {
+        let path = write_session(
+            Format::Pi,
+            root.path(),
+            session_id(Format::Pi),
+            &[
+                serde_json::json!({"type":"session", "id":session_id(Format::Pi), "parentSession":"019e0000-0000-0000-0000-000000000001"}),
+                serde_json::json!({"type":"session_info", "name":name}),
+                serde_json::json!({"type":"message", "message":{"role":"user", "content":"hello"}}),
+            ],
+        );
+        let entry = FileScanEntry {
+            session_id: session_id(Format::Pi).into(),
+            stat_target: path,
+            directory: None,
+        };
+        let raw = parse_file(Format::Pi, entry, 0, true).unwrap().unwrap();
+        assert_eq!(raw.thread_role, Some(role));
+        assert_eq!(raw.parent_links[0].relation, relation);
+    }
+}
+
 pub(crate) fn maps_parent_session_to_primary_fork(format: Format) {
     let root = temp_root("parent-session");
     let session_dir = root.join(format!("--tmp-{}-project--", format.source()));

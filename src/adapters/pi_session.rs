@@ -19,7 +19,7 @@ use crate::types::{
     RawUsageEvent, Role, ThreadRole,
 };
 
-pub(super) const METADATA_PARSER_VERSION: u32 = 3;
+pub(super) const METADATA_PARSER_VERSION: u32 = 4;
 pub(super) const USAGE_PARSER_VERSION: u32 = 3;
 pub(super) const EVENT_PARSER_VERSION: u32 = 1;
 
@@ -60,6 +60,7 @@ struct ParsedSession {
     usage_events: Vec<RawUsageEvent>,
     events: Vec<RawSessionEvent>,
     parent_session: Option<String>,
+    is_subagent: bool,
 }
 
 pub(super) fn push_existing_unique_dir(
@@ -200,7 +201,7 @@ pub(super) fn parse_session_file(
         .filter(|parent| parent != &source_id)
     {
         Some(parent) => vec![ParentLink {
-            relation: ParentRelation::Fork,
+            relation: if parsed.is_subagent { ParentRelation::Spawn } else { ParentRelation::Fork },
             source: format.source().to_string(),
             source_id: parent,
         }],
@@ -222,7 +223,11 @@ pub(super) fn parse_session_file(
         custom_title: parsed.custom_title,
         summary: None,
         duration_minutes: None,
-        thread_role: Some(ThreadRole::Primary),
+        thread_role: Some(if parsed.is_subagent {
+            ThreadRole::Subagent
+        } else {
+            ThreadRole::Primary
+        }),
         parent_links,
         metadata_parser_version: Some(METADATA_PARSER_VERSION),
         refresh_session_metadata: false,
@@ -248,6 +253,7 @@ fn parse_session(
     let mut current_model: Option<String> = None;
     let mut inherited_usage_cutoff = None;
     let mut parent_session = None;
+    let mut is_subagent = false;
     let mut messages = Vec::new();
     let mut usage_events = Vec::new();
     let mut events = Vec::new();
@@ -264,6 +270,20 @@ fn parse_session(
             "session_info" if format == Format::Pi => {
                 if let Some(name) = non_empty_str(entry.get("name")) {
                     // Pi appends session_info records as names are regenerated; the latest wins.
+                    is_subagent |= name.strip_prefix("subagent-").is_some_and(|suffix| {
+                        let ends_in_uuid = |value: &str| {
+                            value
+                                .get(value.len().saturating_sub(36)..)
+                                .is_some_and(|id| uuid::Uuid::try_parse(id).is_ok())
+                        };
+                        ends_in_uuid(suffix)
+                            || suffix
+                                .rsplit_once('-')
+                                .filter(|(_, tail)| {
+                                    !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
+                                })
+                                .is_some_and(|(head, _)| ends_in_uuid(head))
+                    });
                     custom_title = Some(name.to_string());
                 }
             }
@@ -379,6 +399,7 @@ fn parse_session(
         usage_events,
         events,
         parent_session,
+        is_subagent,
     })
 }
 

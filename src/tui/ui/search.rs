@@ -21,9 +21,60 @@ pub(super) fn render_search(f: &mut Frame, app: &App) {
 
     render_search_box(f, app, layout.search_box);
     render_filters(f, app, layout.filters);
+    render_source_tabs(f, app, layout.tabs);
     render_result_list(f, app, layout.list);
     render_preview(f, app, layout.preview);
     render_status_bar(f, app, layout.status);
+}
+
+fn render_source_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let tabs = app.source_tabs(area);
+    if let Some((_, _, first)) = tabs.first()
+        && first.x > area.x
+    {
+        f.render_widget(
+            Paragraph::new("…").style(Style::default().fg(THEME.text_muted)),
+            Rect::new(area.x, area.y, 1, area.height),
+        );
+    }
+    for (source, label, rect) in &tabs {
+        let active = if app.filters.active.sources.len() == 1 {
+            source.as_ref() == app.filters.active.sources.first()
+        } else {
+            source.is_none()
+        };
+        let style = if active {
+            Style::default()
+                .fg(THEME.selected_fg)
+                .bg(THEME.selected_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(source
+                .as_deref()
+                .map(source_brand)
+                .map_or(THEME.text_muted, |brand| brand.color))
+        };
+        f.render_widget(Paragraph::new(label.as_str()).style(style), *rect);
+    }
+    if let Some((source, _, rect)) = tabs.last() {
+        let count =
+            app.all_sources.iter().filter(|(id, _)| app.indexed_sources.contains(id)).count() + 1;
+        let last = source
+            .as_ref()
+            .and_then(|id| {
+                app.all_sources
+                    .iter()
+                    .filter(|(id, _)| app.indexed_sources.contains(id))
+                    .position(|(candidate, _)| candidate == id)
+            })
+            .map_or(0, |index| index + 1);
+        if last + 1 < count && rect.right() < area.right() {
+            f.render_widget(
+                Paragraph::new("…").style(Style::default().fg(THEME.text_muted)),
+                Rect::new(rect.right(), area.y, 1, area.height),
+            );
+        }
+    }
 }
 
 pub(super) fn render_search_box(f: &mut Frame, app: &App, area: Rect) {
@@ -238,7 +289,30 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
 
+            let depth = app.tree_depth(&s.id);
+            let children = app.tree_child_count(&s.id);
+            let mut prefix = if depth > 0 {
+                format!("{}└ ", "  ".repeat(depth))
+            } else if app.tree_subagents.contains(&s.id) {
+                "↳ ".to_string()
+            } else {
+                String::new()
+            };
+            if children > 0 {
+                prefix.push_str(&format!(
+                    "{} {children} ",
+                    if app.expanded_sessions.contains(&s.id) { '▾' } else { '▸' }
+                ));
+            }
             let line = Line::from(vec![
+                Span::styled(
+                    prefix,
+                    if selected {
+                        selected_text_style
+                    } else {
+                        Style::default().fg(THEME.text_muted)
+                    },
+                ),
                 Span::styled(
                     if marked { "[x] " } else { "[ ] " },
                     if marked {
@@ -249,7 +323,13 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::styled(
                     format!("{} {}", brand.mark, source_label),
-                    if selected { selected_text_style } else { Style::default().fg(brand.color) },
+                    if selected {
+                        selected_text_style
+                    } else if depth > 0 {
+                        Style::default().fg(THEME.text_muted)
+                    } else {
+                        Style::default().fg(brand.color)
+                    },
                 ),
                 Span::raw(" "),
                 Span::styled(
@@ -262,7 +342,13 @@ pub(super) fn render_result_list(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::styled(
                     title,
-                    if selected { selected_text_style } else { Style::default().fg(THEME.text) },
+                    if selected {
+                        selected_text_style
+                    } else if depth > 0 {
+                        Style::default().fg(THEME.text_muted)
+                    } else {
+                        Style::default().fg(THEME.text)
+                    },
                 ),
                 Span::styled(
                     format!("  {age}"),

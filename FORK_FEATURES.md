@@ -165,6 +165,13 @@ when title parsing changes so unchanged files backfill correctly.
   metadata. Real host labels remain visible when location metadata exists.
 - Landmarks: `src/tui/source_brand.rs`, `src/tui/ui/search.rs`, and their callers/tests.
 
+### TUI subagent trees and source tabs
+
+- Group spawn-linked sessions beneath their parent when both are in the current results; forks and orphaned results remain visible at the top level. Trees start collapsed; `Ctrl+E` toggles the selected parent.
+- Pi sessions with a `subagent-...<UUID>` session name (optionally followed by a numeric suffix) and parent link are indexed as subagents with spawn links; ordinary Pi forks stay forks. The metadata parser version must advance when this classification changes.
+- Show indexed-source tabs using the existing source filter, with mouse selection and `Alt+Left/Right` cycling. Preserve active-tab visibility on narrow terminals.
+- Landmarks: `src/adapters/pi_session.rs`, `src/tui/app.rs`, `src/tui/layout.rs`, `src/tui/ui/search.rs`.
+
 ### Shortcut UX
 
 - Keep the upstream bottom shortcut bar rather than a fork-only replacement.
