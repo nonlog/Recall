@@ -197,20 +197,23 @@ impl App {
         }
     }
 
+    /// Agents shown as tabs: enabled in Settings and present in the index.
+    fn tab_sources(&self) -> impl Iterator<Item = &(String, String)> {
+        self.all_sources.iter().filter(|(id, _)| {
+            self.indexed_sources.contains(id) && self.config.is_source_enabled(id)
+        })
+    }
+
     pub(crate) fn source_tabs(&self, area: Rect) -> Vec<(Option<String>, String, Rect)> {
         use unicode_width::UnicodeWidthStr;
 
         let mut tabs = vec![(None, " All ".to_string())];
-        tabs.extend(
-            self.all_sources.iter().filter(|(id, _)| self.indexed_sources.contains(id)).map(
-                |(id, label)| {
-                    (
-                        Some(id.clone()),
-                        format!(" {} {label} ", crate::tui::source_brand::source_brand(id).mark),
-                    )
-                },
-            ),
-        );
+        tabs.extend(self.tab_sources().map(|(id, label)| {
+            (
+                Some(id.clone()),
+                format!(" {} {label} ", crate::tui::source_brand::source_brand(id).mark),
+            )
+        }));
         let active = if self.filters.active.sources.len() == 1 {
             tabs.iter()
                 .position(|(id, _)| id.as_ref() == self.filters.active.sources.first())
@@ -1162,12 +1165,7 @@ impl App {
         if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Left | KeyCode::Right)
         {
             let mut sources = vec![None];
-            sources.extend(
-                self.all_sources
-                    .iter()
-                    .filter(|(id, _)| self.indexed_sources.contains(id))
-                    .map(|(id, _)| Some(id.clone())),
-            );
+            sources.extend(self.tab_sources().map(|(id, _)| Some(id.clone())));
             let current = if self.filters.active.sources.len() == 1 {
                 self.filters.active.sources.first()
             } else {
@@ -2767,6 +2765,10 @@ mod tests {
         assert!(!tiny[0].2.contains(Position { x: 3, y: 5 }));
         app.handle_search_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &store);
         assert!(app.filters.active.sources.is_empty());
+        app.config.disabled_sources = vec!["codex".to_string()];
+        assert!(
+            app.source_tabs(layout.tabs).iter().all(|(id, _, _)| id.as_deref() != Some("codex"))
+        );
     }
 
     #[test]
