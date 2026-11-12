@@ -12,9 +12,9 @@ enum IconStyle {
 impl IconStyle {
     fn from_setting(setting: Option<&str>) -> Self {
         match setting {
-            Some("herdr" | "herdr-agent-icons") => Self::Herdr,
+            Some("nerd" | "nerd-font") => Self::Nerd,
             Some("plain" | "unicode" | "ascii" | "off" | "0") => Self::Plain,
-            _ => Self::Nerd,
+            _ => Self::Herdr,
         }
     }
 }
@@ -178,8 +178,10 @@ mod tests {
     }
 
     #[test]
-    fn icon_style_preserves_existing_defaults_and_plain_aliases() {
-        assert_eq!(IconStyle::from_setting(None), IconStyle::Nerd);
+    fn icon_style_defaults_to_herdr_and_preserves_aliases() {
+        assert_eq!(IconStyle::from_setting(None), IconStyle::Herdr);
+        assert_eq!(IconStyle::from_setting(Some("unknown")), IconStyle::Herdr);
+        assert_eq!(IconStyle::from_setting(Some("nerd-font")), IconStyle::Nerd);
         assert_eq!(IconStyle::from_setting(Some("nerd")), IconStyle::Nerd);
         for alias in ["plain", "unicode", "ascii", "off", "0"] {
             assert_eq!(IconStyle::from_setting(Some(alias)), IconStyle::Plain);

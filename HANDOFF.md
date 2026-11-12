@@ -8,6 +8,12 @@ Release commit: see tag `v0.6.5.3`
 
 ## Current fork policy
 
+### Herdr icons and settings
+
+- Herdr icons are the default; release archives include the patched icon-only
+  font and license. Set `RECALL_ICON_STYLE=nerd` or `plain` for alternatives.
+- Settings show branded agents and a scrollable shortcut reference.
+
 ### 2026-11-08 Claude Code stale-index deletion and session artifact directory cleanup
 
 - Deleting Claude Code sessions whose native `.jsonl` files were already purged

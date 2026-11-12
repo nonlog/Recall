@@ -59,14 +59,18 @@ jobs:
       - name: Package (unix)
         if: inputs.upload && runner.os != 'Windows'
         run: |
+          mkdir -p target/${{ matrix.target }}/release/fonts
+          cp assets/fonts/* target/${{ matrix.target }}/release/fonts/
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz recall
+          tar czf ../../../${{ matrix.artifact }}.tar.gz recall fonts
           cd ../../..
 
       - name: Package (windows)
         if: inputs.upload && runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/recall.exe -DestinationPath ${{ matrix.artifact }}.zip
+        run: |
+          Copy-Item -Recurse assets/fonts target/${{ matrix.target }}/release/fonts
+          Compress-Archive -Path target/${{ matrix.target }}/release/recall.exe, target/${{ matrix.target }}/release/fonts -DestinationPath ${{ matrix.artifact }}.zip
 
       - uses: actions/upload-artifact@v5
         if: inputs.upload

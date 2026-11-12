@@ -312,84 +312,113 @@ pub(super) fn render_export_input(f: &mut Frame, app: &App) {
 
 pub(super) fn render_settings(f: &mut Frame, app: &App) {
     let area = f.area();
-    let width = area.width.min(118);
-    let shortcut_rows = shortcut_reference_lines().len() as u16 + 2;
-    let source_rows = app.all_sources.len().div_ceil(2) as u16 + 4;
-    let desired_height = shortcut_rows.max(source_rows) + 2;
-    let height = desired_height.min(area.height.saturating_sub(2).max(7));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup = Rect::new(x, y, width, height);
-
+    let popup = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
     let block = Block::default()
-        .title(" Settings (Enter/Space toggle, Esc close) ")
+        .title(" Settings (Enter/Space toggle, PgUp/PgDn shortcuts, Esc close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME.accent))
         .style(Style::default().bg(THEME.popup_bg));
     let inner = block.inner(popup);
-
     f.render_widget(Clear, popup);
     f.render_widget(block, popup);
-
-    if inner.width < 4 || inner.height == 0 {
+    if inner.width < 8 || inner.height < 3 {
         return;
     }
-
-    let left_width = if inner.width >= 90 {
-        (inner.width * 32 / 100).max(36)
-    } else {
-        (inner.width / 2).max(28)
-    }
-    .min(inner.width.saturating_sub(1));
-    let right_width = inner.width.saturating_sub(left_width + 1);
-    let left = Rect::new(inner.x, inner.y, left_width, inner.height);
-    let right = Rect::new(inner.x + left_width + 1, inner.y, right_width, inner.height);
-
-    let selected_style = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
-    let normal_style = Style::default().fg(THEME.text);
+    let left_width = (inner.width / 2).saturating_sub(1);
+    let left = Rect::new(
+        inner.x + 1,
+        inner.y + 1,
+        left_width.saturating_sub(1),
+        inner.height.saturating_sub(2),
+    );
+    let right = Rect::new(
+        inner.x + left_width + 1,
+        inner.y + 1,
+        inner.width.saturating_sub(left_width + 2),
+        inner.height.saturating_sub(2),
+    );
+    let header = Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD);
+    let selected = Style::default().bg(THEME.selected_bg).fg(THEME.selected_fg);
+    let normal = Style::default().fg(THEME.text);
     let mut settings = vec![
-        Line::from(vec![
-            Span::styled(" Time Scope: ", Style::default().fg(THEME.text_muted)),
-            Span::styled(
-                app.config.sync_window.label(),
-                if app.settings_selected == 0 { selected_style } else { normal_style },
-            ),
-        ]),
+        Line::from(Span::styled("Time scope", header)),
+        Line::from(Span::styled(
+            format!("  {}", app.config.sync_window.label()),
+            if app.settings_selected == 0 { selected } else { normal },
+        )),
         Line::from(""),
+        Line::from(Span::styled("Agents", header)),
     ];
-
-    let count = app.all_sources.len();
-    let rows = count.div_ceil(2);
-    let cell_width = (left_width as usize).saturating_sub(2).max(2) / 2;
+    let longest = app.all_sources.iter().map(|(id, _)| id.len() + 8).max().unwrap_or(0);
+    let columns = if usize::from(left.width) >= longest * 2 { 2 } else { 1 };
+    let rows = app.all_sources.len().div_ceil(columns);
+    let width = usize::from(left.width) / columns;
     for row in 0..rows {
         let mut spans = Vec::new();
-        for index in [row, row + rows] {
-            if let Some((source_id, label)) = app.all_sources.get(index) {
-                let enabled = app.config.is_source_enabled(source_id);
-                let prefix = if enabled { "[x]" } else { "[ ]" };
-                let raw = format!(" {prefix} {label} ({source_id})");
-                let text = truncate_to_width(&raw, cell_width.saturating_sub(1));
-                let padding = cell_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-                let style =
-                    if app.settings_selected == index + 1 { selected_style } else { normal_style };
+        for col in 0..columns {
+            let index = row + col * rows;
+            if let Some((id, _)) = app.all_sources.get(index) {
+                let brand = crate::tui::source_brand::source_brand(id);
+                let name = id
+                    .split('-')
+                    .map(|word| match word {
+                        "cli" => "CLI".to_string(),
+                        _ => {
+                            let mut chars = word.chars();
+                            chars
+                                .next()
+                                .map(|c| c.to_uppercase().to_string() + chars.as_str())
+                                .unwrap_or_default()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let prefix = if app.config.is_source_enabled(id) { "[x]" } else { "[ ]" };
+                let chosen = app.settings_selected == index + 1;
+                let style = if chosen { selected } else { normal };
+                let text = format!(" {prefix} ");
+                let name = truncate_to_width(&name, width.saturating_sub(8));
+                let used = UnicodeWidthStr::width(text.as_str())
+                    + UnicodeWidthStr::width(brand.mark)
+                    + 1
+                    + UnicodeWidthStr::width(name.as_str());
                 spans.push(Span::styled(text, style));
-                spans.push(Span::raw(" ".repeat(padding)));
-            } else {
-                spans.push(Span::raw(" ".repeat(cell_width)));
+                spans.push(Span::styled(brand.mark, style.fg(brand.color)));
+                spans.push(Span::styled(
+                    format!(" {name}{}", " ".repeat(width.saturating_sub(used))),
+                    style,
+                ));
             }
         }
         settings.push(Line::from(spans));
     }
-
-    f.render_widget(Paragraph::new(settings).wrap(Wrap { trim: false }), left);
-
+    let visible = usize::from(left.height.saturating_sub(4));
+    let selected_row = app.settings_selected.saturating_sub(1) % rows.max(1);
+    let offset = selected_row.saturating_add(1).saturating_sub(visible);
+    if offset > 0 {
+        settings.drain(4..4 + offset.min(rows));
+    }
+    f.render_widget(Paragraph::new(settings), left);
     if right.width > 0 {
-        let mut shortcuts = vec![Line::from(Span::styled(
-            " Shortcuts",
-            Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
-        ))];
-        shortcuts.extend(shortcut_reference_lines());
-        f.render_widget(Paragraph::new(shortcuts), right);
+        let shortcuts = shortcut_reference_lines();
+        let width = usize::from(right.width.saturating_sub(13).max(1));
+        let lines = shortcuts.iter().map(|line| line.width().div_ceil(width) + 1).sum::<usize>();
+        let max_scroll = lines.saturating_sub(usize::from(right.height.saturating_sub(1)));
+        let offset = usize::from(app.settings_shortcut_scroll).min(max_scroll);
+        let title = format!("Shortcuts  ↓ PgUp/PgDn ({})", offset + 1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(title, header))),
+            Rect::new(right.x, right.y, right.width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(shortcuts).wrap(Wrap { trim: false }).scroll((offset as u16, 0)),
+            Rect::new(right.x, right.y + 1, right.width, right.height.saturating_sub(1)),
+        );
     }
 }
 
@@ -430,10 +459,23 @@ fn shortcut_reference_lines() -> Vec<Line<'static>> {
 }
 
 fn shortcut_line(label: &'static str, text: &'static str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {label:<10}"), Style::default().fg(THEME.accent)),
-        Span::styled(text, Style::default().fg(THEME.text_muted)),
-    ])
+    let mut spans = vec![Span::styled(
+        format!(" {label:<13}"),
+        Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+    )];
+    for (index, part) in text.split(' ').enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let is_key = index == 0 || text.split(' ').nth(index.saturating_sub(1)) == Some("·");
+        let style = if is_key {
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(THEME.text_muted)
+        };
+        spans.push(Span::styled(part, style));
+    }
+    Line::from(spans)
 }
 
 pub(super) fn render_share_result(f: &mut Frame, app: &App) {

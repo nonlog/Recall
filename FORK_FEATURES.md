@@ -152,17 +152,13 @@ when title parsing changes so unchanged files backfill correctly.
 
 - Keep per-source colors/icons with terminal-safe fallbacks.
 - `RECALL_ICON_STYLE` remains the user fallback control.
-- `RECALL_ICON_STYLE=herdr` opts into the third-party Herdr Agent Icons Max
-  U+E1A0–U+E1BB logo mapping where a source has an exact supported vendor.
-  Unmapped agents must keep their Unicode fallback; do not autodetect solely
-  from an installed font since terminals can render a different PUA glyph.
-  Existing Nerd/default and plain/unicode choices must remain unchanged.
-  Recall does not bundle or install third-party fonts.
-- The locally patched Herdr font and plugin explicitly map Droid to U+E1BB,
-  with text fallback `❋`. Recall must emit U+E1BB in Herdr mode and retain
-  the text fallback in plain mode and a Nerd Font robot in default mode.
-  This extension is not yet in hhdebb/herdr-radar's official GitHub main;
-  only users with the matching patched font can render U+E1BB.
+- Herdr Agent Icons Max is the default, using the U+E1A0–U+E1BB logo mapping
+  where a source has an exact supported vendor. Unmapped agents keep their
+  Unicode fallback. `nerd`/`nerd-font` and plain/unicode remain explicit
+  alternatives. Release archives bundle the icon font and its MIT license;
+  Recall itself does not install fonts.
+- The bundled locally patched font maps Droid to U+E1BB, with text fallback
+  `❋`; Nerd Font mode retains the robot mark.
 - User-selected release builds are Windows x86_64 and Linux x86_64 only;
   do not reintroduce macOS build runners in either main or extension Releases.
 - Do not render an `[unknown]` host badge when a session has no location

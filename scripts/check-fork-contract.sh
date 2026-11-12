@@ -98,7 +98,8 @@ require_text "src/adapters/pi_session.rs" '"session_info" if format == Format::P
 
 require_file "src/tui/source_brand.rs"
 require_text "src/tui/source_brand.rs" "RECALL_ICON_STYLE" "source icon fallback remains configurable"
-require_text "src/tui/source_brand.rs" 'Some("herdr" | "herdr-agent-icons")' "Herdr icon mode remains opt-in"
+require_text "src/tui/source_brand.rs" '_ => Self::Herdr' "Herdr icon mode remains the default"
+require_text "src/tui/source_brand.rs" 'Some("nerd" | "nerd-font")' "Nerd Font icon mode remains available"
 require_text "src/tui/source_brand.rs" "herdr_agent_icons_match_the_upstream_private_use_mapping" "Herdr vendor glyph mappings remain regression-tested"
 require_text "src/tui/source_brand.rs" "herdr_mode_keeps_unicode_fallbacks_for_unmapped_agents" "Herdr missing-agent fallback remains regression-tested"
 require_text "src/tui/source_brand.rs" '"droid" => "\u{e1bb}"' "Droid maps to the user's patched Herdr glyph U+E1BB"

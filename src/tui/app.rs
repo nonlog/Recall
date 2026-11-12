@@ -82,6 +82,7 @@ pub(crate) struct App {
     pub(crate) semantic_progress: SemanticProgress,
     pub(crate) semantic_last_refresh: Instant,
     pub(crate) settings_selected: usize,
+    pub(crate) settings_shortcut_scroll: u16,
     pub(crate) pending_resume: Option<PendingResume>,
     pub(crate) pending_delete: Option<PendingDelete>,
     pub(crate) delete_rx: Option<mpsc::Receiver<DeleteWorkerResponse>>,
@@ -152,6 +153,7 @@ impl App {
             semantic_progress: SemanticProgress::default(),
             semantic_last_refresh: Instant::now(),
             settings_selected: 0,
+            settings_shortcut_scroll: 0,
             pending_resume: None,
             pending_delete: None,
             delete_rx: None,
@@ -885,6 +887,14 @@ impl App {
     }
 
     fn handle_mouse_scroll(&mut self, column: u16, row: u16, up: bool, store: &Store) {
+        if matches!(self.mode, AppMode::Settings) {
+            self.settings_shortcut_scroll = if up {
+                self.settings_shortcut_scroll.saturating_sub(3)
+            } else {
+                self.settings_shortcut_scroll.saturating_add(3)
+            };
+            return;
+        }
         if matches!(self.mode, AppMode::Search) {
             let layout = search_layout(self.terminal_area);
             match self.search_mouse_target(column, row, &layout) {
@@ -1511,6 +1521,12 @@ impl App {
             }
             KeyCode::Up => self.handle_scroll_up(store),
             KeyCode::Down => self.handle_scroll_down(store),
+            KeyCode::PageUp => {
+                self.settings_shortcut_scroll = self.settings_shortcut_scroll.saturating_sub(8)
+            }
+            KeyCode::PageDown => {
+                self.settings_shortcut_scroll = self.settings_shortcut_scroll.saturating_add(8)
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
                 self.update_setting(store);
             }

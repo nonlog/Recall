@@ -32,29 +32,7 @@ recall info  # 索引统计与 worker 状态
 
 ### 终端中的 Agent 图标
 
-`nonlog/Recall` 分支支持与 [herdr-radar](https://github.com/hhdebb/herdr-radar)
-一致的 Agent Logo。终端已能正确显示 **Herdr Agent Icons Max** 字体的
-`U+E1A0–U+E1BA` 图标时，可启用：
-
-```powershell
-$env:RECALL_ICON_STYLE = 'herdr'
-recall
-```
-
-若需要在以后启动的 Windows Terminal 会话中持续启用，可运行
-`[Environment]::SetEnvironmentVariable('RECALL_ICON_STYLE', 'herdr', 'User')`，
-再新开终端。Windows Terminal 不支持按 Unicode 码位指定字体，需要使用确实能
-显示这些图标的主字体／后备字体配置；herdr-radar 提供的合并字体
-`JetBrains Mono Herdr` 是一种选择。**仅安装独立图标字体不保证 WT 能正确选中它。**
-
-此模式需要显式启用，因为 Recall 无法可靠检测终端的字体回退行为。Herdr 未覆盖
-的 Agent 继续显示原有 Unicode 图标，默认 Nerd Font 模式与
-`RECALL_ICON_STYLE=plain` 都不改变。Recall 不安装或再分发 Herdr 字体。
-你安装的 Herdr Agent Icons Max 已通过本地补丁增加 Droid 专属图标
-`U+E1BB`，本机 `herdr-radar` 插件也使用相同码位。启用
-`RECALL_ICON_STYLE=herdr` 后，Recall 会显示相同的 Droid 图标；
-`plain` 模式使用对应的 `❋` 文本回退，默认 Nerd Font 模式保留机器人标记。
-**未安装 Droid 字体补丁的旧版 Herdr 字体可能无法显示 `U+E1BB`。**
+Recall 默认使用 [Herdr Agent Icons Max](https://github.com/hhdebb/herdr-radar) 图标。发布压缩包的 `fonts/` 目录包含字体及许可证；该字体已通过本地补丁添加 Droid 图标 `U+E1BB`。请配置终端使用此字体；也可设置 `RECALL_ICON_STYLE=nerd`（或 `nerd-font`）使用 Nerd Font 图标，或设置 `RECALL_ICON_STYLE=plain` 使用 Unicode 图标。旧版未打补丁的字体可能无法显示 Droid 图标。
 
 ### 删除会话
 

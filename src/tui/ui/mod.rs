@@ -314,7 +314,7 @@ mod tests {
         let mut app = App::new(&store, crate::adapters::source_labels(), AppConfig::default());
         app.mode = AppMode::Settings;
 
-        let rendered = render_to_text(&app, 180, 24);
+        let rendered = render_to_text(&app, 180, 40);
 
         for expected in [
             "Shortcuts",
@@ -337,6 +337,26 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "missing shortcut {expected}:\n{rendered}");
         }
+    }
+
+    #[test]
+    fn settings_popup_shows_brand_and_highlights_shortcut_keys() {
+        let mut app = test_app();
+        app.all_sources = vec![("claude-code".into(), "CC".into())];
+        app.mode = AppMode::Settings;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..40).map(|y| buffer_row(buffer, y, 120)).collect::<Vec<_>>();
+        let brand = crate::tui::source_brand::source_brand("claude-code");
+        assert!(rows.iter().any(|row| row.contains(&format!("{} Claude Code", brand.mark))));
+        let y = rows.iter().position(|row| row.contains("Ctrl+R resume")).unwrap() as u16;
+        assert!((0..120).any(|x| {
+            let cell = &buffer[(x, y)];
+            cell.symbol() == "C"
+                && cell.fg == crate::tui::theme::THEME.accent
+                && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+        }));
     }
 
     #[test]

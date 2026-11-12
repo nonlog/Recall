@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* Default to Herdr agent icons and bundle the patched icon font and license in release archives.
+* Improve the settings popup with agent branding and scrollable shortcut help.
+
 ## [0.6.5.3] (2026-11-08)
 
 ### nonlog fork
