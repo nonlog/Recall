@@ -3060,8 +3060,10 @@ mod tests {
         let max_start = pane.total_rows() - inner.height as usize;
         let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
 
-        app.handle_key(down, &store);
-        app.handle_key(down, &store);
+        // Page count depends on the preview height; extra presses must clamp at the end.
+        for _ in 0..pane.total_rows() {
+            app.handle_key(down, &store);
+        }
 
         assert_eq!(app.preview_selected_msg, 3);
         assert_eq!(app.preview_scroll_offset, max_start);
