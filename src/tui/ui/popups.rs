@@ -546,42 +546,6 @@ fn shortcut_reference_lines(width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-#[cfg(test)]
-mod shortcut_tests {
-    use super::*;
-
-    #[test]
-    fn shortcut_rows_preserve_entries_and_truncate_without_wrapping() {
-        let lines = shortcut_reference_lines(80);
-        for &(_, key, description) in SHORTCUTS {
-            assert!(
-                lines.iter().any(|line| {
-                    line.spans.len() == 4
-                        && line.spans[1].content == key
-                        && line.spans[3].content == description
-                }),
-                "missing {key} {description}"
-            );
-        }
-        let screenshot = shortcut_reference_lines(36);
-        assert!(screenshot.iter().any(|line| line.spans.len() == 4
-            && line.spans[1].content == "Ctrl+R"
-            && line.spans[3].content == "resume"));
-        assert!(screenshot.iter().any(|line| line.spans.len() == 4
-            && line.spans[1].content == "Alt+←/→"
-            && line.spans[3].content == "cycle source tabs"));
-        let narrow = shortcut_reference_lines(25);
-        assert!(
-            narrow
-                .iter()
-                .any(|line| line.spans.last().is_some_and(|span| span.content.ends_with('…')))
-        );
-        for width in 0..=25 {
-            assert!(shortcut_reference_lines(width).iter().all(|line| line.width() <= width));
-        }
-    }
-}
-
 pub(super) fn render_share_result(f: &mut Frame, app: &App) {
     let Some(popup) = app.share_popup.as_ref() else {
         return;
@@ -943,4 +907,40 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_rows_preserve_entries_and_truncate_without_wrapping() {
+        let lines = shortcut_reference_lines(80);
+        for &(_, key, description) in SHORTCUTS {
+            assert!(
+                lines.iter().any(|line| {
+                    line.spans.len() == 4
+                        && line.spans[1].content == key
+                        && line.spans[3].content == description
+                }),
+                "missing {key} {description}"
+            );
+        }
+        let screenshot = shortcut_reference_lines(36);
+        assert!(screenshot.iter().any(|line| line.spans.len() == 4
+            && line.spans[1].content == "Ctrl+R"
+            && line.spans[3].content == "resume"));
+        assert!(screenshot.iter().any(|line| line.spans.len() == 4
+            && line.spans[1].content == "Alt+←/→"
+            && line.spans[3].content == "cycle source tabs"));
+        let narrow = shortcut_reference_lines(25);
+        assert!(
+            narrow
+                .iter()
+                .any(|line| line.spans.last().is_some_and(|span| span.content.ends_with('…')))
+        );
+        for width in 0..=25 {
+            assert!(shortcut_reference_lines(width).iter().all(|line| line.width() <= width));
+        }
+    }
 }

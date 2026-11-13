@@ -216,6 +216,20 @@ fn send_result(
     });
 }
 
+fn send_error(
+    response_tx: &Sender<SearchResponse>,
+    request: SearchRequest,
+    phase: SearchPhase,
+    error: String,
+) {
+    let _ = response_tx.send(SearchResponse {
+        id: request.id,
+        query: request.query,
+        phase,
+        result: Err(error),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,18 +388,4 @@ mod tests {
             assert_eq!(results.iter().filter(|result| result.session.id == id).count(), 1);
         }
     }
-}
-
-fn send_error(
-    response_tx: &Sender<SearchResponse>,
-    request: SearchRequest,
-    phase: SearchPhase,
-    error: String,
-) {
-    let _ = response_tx.send(SearchResponse {
-        id: request.id,
-        query: request.query,
-        phase,
-        result: Err(error),
-    });
 }
