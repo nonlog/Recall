@@ -5,6 +5,27 @@ Source: https://github.com/hhdebb/herdr-radar, `dist/HerdrAgentIconsMax-Regular.
 This icon-only font is built from SVG marks and contains no JetBrains Mono outlines.
 The bundled font is locally patched to add the Droid glyph at U+E1BB.
 
+Recall additions
+----------------
+
+The following monochrome icons are from Lobe Icons, MIT licensed,
+Copyright (c) 2023 LobeHub. The MIT permission and warranty text below applies.
+
+- MiniMax: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/minimax.svg
+- Xiaomi MiMo: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/xiaomimimo.svg
+- Goose: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/goose.svg
+- OpenHands: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/openhands.svg
+- CodeBuddy: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/codebuddy.svg
+- Trae: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/trae.svg
+- Junie: https://github.com/lobehub/lobe-icons/blob/master/packages/static-svg/icons/junie.svg
+
+The following icons are from Simple Icons, CC0-1.0:
+
+- Zed: https://github.com/simple-icons/simple-icons/blob/develop/icons/zedindustries.svg
+- Warp: https://github.com/simple-icons/simple-icons/blob/develop/icons/warp.svg
+
+All trademarks belong to their respective owners.
+
 MIT License
 
 Copyright (c) 2025 qintmb

@@ -125,6 +125,15 @@ fn herdr_logo(source: &str) -> Option<&'static str> {
         "muse-code" => "\u{e1b9}",
         "crush" => "\u{e1ba}",
         "droid" => "\u{e1bb}",
+        "minimax-code" => "\u{e1bc}",
+        "mimo-code" => "\u{e1bd}",
+        "goose" => "\u{e1be}",
+        "openhands" => "\u{e1bf}",
+        "codebuddy" => "\u{e1c6}",
+        "trae-cli" => "\u{e1c7}",
+        "junie" => "\u{e1c8}",
+        "zed" => "\u{e1c9}",
+        "warp" => "\u{e1ca}",
         _ => return None,
     })
 }
@@ -220,6 +229,15 @@ mod tests {
             ("muse-code", 0xe1b9),
             ("crush", 0xe1ba),
             ("droid", 0xe1bb),
+            ("minimax-code", 0xe1bc),
+            ("mimo-code", 0xe1bd),
+            ("goose", 0xe1be),
+            ("openhands", 0xe1bf),
+            ("codebuddy", 0xe1c6),
+            ("trae-cli", 0xe1c7),
+            ("junie", 0xe1c8),
+            ("zed", 0xe1c9),
+            ("warp", 0xe1ca),
         ];
         for (source, codepoint) in logos {
             let glyph = source_brand_with_style(source, IconStyle::Herdr);
@@ -244,7 +262,7 @@ mod tests {
 
     #[test]
     fn herdr_mode_keeps_unicode_fallbacks_for_unmapped_agents() {
-        for source in ["roo", "mimo-code", "goose", "codebuddy", "warp", "unknown"] {
+        for source in ["roo", "rx-agent", "zcode", "unknown"] {
             let with_font = source_brand_with_style(source, IconStyle::Herdr);
             let without_font = source_brand_with_style(source, IconStyle::Plain);
             assert_eq!(with_font, without_font, "missing fallback for {source}");
