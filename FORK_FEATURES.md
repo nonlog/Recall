@@ -43,6 +43,8 @@ Before merging or rebasing a new upstream release:
 
 ## Retained fork features
 
+- Recent session trees include spawn children loaded in the search worker; Settings presents a scrollable shortcut table.
+
 ### Safe session deletion
 
 - `Del` moves native session data to Recall Trash when safe native paths are

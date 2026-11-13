@@ -3,10 +3,15 @@ Herdr Agent Icons Max
 
 Source: https://github.com/hhdebb/herdr-radar, `dist/HerdrAgentIconsMax-Regular.ttf`.
 This icon-only font is built from SVG marks and contains no JetBrains Mono outlines.
-The bundled font is locally patched to add the Droid glyph at U+E1BB.
+The font is patched with additional glyphs, including Droid at U+E1BB.
 
 Recall additions
 ----------------
+
+Droid was extracted from the locally supplied patched font in
+`nonlog/agent-extras/fonts/HerdrAgentIconsMax-Regular.ttf`. Its adjacent
+`THIRD_PARTY_NOTICES.md` does not identify the Droid mark's original source or
+license; its underlying provenance is unverified. Droid is a Factory trademark.
 
 The following monochrome icons are from Lobe Icons, MIT licensed,
 Copyright (c) 2023 LobeHub. The MIT permission and warranty text below applies.

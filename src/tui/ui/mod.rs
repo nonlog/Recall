@@ -323,19 +323,20 @@ mod tests {
         let mut app = App::new(&store, crate::adapters::source_labels(), AppConfig::default());
         app.mode = AppMode::Settings;
 
-        let rendered = render_to_text(&app, 180, 40);
+        let rendered = render_to_text(&app, 180, 150);
+        let rendered = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
 
         for expected in [
             "Shortcuts",
             "Ctrl+C quit",
             "Tab/Ctrl+F filters",
-            "Alt+←/→ source",
+            "Alt+←/→ cycle source tabs",
             "Ctrl+E expand/collapse children",
             "Ctrl+R resume",
             "Ctrl+O app",
             "Ctrl+S sync",
             "Ctrl+P settings",
-            "Ins/Ctrl+Space/Space select",
+            "Ins/Ctrl+Space select",
             "Del trash",
             "Ctrl+D purge",
             "a subagents",
@@ -344,7 +345,7 @@ mod tests {
             "Y/Enter confirm",
             "O open",
             "Enter apply/save",
-            "Export/Find",
+            "Export & find",
         ] {
             assert!(rendered.contains(expected), "missing shortcut {expected}:\n{rendered}");
         }
@@ -361,7 +362,7 @@ mod tests {
         let rows = (0..40).map(|y| buffer_row(buffer, y, 120)).collect::<Vec<_>>();
         let brand = crate::tui::source_brand::source_brand("claude-code");
         assert!(rows.iter().any(|row| row.contains(&format!("{} Claude Code", brand.mark))));
-        let y = rows.iter().position(|row| row.contains("Ctrl+R resume")).unwrap() as u16;
+        let y = rows.iter().position(|row| row.contains("Ctrl+R")).unwrap() as u16;
         assert!((0..120).any(|x| {
             let cell = &buffer[(x, y)];
             cell.symbol() == "C"

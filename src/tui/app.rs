@@ -372,6 +372,7 @@ impl App {
     }
 
     pub(crate) fn load_recent(&mut self, store: &Store) {
+        self.invalidate_active_search();
         let source_ids = self.source_filter_ids();
         let recent = store
             .list_recent_sessions_for_search_scope(
@@ -397,9 +398,9 @@ impl App {
         self.selected_session_ids.clear();
         self.result_scroll_offset = 0;
         self.panel_focus = PanelFocus::SessionList;
-        self.search_pending = false;
         self.search_in_flight = false;
         self.load_preview(store);
+        self.queue_search_now();
     }
 
     fn set_tree_results(&mut self, store: &Store, results: Vec<SearchResult>) {
@@ -2798,7 +2799,25 @@ mod tests {
                 rusqlite::params![id, relation, parent_id],
             ).unwrap();
         }
-        app.set_tree_results(&store, vec![child, orphan, parent, fork]);
+        app.active_search_id = 1;
+        app.apply_search_response(
+            &store,
+            SearchResponse {
+                id: 1,
+                query: String::new(),
+                phase: SearchPhase::Text,
+                result: Ok(vec![child, orphan, parent, fork]),
+            },
+        );
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::tui::ui::render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("▸ 1"));
         let ids = |app: &App| app.results.iter().map(|r| r.session.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&app), ["orphan", "parent", "fork"]);
         assert!(app.tree_subagents.contains("orphan"));

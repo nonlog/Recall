@@ -405,10 +405,12 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
     }
     f.render_widget(Paragraph::new(settings), left);
     if right.width > 0 {
-        let shortcuts = shortcut_reference_lines();
-        let width = usize::from(right.width.saturating_sub(13).max(1));
-        let lines = shortcuts.iter().map(|line| line.width().div_ceil(width) + 1).sum::<usize>();
-        let max_scroll = lines.saturating_sub(usize::from(right.height.saturating_sub(1)));
+        let viewport = usize::from(right.height.saturating_sub(1));
+        let content_len = shortcut_reference_lines(0).len();
+        let has_scrollbar = viewport > 0 && content_len > viewport && right.width > 1;
+        let content_width = right.width.saturating_sub(u16::from(has_scrollbar));
+        let shortcuts = shortcut_reference_lines(usize::from(content_width));
+        let max_scroll = shortcuts.len().saturating_sub(viewport);
         let offset = usize::from(app.settings_shortcut_scroll).min(max_scroll);
         let title = format!("Shortcuts  ↓ PgUp/PgDn ({})", offset + 1);
         f.render_widget(
@@ -416,67 +418,168 @@ pub(super) fn render_settings(f: &mut Frame, app: &App) {
             Rect::new(right.x, right.y, right.width, 1),
         );
         f.render_widget(
-            Paragraph::new(shortcuts).wrap(Wrap { trim: false }).scroll((offset as u16, 0)),
-            Rect::new(right.x, right.y + 1, right.width, right.height.saturating_sub(1)),
+            Paragraph::new(shortcuts).scroll((offset as u16, 0)),
+            Rect::new(right.x, right.y + 1, content_width, right.height.saturating_sub(1)),
         );
-    }
-}
-
-fn shortcut_reference_lines() -> Vec<Line<'static>> {
-    vec![
-        shortcut_line("Global", "Ctrl+C quit (except while deleting)"),
-        shortcut_line("Search", "↑/↓ move · PgUp/PgDn page · ←/→ cursor/preview"),
-        shortcut_line("", "Backspace edit · Enter detail · Tab/Ctrl+F filters · Alt+←/→ source"),
-        shortcut_line("", "Ctrl+R resume · Ctrl+O app · Ctrl+S sync · Ctrl+P settings"),
-        shortcut_line("", "Ctrl+E expand/collapse children · Ins/Ctrl+Space/Space select"),
-        shortcut_line("", "Del trash · Ctrl+D purge"),
-        shortcut_line("", "Esc clear/back/quit · q quit(empty query)"),
-        shortcut_line("Preview", "↑/↓/PgUp/PgDn · ← sessions · Enter detail · Esc back"),
-        shortcut_line("Viewer", "↑/↓/j/k/PgUp/PgDn · Home/g first · End/G last"),
-        shortcut_line("", "a subagents · c copy · e export · s share · v preview"),
-        shortcut_line("", "h handoff · / find · n/N match · Ctrl+R resume · Ctrl+O app"),
-        shortcut_line("", "Del trash · Ctrl+D purge · Esc/q back"),
-        shortcut_line("Usage", "m mode · t time · s source · r reset · Enter open · j/k · Esc/q"),
-        shortcut_line(
-            "Filters",
-            "↑/↓ · ←/→ · Enter/Space edit · c clear · d/w/m/l time · r/n sort",
-        ),
-        shortcut_line(
-            "Pickers",
-            "/ filter · Space toggle · Enter apply · Ctrl+A all · Ctrl+U clear",
-        ),
-        shortcut_line("", "↑/↓ · Backspace/←/→/Home/End edit · Esc back"),
-        shortcut_line("Settings", "↑/↓ · ←/→/Enter/Space change · Esc/q close"),
-        shortcut_line("Sub/Handoff", "↑/↓/j/k · Enter/Space open/choose · Esc/q close"),
-        shortcut_line(
-            "Confirm/Share",
-            "Y/Enter confirm · N/Esc cancel · O open · C copy · q close",
-        ),
-        shortcut_line(
-            "Export/Find",
-            "type · Backspace · ←/→ · Home/End(find) · Enter apply/save · Esc",
-        ),
-    ]
-}
-
-fn shortcut_line(label: &'static str, text: &'static str) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        format!(" {label:<13}"),
-        Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
-    )];
-    for (index, part) in text.split(' ').enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
+        if has_scrollbar {
+            let scrollbar_area =
+                Rect::new(right.x, right.y, right.width, right.height.saturating_add(1));
+            super::render_vertical_scrollbar(f, scrollbar_area, content_len, viewport, offset);
         }
-        let is_key = index == 0 || text.split(' ').nth(index.saturating_sub(1)) == Some("·");
-        let style = if is_key {
-            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(THEME.text_muted)
-        };
-        spans.push(Span::styled(part, style));
     }
-    Line::from(spans)
+}
+
+const SHORTCUTS: &[(&str, &str, &str)] = &[
+    ("Global", "Ctrl+C", "quit (except while deleting)"),
+    ("Search", "↑/↓", "move"),
+    ("Search", "PgUp/PgDn", "page"),
+    ("Search", "←/→", "cursor/preview"),
+    ("Search", "Backspace", "edit"),
+    ("Search", "Enter", "detail"),
+    ("Search", "Tab/Ctrl+F", "filters"),
+    ("Search", "Alt+←/→", "cycle source tabs"),
+    ("Search", "Ctrl+R", "resume"),
+    ("Search", "Ctrl+O", "app"),
+    ("Search", "Ctrl+S", "sync"),
+    ("Search", "Ctrl+P", "settings"),
+    ("Search", "Ctrl+E", "expand/collapse children"),
+    ("Search", "Ins/Ctrl+Space", "select"),
+    ("Search", "Space", "select (empty query)"),
+    ("Search", "Del", "trash"),
+    ("Search", "Ctrl+D", "purge"),
+    ("Search", "Esc", "clear/back/quit"),
+    ("Search", "q", "quit(empty query)"),
+    ("Preview", "↑/↓/PgUp/PgDn", "scroll"),
+    ("Preview", "←", "sessions"),
+    ("Preview", "Enter", "detail"),
+    ("Preview", "Esc", "back"),
+    ("Viewer", "↑/↓/j/k", "scroll"),
+    ("Viewer", "PgUp/PgDn", "scroll"),
+    ("Viewer", "Home/g", "first"),
+    ("Viewer", "End/G", "last"),
+    ("Viewer", "a", "subagents"),
+    ("Viewer", "c", "copy"),
+    ("Viewer", "e", "export"),
+    ("Viewer", "s", "share"),
+    ("Viewer", "v", "preview"),
+    ("Viewer", "h", "handoff"),
+    ("Viewer", "/", "find"),
+    ("Viewer", "n/N", "match"),
+    ("Viewer", "Ctrl+R", "resume"),
+    ("Viewer", "Ctrl+O", "app"),
+    ("Viewer", "Del", "trash"),
+    ("Viewer", "Ctrl+D", "purge"),
+    ("Viewer", "Esc/q", "back"),
+    ("Usage", "m", "mode"),
+    ("Usage", "t", "time"),
+    ("Usage", "s", "source"),
+    ("Usage", "r", "reset"),
+    ("Usage", "Enter", "open"),
+    ("Usage", "j/k", "move"),
+    ("Usage", "Esc/q", "back"),
+    ("Filters", "↑/↓", "move"),
+    ("Filters", "←/→", "change"),
+    ("Filters", "Enter/Space", "edit"),
+    ("Filters", "c", "clear"),
+    ("Filters", "d/w/m/l", "time"),
+    ("Filters", "r/n", "sort"),
+    ("Pickers", "/", "filter"),
+    ("Pickers", "Space", "toggle"),
+    ("Pickers", "Enter", "apply"),
+    ("Pickers", "Ctrl+A", "all"),
+    ("Pickers", "Ctrl+U", "clear"),
+    ("Pickers", "↑/↓", "move"),
+    ("Pickers", "Backspace/←/→", "edit"),
+    ("Pickers", "Home/End", "edit"),
+    ("Pickers", "Esc", "back"),
+    ("Settings", "↑/↓", "move"),
+    ("Settings", "←/→/Enter/Space", "change"),
+    ("Settings", "Esc/q", "close"),
+    ("Subagents & handoff", "↑/↓/j/k", "move"),
+    ("Subagents & handoff", "Enter/Space", "open/choose"),
+    ("Subagents & handoff", "Esc/q", "close"),
+    ("Confirm & share", "Y/Enter", "confirm"),
+    ("Confirm & share", "N/Esc", "cancel"),
+    ("Confirm & share", "O", "open"),
+    ("Confirm & share", "C", "copy"),
+    ("Confirm & share", "q", "close"),
+    ("Export & find", "type", "enter text"),
+    ("Export & find", "Backspace", "edit"),
+    ("Export & find", "←/→", "move cursor"),
+    ("Export & find", "Home/End", "find"),
+    ("Export & find", "Enter", "apply/save"),
+    ("Export & find", "Esc", "back"),
+];
+
+fn shortcut_reference_lines(width: usize) -> Vec<Line<'static>> {
+    let key_width = SHORTCUTS.iter().map(|(_, key, _)| key.width()).max().unwrap_or(0).min(16);
+    let mut lines = Vec::new();
+    let mut previous = "";
+    for &(section, key, description) in SHORTCUTS {
+        if section != previous {
+            if !previous.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(section, width),
+                Style::default().fg(THEME.highlight).add_modifier(Modifier::BOLD),
+            )));
+            previous = section;
+        }
+        let indent = width.min(2);
+        let available_key_width = key_width.min(width.saturating_sub(indent));
+        let key = truncate_to_width(key, available_key_width);
+        let remaining = width.saturating_sub(indent + available_key_width);
+        let separator = usize::from(remaining > 0);
+        let padding = available_key_width.saturating_sub(key.width()) + separator;
+        let description_width = remaining.saturating_sub(separator);
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(key, Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(padding)),
+            Span::styled(
+                truncate_to_width(description, description_width),
+                Style::default().fg(THEME.text_muted),
+            ),
+        ]));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_rows_preserve_entries_and_truncate_without_wrapping() {
+        let lines = shortcut_reference_lines(80);
+        for &(_, key, description) in SHORTCUTS {
+            assert!(
+                lines.iter().any(|line| {
+                    line.spans.len() == 4
+                        && line.spans[1].content == key
+                        && line.spans[3].content == description
+                }),
+                "missing {key} {description}"
+            );
+        }
+        let screenshot = shortcut_reference_lines(36);
+        assert!(screenshot.iter().any(|line| line.spans.len() == 4
+            && line.spans[1].content == "Ctrl+R"
+            && line.spans[3].content == "resume"));
+        assert!(screenshot.iter().any(|line| line.spans.len() == 4
+            && line.spans[1].content == "Alt+←/→"
+            && line.spans[3].content == "cycle source tabs"));
+        let narrow = shortcut_reference_lines(25);
+        assert!(
+            narrow
+                .iter()
+                .any(|line| line.spans.last().is_some_and(|span| span.content.ends_with('…')))
+        );
+        for width in 0..=25 {
+            assert!(shortcut_reference_lines(width).iter().all(|line| line.width() <= width));
+        }
+    }
 }
 
 pub(super) fn render_share_result(f: &mut Frame, app: &App) {

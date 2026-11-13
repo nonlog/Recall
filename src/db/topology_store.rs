@@ -95,6 +95,14 @@ impl Store {
     }
 
     pub(crate) fn child_subagents(&self, parent_id: &str) -> Result<Vec<Session>> {
+        self.child_subagents_limited(parent_id, usize::MAX)
+    }
+
+    pub(crate) fn child_subagents_limited(
+        &self,
+        parent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
         let Some(parent) = self.get_session_by_id(parent_id)? else {
             return Ok(Vec::new());
         };
@@ -103,11 +111,9 @@ impl Store {
              WHERE l.parent_source = ?1 AND l.parent_source_id = ?2 AND l.relation = 'spawn'
              ORDER BY s.started_at, s.id",
         )?;
-        let ids = stmt
-            .query_map(rusqlite::params![parent.source, parent.source_id], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let ids = stmt.query_map(rusqlite::params![parent.source, parent.source_id], |row| {
+            row.get::<_, String>(0)
+        })?;
         let link = ParentLink {
             relation: crate::types::ParentRelation::Spawn,
             source: parent.source,
@@ -115,6 +121,10 @@ impl Store {
         };
         let mut children = Vec::new();
         for id in ids {
+            if children.len() >= limit {
+                break;
+            }
+            let id = id?;
             if self.resolve_parent(&id, &link)?.is_some_and(|resolved| resolved.id == parent_id)
                 && let Some(child) = self.get_session_by_id(&id)?
             {

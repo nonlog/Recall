@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FONT = ROOT / 'assets/fonts/HerdrAgentIconsMax-Regular.ttf'
 MARKS = ROOT / 'assets/fonts/marks'
 GLYPHS = {
+    'droid': 0xE1BB,
     'minimax': 0xE1BC, 'xiaomimimo': 0xE1BD, 'goose': 0xE1BE,
     'openhands': 0xE1BF, 'codebuddy': 0xE1C6, 'trae': 0xE1C7,
     'junie': 0xE1C8, 'zedindustries': 0xE1C9, 'warp': 0xE1CA,
@@ -42,9 +43,13 @@ def main():
         scale = 918 / max(x1 - x0, y1 - y0)
         target = TTGlyphPen(None)
         quad = Cu2QuPen(target, max_err=1, reverse_direction=True)
-        transform = TransformPen(quad, (scale, 0, 0, -scale,
-                                        advance / 2 - scale * (x0 + x1) / 2,
-                                        365 + scale * (y0 + y1) / 2))
+        if name == 'droid':
+            # The exported outline already has the original font's positioning.
+            transform = TransformPen(quad, (1, 0, 0, -1, 0, 0))
+        else:
+            transform = TransformPen(quad, (scale, 0, 0, -scale,
+                                            advance / 2 - scale * (x0 + x1) / 2,
+                                            365 + scale * (y0 + y1) / 2))
         recording.replay(transform)
         glyph = target.glyph()
         font['glyf'][glyph_name] = glyph

@@ -12,6 +12,7 @@ Release commit: see tag `v0.6.5.4`
 
 - Search results group spawn-linked sessions beneath a matching parent; `Ctrl+E` expands or collapses a parent. Forks and unmatched subagents stay visible. Indexed source tabs use the existing filter and support mouse clicks and `Alt+Left/Right`.
 - Pi's `subagent-...<UUID>` session names, including names with a numeric suffix, identify spawned sessions when a parent is recorded; parser version 4 backfills the topology. Claude Code, Codex and other adapters keep their existing link handling.
+- Recent-session workers load hidden spawn children without consuming result slots; Settings shortcuts use a scrollable, non-wrapping table.
 - Local compilation and tests were prohibited on the implementation machine; GitHub Actions must verify this change.
 
 ### Herdr icons and settings
