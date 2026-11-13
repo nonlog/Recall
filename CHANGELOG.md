@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.5.5] (2026-11-13)
+
+### nonlog fork
+
+* Load spawn descendants for recent, text and hybrid search results so Pi subagent sessions can be expanded beneath their parents. Preserve original matches and limit added descendants to 1,000.
+* Present shortcut help as grouped, non-wrapping key/description rows.
+* Add MiniMax, MiMo, Goose, OpenHands, CodeBuddy, TRAE, Junie, Zed and Warp font glyphs; restore the missing Droid glyph. Droid outline provenance remains unverified; see the bundled font notices.
+* Fix integration-test executable discovery using Cargo-provided binary paths.
+
 ## [0.6.5.4] (2026-11-12)
 
 ### nonlog fork
