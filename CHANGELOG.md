@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.5.7] (2026-11-20)
+
+### nonlog fork
+
+* Fix Codex Desktop ghost threads by pruning deleted session records from `session_index.jsonl` after a successful native delete.
+* Save complete Recall session exports in Trash and add `recall session trash list`, `restore`, and `empty` management commands.
+* Make TUI `Ctrl+D` move sessions to Trash. `Ctrl+Shift+D` is the explicit permanent-delete shortcut.
+
 ## [0.6.5.6] (2026-11-13)
 
 ### nonlog fork

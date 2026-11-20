@@ -126,6 +126,11 @@ pub(crate) enum SessionCommands {
         #[arg(long, value_enum, default_value_t = SessionActionFormat::Text)]
         format: SessionActionFormat,
     },
+    #[command(about = "Manage Recall trash")]
+    Trash {
+        #[command(subcommand)]
+        command: TrashCommands,
+    },
     #[command(about = "Delete one indexed session")]
     Delete {
         #[command(flatten)]
@@ -156,6 +161,24 @@ pub(crate) enum SessionCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum TrashCommands {
+    #[command(about = "List trashed sessions")]
+    List {
+        #[arg(long, value_enum, default_value_t = SessionActionFormat::Text)]
+        format: SessionActionFormat,
+    },
+    #[command(about = "Restore one trashed session")]
+    Restore {
+        #[arg(help = "Trash entry name from `recall session trash list`")]
+        entry: String,
+    },
+    #[command(about = "Permanently clear every trash entry")]
+    Empty {
+        #[arg(long, help = "Confirm permanent removal of all trash entries")]
+        yes: bool,
+    },
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum SessionListFormat {
     Table,

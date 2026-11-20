@@ -1224,8 +1224,15 @@ impl App {
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && key.code == KeyCode::Char('d')
+        {
             self.start_delete_confirmation(DeleteOrigin::Search, DeleteMode::Permanent);
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            self.start_delete_confirmation(DeleteOrigin::Search, DeleteMode::Trash);
             return;
         }
 
@@ -1364,8 +1371,14 @@ impl App {
             self.sync_requested = true;
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && key.code == KeyCode::Char('d')
+        {
             self.start_delete_confirmation(DeleteOrigin::Viewing, DeleteMode::Permanent);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            self.start_delete_confirmation(DeleteOrigin::Viewing, DeleteMode::Trash);
             return;
         }
         if key.code == KeyCode::Delete {
@@ -3557,7 +3570,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_from_search_opens_permanent_confirmation() {
+    fn ctrl_d_from_search_opens_trash_confirmation() {
         crate::db::schema::register_sqlite_vec();
         let store = Store::open_in_memory().unwrap();
         let mut app = app_with_sources();
@@ -3566,7 +3579,7 @@ mod tests {
         app.handle_search_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &store);
 
         let pending = app.pending_delete.as_ref().unwrap();
-        assert_eq!(pending.mode, DeleteMode::Permanent);
+        assert_eq!(pending.mode, DeleteMode::Trash);
         assert_eq!(pending.sessions.len(), 1);
     }
 
@@ -3605,6 +3618,13 @@ mod tests {
         app.handle_confirm_delete_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         app.handle_viewing_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), &store);
+        assert_eq!(app.pending_delete.as_ref().unwrap().mode, DeleteMode::Trash);
+        app.handle_confirm_delete_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.handle_viewing_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            &store,
+        );
         assert_eq!(app.pending_delete.as_ref().unwrap().mode, DeleteMode::Permanent);
         app.handle_confirm_delete_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, AppMode::Viewing));

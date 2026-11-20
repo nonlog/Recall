@@ -1,14 +1,19 @@
 # Recall fork handoff
 
-Last updated: 2026-11-13
+Last updated: 2026-11-20
 Repository: https://github.com/nonlog/Recall
 Upstream baseline: samzong/Recall main at `fcc3f214015e69f27f0c5952a21ec0c316e1642c` (version 0.6.5)
-Fork release: `v0.6.5.6`
-Release commit: see tag `v0.6.5.6`
+Fork release: `v0.6.5.7`
+Release commit: see tag `v0.6.5.7`
 
 ## Current fork policy
 
-### Subagent trees and source tabs
+### 2026-11-20 Codex ghost-thread cleanup and managed Trash
+
+- Codex native deletion now removes matching `session_index.jsonl` records only after the thread registry and rollout deletion both verify successfully. This prevents Codex Desktop from showing a deleted rollout as `chat unavailable`.
+- Trash entries include a complete Recall JSONL export. `recall session trash list`, `restore`, and `empty --yes` manage persisted entries. TUI `Ctrl+D` uses Trash and `Ctrl+Shift+D` is the permanent path.
+
+
 
 - Search results group spawn-linked sessions beneath a matching parent; `Ctrl+E` expands or collapses a parent. Forks and unmatched subagents stay visible. Indexed source tabs use the existing filter and support mouse clicks and `Alt+Left/Right`.
 - Pi's `subagent-...<UUID>` session names, including names with a numeric suffix, identify spawned sessions when a parent is recorded; parser version 4 backfills the topology. Claude Code, Codex and other adapters keep their existing link handling.
@@ -184,8 +189,8 @@ Release commit: see tag `v0.6.5.6`
   set against the 73 native threads. Do not force-migrate every user's explicit
   non-All setting in code.
 - Shortcut behavior is aligned with upstream as requested: `Ctrl+S` triggers the
-  background Sync worker and `Ctrl+P` opens Settings. Fork-only deletion shortcuts
-  remain additive (`Del` Trash, `Ctrl+D` permanent).
+  background Sync worker and `Ctrl+P` opens Settings. `Ctrl+D` moves a
+  session to Trash with a Recall export, while `Ctrl+Shift+D` permanently deletes.
 - Native-title preservation was re-applied on top of upstream's refactored adapters:
   Codex state/index titles, Claude explicit-vs-AI title precedence, and Pi
   `session_info.name`. Codex title observations also refresh unchanged indexed

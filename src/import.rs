@@ -51,6 +51,8 @@ struct ImportRecord {
 
 #[derive(Deserialize)]
 struct ImportSession {
+    #[serde(default)]
+    id: Option<String>,
     source: String,
     source_id: String,
     title: String,
@@ -171,6 +173,39 @@ pub(crate) fn import_jsonl<R: BufRead>(
     Ok(summary)
 }
 
+pub(crate) fn restore_jsonl(store: &Store, path: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut lines = std::io::BufReader::new(file).lines();
+    let line = lines.next().ok_or_else(|| anyhow!("empty Recall trash session backup"))??;
+    anyhow::ensure!(
+        lines.next().is_none(),
+        "Recall trash session backup contains multiple records"
+    );
+    let record: ImportRecord = serde_json::from_str(&line)?;
+    anyhow::ensure!(record.record_type == RECORD_TYPE, "invalid Recall trash session backup");
+    let id = record
+        .session
+        .id
+        .clone()
+        .ok_or_else(|| anyhow!("Recall trash session backup has no session id"))?;
+    anyhow::ensure!(store.get_session_by_id(&id)?.is_none(), "Recall session {id} already exists");
+    let data = decode_record(record, id, 0)?;
+    let mut session = data.session;
+    session.is_import = false;
+    store.persist_session_with_usage_and_events_with_topology(
+        &session,
+        &data.messages,
+        &data.usage_events,
+        None,
+        &data.events,
+        None,
+        &SessionTopologyWrite {
+            thread_role: data.topology.thread_role,
+            parents: &data.topology.parents,
+            parser_version: None,
+        },
+    )
+}
 pub(crate) struct DecodedSession {
     pub(crate) session: Session,
     pub(crate) messages: Vec<Message>,

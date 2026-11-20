@@ -34,6 +34,9 @@ recall session share --id <session-id> --format json  # publish one selected ses
 recall session delete --id <session-id> --dry-run  # preview safe session deletion
 recall share list --format json  # list published share URLs
 recall share unpublish <share-id> --yes  # take down one public page
+recall session trash list  # inspect Recall trash
+recall session trash restore <entry>  # restore one entry
+recall session trash empty --yes  # permanently clear trash
 recall info  # index stats and worker status
 ```
 
@@ -47,8 +50,8 @@ Recall defaults to [Herdr Agent Icons Max](https://github.com/hhdebb/herdr-radar
 
 ```bash
 recall session delete --id <session-id> --dry-run   # preview only
-recall session delete --id <session-id>             # safe default: keep a Recall trash backup
-recall session delete --id <session-id> --permanent # no Recall trash backup
+recall session delete --id <session-id>             # move to Recall trash and remove native data safely
+recall session delete --id <session-id> --permanent # permanently delete native data
 recall session delete --id <session-id> --index-only # leave source-agent data untouched
 ```
 
@@ -62,7 +65,7 @@ to inspect paths before deleting. Droid can mirror sessions to Factory cloud
 (`cloudSessionSync` defaults to `true`); deleting local files does **not**
 delete cloud copies, which may still appear in Factory or be re-synced.
 
-On Windows, the default trash is the `trash` directory beside the installed `recall.exe`; the Scoop package persists that directory across upgrades. `RECALL_TRASH_DIR` can override the location. On other platforms Recall falls back to its data directory. For sources with an official native delete command, Recall creates a safety backup first; for file-backed sources it moves the native session data into the trash. Imported sessions are always index-only.
+On Windows, the default trash is the `trash` directory beside the installed `recall.exe`; the Scoop package persists that directory across upgrades. `RECALL_TRASH_DIR` can override the location. On other platforms Recall falls back to its data directory. Trash entries include a complete Recall session export so they can be listed and restored. `Ctrl+D` in the TUI moves the selected session to trash. `Ctrl+Shift+D` permanently deletes it. Imported sessions are always index-only.
 
 With Skill use **Recall** is the best way.
 

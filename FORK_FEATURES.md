@@ -47,8 +47,8 @@ Before merging or rebasing a new upstream release:
 
 ### Safe session deletion
 
-- `Del` moves native session data to Recall Trash when safe native paths are
-  available; `Ctrl+D` permanently deletes.
+- `Ctrl+D` moves native session data and a complete Recall export to Recall Trash;
+  `Ctrl+Shift+D` permanently deletes.
 - CLI supports Trash, permanent, explicit `--index-only`, and `--dry-run`.
 - TUI supports bulk selection and one confirmation for the selected set.
 - Unsupported/unsafe native deletion must fail closed and require explicit
@@ -215,4 +215,6 @@ At minimum, verify on the installed Windows build:
 - A Pi session containing `session_info.name` displays that name rather than
   the first prompt.
 - `recall usage` Skill Audit discovers the expected shared/user skill set.
-- `Del` performs Trash semantics and `Ctrl+D` is the explicit permanent path.
+- `Ctrl+D` performs Trash semantics and stores a complete Recall export for
+  restore. `Ctrl+Shift+D` is the explicit permanent path. CLI trash management
+  supports listing, restoring, and clearing entries.

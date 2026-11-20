@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::adapters::{self, ResumeCommand};
@@ -50,14 +50,23 @@ pub(crate) struct DeleteResult {
     pub(crate) native_already_missing: bool,
 }
 
-#[derive(Serialize)]
-struct TrashManifest<'a> {
-    recall_session_id: &'a str,
-    source: &'a str,
-    source_id: &'a str,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrashManifest {
+    recall_session_id: String,
+    source: String,
+    source_id: String,
     deleted_at_ms: i64,
     original_paths: Vec<String>,
     native_delete_command: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrashEntry {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) source_id: String,
+    pub(crate) deleted_at_ms: i64,
+    pub(crate) dir: PathBuf,
 }
 
 pub(crate) fn plan(session: &Session, mode: DeleteMode) -> Result<DeletePlan> {
@@ -176,6 +185,35 @@ pub(crate) fn execute(
     let mut trash_dir = None;
     let mut native_deleted_irreversibly = false;
     let mut native_phase_entered = false;
+    let prepared_trash = if plan.mode == DeleteMode::Trash {
+        let deleted_at_ms = Utc::now().timestamp_millis();
+        let dir = new_trash_dir(session, deleted_at_ms)?;
+        let mut manifest_roots = plan.native_roots.clone();
+        if let Some(path) = &plan.native_database {
+            manifest_roots.push(path.clone());
+        }
+        if let Err(error) = write_manifest(
+            session,
+            &manifest_roots,
+            &dir,
+            deleted_at_ms,
+            plan.native_command.as_ref().map(ResumeCommand::display),
+        )
+        .and_then(|()| backup_session_record(store, session, &dir))
+        .and_then(|()| {
+            if session.source == "codex" && plan.native_command.is_some() {
+                backup_codex_session_index(session, &dir)
+            } else {
+                Ok(())
+            }
+        }) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+        Some(dir)
+    } else {
+        None
+    };
     let opencode_already_missing = session.source == "opencode"
         && crate::adapters::opencode::native_session_exists(&session.source_id)? == Some(false);
 
@@ -229,6 +267,7 @@ pub(crate) fn execute(
                     _ => false,
                 };
                 if still_missing {
+                    trash_dir = prepared_trash.clone();
                     return Ok(());
                 }
                 anyhow::bail!(
@@ -246,17 +285,26 @@ pub(crate) fn execute(
             match plan.mode {
                 DeleteMode::Trash => {
                     if let Some(db_path) = &plan.native_database {
-                        let backup_dir = backup_zcode_database(session, db_path)?;
+                        let backup_dir = prepared_trash
+                            .as_ref()
+                            .expect("trash directory prepared for Trash mode");
+                        backup_zcode_database(db_path, backup_dir)?;
                         if let Err(error) = delete_zcode_session(db_path, &session.source_id) {
-                            let _ = fs::remove_dir_all(&backup_dir);
+                            let _ = fs::remove_dir_all(backup_dir);
                             return Err(error);
                         }
                         native_deleted_irreversibly = true;
-                        trash_dir = Some(backup_dir);
+                        trash_dir = Some(backup_dir.clone());
                     } else if let Some(command) = &plan.native_command {
                         if !opencode_already_missing {
-                            let backup_dir =
-                                backup_before_native_command(session, &plan.native_roots, command)?;
+                            let backup_dir = prepared_trash
+                                .as_ref()
+                                .expect("trash directory prepared for Trash mode");
+                            backup_before_native_command(
+                                session,
+                                &plan.native_roots,
+                                backup_dir,
+                            )?;
                             if let Err(error) = run_native_delete_command(command) {
                                 let reconciled = match session.source.as_str() {
                                     "opencode" => crate::adapters::opencode::native_session_exists(
@@ -288,10 +336,19 @@ pub(crate) fn execute(
                                 }
                             }
                             native_deleted_irreversibly = true;
-                            trash_dir = Some(backup_dir);
+                            trash_dir = Some(backup_dir.clone());
                         }
                     } else {
-                        let moved = move_to_trash(session, &plan.native_roots, None)?;
+                        let backup_dir = prepared_trash
+                            .as_ref()
+                            .expect("trash directory prepared for Trash mode");
+                        let moved = move_to_trash_at(
+                            session,
+                            &plan.native_roots,
+                            backup_dir,
+                            Utc::now().timestamp_millis(),
+                            None,
+                        )?;
                         trash_dir = Some(moved.dir.clone());
                         moved_trash = Some(moved);
                     }
@@ -355,6 +412,9 @@ pub(crate) fn execute(
                     "Codex deletion removed the rollout path but session {} still exists in the native thread registry",
                     session.source_id
                 );
+            }
+            if session.source == "codex" && plan.native_command.is_some() {
+                prune_codex_session_index(&session.source_id)?;
             }
             if session.source == "zcode"
                 && let Some(db_path) = &plan.native_database
@@ -859,25 +919,9 @@ fn delete_zcode_session(db_path: &Path, source_id: &str) -> Result<bool> {
     Ok(deleted > 0)
 }
 
-fn backup_zcode_database(session: &Session, db_path: &Path) -> Result<PathBuf> {
-    let deleted_at_ms = Utc::now().timestamp_millis();
-    let trash_dir = new_trash_dir(session, deleted_at_ms)?;
-    if let Err(error) = write_manifest(
-        session,
-        std::slice::from_ref(&db_path.to_path_buf()),
-        &trash_dir,
-        deleted_at_ms,
-        Some(format!("sqlite delete ZCode session {}", session.source_id)),
-    ) {
-        let _ = fs::remove_dir_all(&trash_dir);
-        return Err(error);
-    }
+fn backup_zcode_database(db_path: &Path, trash_dir: &Path) -> Result<()> {
     let backup_path = trash_dir.join("zcode-db-before.sqlite");
-    if let Err(error) = backup_sqlite_database(db_path, &backup_path) {
-        let _ = fs::remove_dir_all(&trash_dir);
-        return Err(error);
-    }
-    Ok(trash_dir)
+    backup_sqlite_database(db_path, &backup_path)
 }
 
 fn backup_sqlite_database(source: &Path, destination: &Path) -> Result<()> {
@@ -1620,27 +1664,14 @@ fn run_native_delete_command(command: &ResumeCommand) -> Result<()> {
 fn backup_before_native_command(
     session: &Session,
     roots: &[PathBuf],
-    command: &ResumeCommand,
-) -> Result<PathBuf> {
-    let deleted_at_ms = Utc::now().timestamp_millis();
-    let trash_dir = new_trash_dir(session, deleted_at_ms)?;
-    if let Err(error) =
-        write_manifest(session, roots, &trash_dir, deleted_at_ms, Some(command.display()))
-    {
-        let _ = fs::remove_dir_all(&trash_dir);
-        return Err(error);
-    }
-
+    trash_dir: &Path,
+) -> Result<()> {
     let backup_result = if session.source == "opencode" {
-        backup_opencode_export(session, &trash_dir)
+        backup_opencode_export(session, trash_dir)
     } else {
-        backup_paths(roots, &trash_dir)
+        backup_paths(roots, trash_dir)
     };
-    if let Err(error) = backup_result {
-        let _ = fs::remove_dir_all(&trash_dir);
-        return Err(error);
-    }
-    Ok(trash_dir)
+    backup_result
 }
 
 fn backup_opencode_export(session: &Session, trash_dir: &Path) -> Result<()> {
@@ -1695,16 +1726,6 @@ fn backup_paths(roots: &[PathBuf], trash_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn move_to_trash(
-    session: &Session,
-    roots: &[PathBuf],
-    native_command: Option<String>,
-) -> Result<TrashMove> {
-    let deleted_at_ms = Utc::now().timestamp_millis();
-    let trash_dir = new_trash_dir(session, deleted_at_ms)?;
-    move_to_trash_at(session, roots, &trash_dir, deleted_at_ms, native_command)
-}
-
 #[derive(Debug)]
 struct TrashMove {
     dir: PathBuf,
@@ -1747,14 +1768,198 @@ fn write_manifest(
     native_delete_command: Option<String>,
 ) -> Result<()> {
     let manifest = TrashManifest {
-        recall_session_id: &session.id,
-        source: &session.source,
-        source_id: &session.source_id,
+        recall_session_id: session.id.clone(),
+        source: session.source.clone(),
+        source_id: session.source_id.clone(),
         deleted_at_ms,
         original_paths: roots.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
         native_delete_command,
     };
     fs::write(trash_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(())
+}
+
+fn backup_session_record(store: &Store, session: &Session, trash_dir: &Path) -> Result<()> {
+    let record = crate::export::session_record_value(
+        session.clone(),
+        store.session_topology(&session.id)?,
+        store.get_messages(&session.id)?,
+        store.list_usage_events_for_session(&session.id)?,
+        store.list_session_events_for_session(&session.id)?,
+    )?;
+    let path = trash_dir.join("recall-session.jsonl");
+    let mut file = fs::File::create(&path)?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn list_trash() -> Result<Vec<TrashEntry>> {
+    let root = trash_root()?;
+    let mut entries = Vec::new();
+    let items = match fs::read_dir(&root) {
+        Ok(items) => items,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(entries),
+        Err(error) => return Err(error.into()),
+    };
+    for item in items {
+        let item = item?;
+        if !item.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = item.path();
+        let manifest_path = dir.join("manifest.json");
+        let manifest: TrashManifest = match serde_json::from_reader(fs::File::open(&manifest_path)?)
+        {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        entries.push(TrashEntry {
+            name: item.file_name().to_string_lossy().into_owned(),
+            source: manifest.source,
+            source_id: manifest.source_id,
+            deleted_at_ms: manifest.deleted_at_ms,
+            dir,
+        });
+    }
+    entries.sort_by(|a, b| b.deleted_at_ms.cmp(&a.deleted_at_ms).then_with(|| a.name.cmp(&b.name)));
+    Ok(entries)
+}
+
+fn resolve_trash_entry(name: &str) -> Result<TrashEntry> {
+    list_trash()?
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| anyhow::anyhow!("trash entry not found: {name}"))
+}
+
+pub(crate) fn restore_trash(store: &Store, name: &str) -> Result<TrashEntry> {
+    let entry = resolve_trash_entry(name)?;
+    let manifest: TrashManifest =
+        serde_json::from_reader(fs::File::open(entry.dir.join("manifest.json"))?)?;
+    if manifest.source == "zcode" {
+        anyhow::bail!(
+            "ZCode native database restore requires replacing its active database; restore the Recall index from the saved export manually"
+        );
+    }
+    for (index, original) in manifest.original_paths.iter().enumerate() {
+        let original = PathBuf::from(original);
+        let backup = trash_path_for_root(&entry.dir, index, &original);
+        if !backup.exists() {
+            continue;
+        }
+        if original.exists() {
+            anyhow::bail!("cannot restore {}; native path already exists", original.display());
+        }
+    }
+    for (index, original) in manifest.original_paths.iter().enumerate() {
+        let original = PathBuf::from(original);
+        let backup = trash_path_for_root(&entry.dir, index, &original);
+        if backup.exists() {
+            copy_path(&backup, &original)?;
+        }
+    }
+    if manifest.source == "codex" {
+        restore_codex_session_index(&entry.dir)?;
+    }
+    crate::import::restore_jsonl(store, &entry.dir.join("recall-session.jsonl"))?;
+    fs::remove_dir_all(&entry.dir)?;
+    Ok(entry)
+}
+
+pub(crate) fn empty_trash() -> Result<usize> {
+    let root = trash_root()?;
+    let Ok(items) = fs::read_dir(&root) else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    for item in items {
+        let item = item?;
+        if item.file_type()?.is_dir() {
+            fs::remove_dir_all(item.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn backup_codex_session_index(session: &Session, trash_dir: &Path) -> Result<()> {
+    let Some(codex_dir) = adapters::codex::resolve_codex_dir()? else {
+        return Ok(());
+    };
+    let path = codex_dir.join("session_index.jsonl");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut matching = String::new();
+    for line in fs::read_to_string(&path)?.lines() {
+        if serde_json::from_str::<serde_json::Value>(line).ok().and_then(|value| {
+            value.get("id").and_then(|id| id.as_str()).map(|id| id == session.source_id)
+        }) == Some(true)
+        {
+            matching.push_str(line);
+            matching.push('\n');
+        }
+    }
+    if !matching.is_empty() {
+        fs::write(trash_dir.join("codex-session-index.jsonl"), matching)?;
+    }
+    Ok(())
+}
+
+fn restore_codex_session_index(trash_dir: &Path) -> Result<()> {
+    let backup = trash_dir.join("codex-session-index.jsonl");
+    if !backup.is_file() {
+        return Ok(());
+    }
+    let Some(codex_dir) = adapters::codex::resolve_codex_dir()? else {
+        return Ok(());
+    };
+    fs::create_dir_all(&codex_dir)?;
+    let path = codex_dir.join("session_index.jsonl");
+    let mut current = if path.is_file() { fs::read_to_string(&path)? } else { String::new() };
+    for line in fs::read_to_string(backup)?.lines() {
+        if !current.lines().any(|existing| existing == line) {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    fs::write(path, current)?;
+    Ok(())
+}
+fn prune_codex_session_index(source_id: &str) -> Result<()> {
+    let Some(codex_dir) = adapters::codex::resolve_codex_dir()? else {
+        return Ok(());
+    };
+    prune_codex_session_index_under(&codex_dir, source_id)
+}
+
+fn prune_codex_session_index_under(codex_dir: &Path, source_id: &str) -> Result<()> {
+    let path = codex_dir.join("session_index.jsonl");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path)?;
+    let mut kept = String::new();
+    for line in content.lines() {
+        let keep = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| value.get("id").and_then(|id| id.as_str()).map(|id| id != source_id))
+            .unwrap_or(true);
+        if keep {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if kept == content {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("Codex index has no parent"))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(kept.as_bytes())?;
+    temp.as_file().sync_all()?;
+    temp.persist(&path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -1930,10 +2135,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_index_pruning_removes_only_deleted_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("session_index.jsonl");
+        fs::write(
+            &index,
+            "{\"id\":\"keep\",\"thread_name\":\"Keep\"}\n{\"id\":\"delete\",\"thread_name\":\"Delete\"}\nmalformed\n",
+        )
+        .unwrap();
+
+        prune_codex_session_index_under(dir.path(), "delete").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(index).unwrap(),
+            "{\"id\":\"keep\",\"thread_name\":\"Keep\"}\nmalformed\n"
+        );
+    }
+    #[test]
     fn droid_delete_collects_only_one_validated_session_and_its_sidecars() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sessions");
-        let id = "98000000-0000-4000-8000-000000000001";
         let other = "98000000-0000-4000-8000-000000000002";
         let transcript = write_droid_session(&root, "-project-a", id, id);
         let other_transcript = write_droid_session(&root, "-project-a", other, other);

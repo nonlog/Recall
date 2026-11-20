@@ -70,6 +70,7 @@ pub(crate) fn cmd_session(command: SessionCommands) -> Result<()> {
         SessionCommands::Open { selector, print_command, format } => {
             cmd_session_command(&selector, print_command, format, SessionAction::OpenApp)
         }
+        SessionCommands::Trash { command } => cmd_session_trash(command),
         SessionCommands::Delete { selector, permanent, index_only, dry_run, format } => {
             cmd_session_delete(&selector, permanent, index_only, dry_run, format)
         }
@@ -453,6 +454,52 @@ fn cmd_session_command(
     }
 
     session_action::run(&command, session.directory.as_deref())
+}
+
+fn cmd_session_trash(command: TrashCommands) -> Result<()> {
+    match command {
+        TrashCommands::List { format } => {
+            let entries = crate::session_delete::list_trash()?;
+            match format {
+                SessionActionFormat::Text => {
+                    if entries.is_empty() {
+                        println!("trash is empty");
+                    } else {
+                        for entry in entries {
+                            println!(
+                                "{}\t{}\t{}\t{}",
+                                entry.name, entry.source, entry.source_id, entry.deleted_at_ms
+                            );
+                        }
+                    }
+                }
+                SessionActionFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &entries
+                            .iter()
+                            .map(|entry| serde_json::json!({
+                                "entry": entry.name,
+                                "source": entry.source,
+                                "source_id": entry.source_id,
+                                "deleted_at_ms": entry.deleted_at_ms
+                            }))
+                            .collect::<Vec<_>>()
+                    )?
+                ),
+            }
+        }
+        TrashCommands::Restore { entry } => {
+            let store = Store::open()?;
+            let restored = crate::session_delete::restore_trash(&store, &entry)?;
+            println!("restored {} ({})", restored.source_id, restored.source);
+        }
+        TrashCommands::Empty { yes } => {
+            anyhow::ensure!(yes, "clearing trash is permanent; repeat with --yes");
+            println!("cleared {} trash entries", crate::session_delete::empty_trash()?);
+        }
+    }
+    Ok(())
 }
 
 fn cmd_session_delete(
