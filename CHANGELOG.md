@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.5.10] (2026-11-20)
+
+### nonlog fork
+
+* Apply the Clippy fixes required by the release gate for the session deletion implementation.
+
 ## [0.6.5.8] (2026-11-20)
 
 ### nonlog fork
