@@ -2154,6 +2154,8 @@ mod tests {
     #[test]
     fn droid_delete_collects_only_one_validated_session_and_its_sidecars() {
         let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let id = "98000000-0000-4000-8000-000000000001";
         let other = "98000000-0000-4000-8000-000000000002";
         let transcript = write_droid_session(&root, "-project-a", id, id);
         let other_transcript = write_droid_session(&root, "-project-a", other, other);
