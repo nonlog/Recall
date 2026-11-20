@@ -254,7 +254,8 @@ fn exchange(
                 }
                 continue;
             }
-            match downloads.entry(name.canonical) {
+            let canonical = name.canonical.clone();
+            match downloads.entry(canonical) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(object);
                 }

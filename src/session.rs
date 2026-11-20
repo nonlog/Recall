@@ -661,6 +661,7 @@ fn parse_session_includes(
     let includes = ExportIncludes {
         messages: matches!(format, SessionDetailFormat::Text) || messages_flag,
         usage: false,
+        usage_ownership: false,
         events: false,
     };
     let Some(include) = include else {

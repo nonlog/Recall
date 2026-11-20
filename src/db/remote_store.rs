@@ -637,6 +637,10 @@ pub(crate) fn revision_heads(revisions: &BTreeMap<String, Revision>) -> Vec<&Str
         .collect()
 }
 
+pub(crate) fn validate_object_key(key: &str) -> Result<()> {
+    object_parts(key).map(|_| ())
+}
+
 fn object_parts(key: &str) -> Result<(&'static str, &str)> {
     let (table, suffix) = if let Some(suffix) = key.strip_prefix("v1/revisions/") {
         ("sync_revisions", suffix)
