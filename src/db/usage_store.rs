@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -221,6 +221,16 @@ impl Store {
         Ok(state)
     }
 
+    pub(crate) fn counted_usage_event_keys(
+        &self,
+        session_ids: &HashSet<&str>,
+    ) -> Result<HashMap<String, HashSet<String>>> {
+        self.fold_usage_events_after(None, None, HashMap::new(), |keys, event| {
+            if session_ids.contains(event.session_id.as_str()) {
+                keys.entry(event.session_id).or_default().insert(event.event_key);
+            }
+        })
+    }
     pub(crate) fn list_usage_events_for_session(
         &self,
         session_id: &str,

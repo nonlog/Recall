@@ -1,6 +1,7 @@
+mod object;
 mod transfer;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -229,7 +230,7 @@ fn exchange(
     let mut cursor = None;
     let mut cursors = HashSet::new();
     let mut remote_keys = HashSet::new();
-    let mut downloads = Vec::new();
+    let mut downloads = BTreeMap::new();
     let temporary = tempfile::tempdir()?;
     loop {
         let Reply::Listed(page) =
@@ -242,17 +243,29 @@ fn exchange(
                 object.size <= crate::db::remote_store::OBJECT_LIMIT as u64,
                 "remote object exceeds 512 MiB"
             );
-            if !remote_keys.insert(object.key.clone()) {
+            let name = object::Name::parse(&object.key)?;
+            remote_keys.insert(name.canonical.clone());
+            if let Some(cached) = store.cached_remote_size(&name.canonical)? {
+                if matches!(&name.encoding, object::Encoding::Raw) {
+                    ensure!(
+                        cached == object.size,
+                        "remote object size differs from its cached content"
+                    );
+                }
                 continue;
             }
-            if let Some(cached) = store.cached_remote_size(&object.key)? {
-                ensure!(
-                    cached == object.size,
-                    "remote object size differs from its cached content"
-                );
-                continue;
+            match downloads.entry(name.canonical) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(object);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if name.base().is_none()
+                        && object::Name::parse(&entry.get().key)?.base().is_some()
+                    {
+                        entry.insert(object);
+                    }
+                }
             }
-            downloads.push(object);
         }
         progress.detail(format!(
             "Remote objects: {} listed, {} new",
@@ -267,7 +280,13 @@ fn exchange(
         }
     }
     progress.phase("Downloading objects");
-    summary.downloaded = download_objects(store, progress, transport, downloads, temporary.path())?;
+    summary.downloaded = download_objects(
+        store,
+        progress,
+        transport,
+        downloads.into_values().collect(),
+        temporary.path(),
+    )?;
     progress.phase("Merging revisions");
     summary.sessions_with_alternatives = store.merge_remote()?;
     let uploads: Vec<String> = store
@@ -276,7 +295,8 @@ fn exchange(
         .filter(|key| !remote_keys.contains(key))
         .collect();
     progress.phase("Uploading objects");
-    summary.uploaded = upload_objects(store, progress, transport, uploads, temporary.path())?;
+    summary.uploaded =
+        upload_objects(store, progress, transport, uploads, &remote_keys, temporary.path())?;
     Ok(summary)
 }
 

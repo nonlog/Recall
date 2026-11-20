@@ -12,9 +12,19 @@ use crate::host::Location;
 use crate::project_scope::ProjectScope;
 use crate::types::Session;
 
+mod codec;
+
+pub(crate) use codec::{decode_zstd, encode_delta};
+
 const SQLITE_MAX_LENGTH: usize = 1_000_000_000;
 pub(crate) const OBJECT_LIMIT: usize = 512 * 1024 * 1024;
 const _: () = assert!(OBJECT_LIMIT < SQLITE_MAX_LENGTH);
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+pub(crate) const ZSTD_LEVEL: i32 = 3;
+
+pub(crate) fn decode_stored(body: Vec<u8>) -> Result<Vec<u8>> {
+    if body.starts_with(&ZSTD_MAGIC) { decode_zstd(&body, None) } else { Ok(body) }
+}
 
 pub(crate) fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -176,10 +186,11 @@ impl Store {
                 row.get(0)
             })
             .optional()?;
-        body.map(|body| serde_json::from_slice(&body).map_err(Into::into)).transpose()
+        body.map(|body| serde_json::from_slice(&decode_stored(body)?).map_err(Into::into))
+            .transpose()
     }
 
-    pub(crate) fn cached_remote(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn cached_stored(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let (table, hash) = object_parts(key)?;
         Ok(self
             .conn
@@ -187,6 +198,10 @@ impl Store {
                 row.get(0)
             })
             .optional()?)
+    }
+
+    pub(crate) fn cached_remote(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.cached_stored(key)?.map(decode_stored).transpose()
     }
 
     pub(crate) fn cached_remote_size(&self, key: &str) -> Result<Option<u64>> {
@@ -255,6 +270,14 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn cache_encoded(
+        &self,
+        key: &str,
+        body: &[u8],
+        _stored: Option<&[u8]>,
+    ) -> Result<()> {
+        self.cache_remote(key, body)
+    }
     fn alias_session(&self, sync_id: &str) -> Result<Option<String>> {
         Ok(self
             .conn
