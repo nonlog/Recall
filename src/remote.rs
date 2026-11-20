@@ -246,7 +246,7 @@ fn exchange(
             let name = object::Name::parse(&object.key)?;
             remote_keys.insert(name.canonical.clone());
             if let Some(cached) = store.cached_remote_size(&name.canonical)? {
-                if matches!(&name.encoding, object::Encoding::Raw) {
+                if name.canonical.starts_with("v1/metadata/") {
                     ensure!(
                         cached == object.size,
                         "remote object size differs from its cached content"
@@ -254,15 +254,13 @@ fn exchange(
                 }
                 continue;
             }
-            let canonical = name.canonical.clone();
-            match downloads.entry(canonical) {
+            let standalone = name.base().is_none();
+            match downloads.entry(name.canonical) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(object);
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if name.base().is_none()
-                        && object::Name::parse(&entry.get().key)?.base().is_some()
-                    {
+                    if standalone && object::Name::parse(&entry.get().key)?.base().is_some() {
                         entry.insert(object);
                     }
                 }

@@ -117,7 +117,8 @@ pub(super) fn download_objects(
                         None => None,
                     };
                     let raw = name.decode(&body, base.as_deref())?;
-                    store.cache_encoded(&name.canonical, &raw, None)?;
+                    let stored = (name.encoding == object::Encoding::Zstd).then_some(&body[..]);
+                    store.cache_encoded(&name.canonical, &raw, stored)?;
                     downloaded += 1;
                     ready.extend(waiting.remove(&name.canonical).unwrap_or_default());
                 }

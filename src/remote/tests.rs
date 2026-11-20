@@ -95,7 +95,11 @@ fn remote_large_revision_preserves_complete_events_and_recovers_objects() {
         .unwrap();
     let mut cloud = BTreeMap::new();
     transfer(&a, &mut cloud).unwrap();
-    assert!(cloud.values().any(|body| body.len() > 64 * 1024 * 1024));
+    let (key, encoded) = cloud.iter().find(|(key, _)| key.ends_with(".json.zst")).unwrap();
+    assert!(encoded.len() < 64 * 1024 * 1024);
+    let name = object::Name::parse(key).unwrap();
+    let key = key.clone();
+    assert!(name.decode(encoded, None).unwrap().len() > 64 * 1024 * 1024);
     transfer(&b, &mut cloud).unwrap();
     let received = b.list_recent_sessions(1).unwrap().pop().unwrap();
     let actual: String = b
@@ -108,7 +112,6 @@ fn remote_large_revision_preserves_complete_events_and_recovers_objects() {
         .unwrap();
     assert_eq!(actual, attrs);
     assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 0);
-    let key = cloud.iter().max_by_key(|(_, body)| body.len()).unwrap().0.clone();
     let lost = cloud.remove(&key).unwrap();
     assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 1);
     assert_eq!(cloud[&key], lost);
@@ -159,6 +162,52 @@ fn remote_roundtrip_updates_replicas_without_native_ownership_and_recovers_objec
     assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 1);
     assert_eq!(cloud[&lost], expected);
     assert_eq!(b.stats().unwrap().0, 1);
+}
+
+#[test]
+fn remote_delta_waits_for_legacy_parent_and_caches_the_complete_revision() {
+    crate::db::schema::register_sqlite_vec();
+    let source = Store::open_in_memory().unwrap();
+    let id = seed(&source, &"compressible synthetic message ".repeat(512), true);
+    let mut cloud = BTreeMap::new();
+    transfer(&source, &mut cloud).unwrap();
+    let base = cloud.keys().find(|key| key.ends_with(".json.zst")).unwrap().clone();
+    let canonical_base = object::Name::parse(&base).unwrap().canonical;
+    source
+        .conn
+        .execute(
+            "UPDATE messages SET content = ?1 WHERE session_id = ?2",
+            [&"updated synthetic message ".repeat(512), &id],
+        )
+        .unwrap();
+    assert_eq!(transfer(&source, &mut cloud).unwrap().uploaded, 1);
+    let delta = cloud.keys().find(|key| key.contains(".delta-")).unwrap();
+    let name = object::Name::parse(delta).unwrap();
+    assert_eq!(name.base(), Some(canonical_base.as_str()));
+    let expected = source.cached_remote(&name.canonical).unwrap().unwrap();
+    let base_bytes = cloud.remove(&base).unwrap();
+
+    let replica = Store::open_in_memory().unwrap();
+    transfer(&replica, &mut cloud).unwrap();
+    assert!(replica.cached_remote(&name.canonical).unwrap().is_none());
+    let raw_base = object::Name::parse(&base).unwrap().decode(&base_bytes, None).unwrap();
+    cloud.insert(canonical_base.clone(), raw_base);
+    let summary = transfer_observing(&replica, &mut cloud, &|key, _| {
+        if key == canonical_base {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!((summary.downloaded, summary.uploaded), (2, 0));
+    let revision = replica.cached_remote(&name.canonical).unwrap().unwrap();
+    assert_eq!(revision, expected);
+    let stored = replica.cached_stored(&name.canonical).unwrap().unwrap();
+    assert!(stored.starts_with(&crate::db::remote_store::ZSTD_MAGIC));
+    let session = replica.list_recent_sessions(1).unwrap().pop().unwrap();
+    assert!(replica.get_messages(&session.id).unwrap()[0].content.starts_with("updated"));
+    let summary = transfer(&replica, &mut cloud).unwrap();
+    assert_eq!((summary.downloaded, summary.uploaded), (0, 0));
 }
 
 #[test]
@@ -223,7 +272,8 @@ fn remote_downloads_overlap_retry_transient_gets_and_stop_on_a_failed_get() {
         Ok(())
     });
     assert!(format!("{:#}", failed.err().unwrap()).contains("synthetic get failure"));
-    assert_eq!(c.cached_remote_size(&broken).unwrap(), None);
+    let canonical = object::Name::parse(&broken).unwrap().canonical;
+    assert_eq!(c.cached_remote_size(&canonical).unwrap(), None);
 }
 
 #[test]
@@ -274,8 +324,8 @@ fn remote_concurrent_revisions_keep_one_projection_and_all_full_snapshots() {
     transfer(&source, &mut cloud).unwrap();
     transfer(&receiver, &mut cloud).unwrap();
     let original = cloud.iter().find(|(key, _)| key.starts_with("v1/revisions/")).unwrap();
-    let parent = digest(original.1);
-    let body = original.1.clone();
+    let body = object::Name::parse(original.0).unwrap().decode(original.1, None).unwrap();
+    let parent = digest(&body);
     for text in ["concurrent left", "concurrent right"] {
         let mut revision: Revision = serde_json::from_slice(&body).unwrap();
         revision.parent = Some(parent.clone());

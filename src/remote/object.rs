@@ -31,7 +31,10 @@ impl Name {
         {
             let (hash, encoding) = match name.split_once(DELTA) {
                 Some((hash, base)) => {
-                    ensure!(valid_digest(base) && base != hash, "invalid remote object name");
+                    ensure!(
+                        valid_digest(base) && base != hash,
+                        "invalid remote object name: {key}"
+                    );
                     (hash, Encoding::Delta(revision_key(base)))
                 }
                 None => (
@@ -39,7 +42,7 @@ impl Name {
                     Encoding::Zstd,
                 ),
             };
-            ensure!(valid_digest(hash), "invalid remote object name");
+            ensure!(valid_digest(hash), "invalid remote object name: {key}");
             return Ok(Self { canonical: revision_key(hash), encoding });
         }
         validate_object_key(key)?;

@@ -217,6 +217,15 @@ impl Store {
     }
 
     pub(crate) fn cache_remote(&self, key: &str, body: &[u8]) -> Result<()> {
+        self.cache_encoded(key, body, None)
+    }
+
+    pub(crate) fn cache_encoded(
+        &self,
+        key: &str,
+        body: &[u8],
+        compressed: Option<&[u8]>,
+    ) -> Result<()> {
         ensure!(body.len() <= OBJECT_LIMIT, "remote object exceeds 512 MiB");
         let (table, hash) = object_parts(key)?;
         ensure!(digest(body) == hash, "remote object content hash mismatch");
@@ -236,9 +245,17 @@ impl Store {
                 revision.parent_sessions.len() == decoded.topology.parents.len(),
                 "invalid portable parent links"
             );
+            let encoded;
+            let stored = match compressed {
+                Some(compressed) => compressed,
+                None => {
+                    encoded = zstd::encode_all(body, ZSTD_LEVEL)?;
+                    &encoded
+                }
+            };
             self.conn.execute(
                 "INSERT OR IGNORE INTO sync_revisions(digest, sync_id, body) VALUES (?1, ?2, ?3)",
-                params![hash, revision.sync_id, body],
+                params![hash, revision.sync_id, stored],
             )?;
         } else {
             let metadata: Metadata = serde_json::from_slice(body)?;
@@ -270,14 +287,6 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn cache_encoded(
-        &self,
-        key: &str,
-        body: &[u8],
-        _stored: Option<&[u8]>,
-    ) -> Result<()> {
-        self.cache_remote(key, body)
-    }
     fn alias_session(&self, sync_id: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -515,7 +524,9 @@ impl Store {
         let rows = stmt
             .query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(|(hash, body)| Ok((hash, serde_json::from_slice(&body)?))).collect()
+        rows.into_iter()
+            .map(|(hash, body)| Ok((hash, serde_json::from_slice(&decode_stored(body)?)?)))
+            .collect()
     }
 
     pub(crate) fn revision_summaries(&self, id: &str) -> Result<Vec<Value>> {
