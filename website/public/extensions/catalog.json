@@ -1,5 +1,24 @@
 {
   "extensions": {
+    "calibrate": {
+      "description": "Suggest agent settings, such as the auto-compact window, from Recall usage",
+      "versions": {
+        "0.1.0": {
+          "min_recall": "0.6.5.11",
+          "protocol": 2,
+          "targets": {
+            "x86_64-pc-windows-msvc": {
+              "sha256": "5abfdbd640f196373e61352839920bc446ea74566ab9fe7366e466a367ee2c25",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-calibrate-v0.1.0/recall-calibrate-v0.1.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "93d76727cd4f8592468b58e1c7b24d5af463522cc095a8bcd624d78a54f1ec4a",
+              "url": "https://github.com/nonlog/Recall/releases/download/recall-calibrate-v0.1.0/recall-calibrate-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        }
+      }
+    },
     "opendal": {
       "description": "Recall remote storage provider powered by Apache OpenDAL",
       "versions": {
