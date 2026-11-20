@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.5.8] (2026-11-20)
+
+### nonlog fork
+
+* Fix the Droid deletion regression test setup exposed by the release CI compile.
+
 ## [0.6.5.7] (2026-11-20)
 
 ### nonlog fork
