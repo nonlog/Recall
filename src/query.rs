@@ -151,9 +151,18 @@ pub(crate) fn resolve_source_filter(
     source_filter: Option<&str>,
     sources: &[(String, String)],
 ) -> Result<Option<Vec<String>>> {
-    source_filter
-        .map(|source| resolve_source_id(source, sources).map(|source| vec![source]))
-        .transpose()
+    let Some(source_filter) = source_filter else {
+        return Ok(None);
+    };
+    let mut resolved = Vec::new();
+    for source in source_filter.split(',').map(str::trim).filter(|source| !source.is_empty()) {
+        let id = resolve_source_id(source, sources)?;
+        if !resolved.contains(&id) {
+            resolved.push(id);
+        }
+    }
+    anyhow::ensure!(!resolved.is_empty(), "source filter cannot be empty");
+    Ok(Some(resolved))
 }
 
 pub(crate) fn resolve_source_id(source: &str, sources: &[(String, String)]) -> Result<String> {
@@ -192,6 +201,10 @@ pub(crate) fn query_embedding<F>(
 where
     F: FnMut(&str),
 {
+    let config = crate::config::AppConfig::load().unwrap_or_default();
+    if !config.semantic_enabled {
+        return Ok(None);
+    }
     let progress = store.semantic_progress().unwrap_or_default();
     if progress.done_sessions == 0 && progress.processing_sessions == 0 {
         return Ok(None);

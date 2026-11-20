@@ -5,11 +5,58 @@ use anyhow::Result;
 use crate::db::store::Store;
 use crate::embedding::EmbeddingProvider;
 use crate::utils::try_acquire_worker_lock;
+#[derive(clap::Subcommand)]
+pub(crate) enum SemanticCommands {
+    #[command(about = "Enable semantic indexing and search")]
+    Enable,
+    #[command(about = "Disable semantic indexing and search")]
+    Disable,
+    #[command(about = "Show semantic setting and indexing progress")]
+    Status,
+}
+
+pub(crate) fn run_semantic_command(command: SemanticCommands) -> Result<()> {
+    match command {
+        SemanticCommands::Enable => {
+            let mut config = crate::config::AppConfig::load()?;
+            config.semantic_enabled = true;
+            config.save()?;
+            let pending = Store::open()?
+                .semantic_progress()
+                .map(|progress| progress.total_sessions.saturating_sub(progress.done_sessions))
+                .unwrap_or_default();
+            println!("Semantic search enabled. {pending} sessions remain queued.");
+            ensure_background_worker(false)?;
+        }
+        SemanticCommands::Disable => {
+            let mut config = crate::config::AppConfig::load()?;
+            config.semantic_enabled = false;
+            config.save()?;
+            println!("Semantic search disabled. Full-text search remains available.");
+        }
+        SemanticCommands::Status => {
+            let config = crate::config::AppConfig::load()?;
+            let progress = Store::open()?.semantic_progress()?;
+            println!(
+                "semantic_enabled={} done={} processing={} failed={} total={}",
+                config.semantic_enabled,
+                progress.done_sessions,
+                progress.processing_sessions,
+                progress.failed_sessions,
+                progress.total_sessions
+            );
+        }
+    }
+    Ok(())
+}
 
 const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
 
 pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
+    if !crate::config::AppConfig::load().unwrap_or_default().semantic_enabled {
+        return Ok(());
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__background-worker");
@@ -30,6 +77,10 @@ where
     };
 
     let store = Store::open()?;
+
+    if !crate::config::AppConfig::load().unwrap_or_default().semantic_enabled {
+        return Ok(());
+    }
 
     if sync_first {
         store.set_background_job_state(BACKGROUND_JOB, "sync", Some("Incremental sync"))?;

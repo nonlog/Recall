@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -12,6 +12,57 @@ const CODEX_DISJOINT_REASONING_VERSION: u32 = 5;
 const CACHE_EXCLUSIVE_INPUT_VERSION: u32 = 2;
 const FLEXIBLE_REASONING_VERSION: u32 = 2;
 
+enum UsageOwnership {
+    Counted,
+    Duplicate,
+    OtherSession,
+}
+
+#[derive(Default)]
+struct UsageDedup {
+    owners: HashMap<(String, String), String>,
+}
+
+impl UsageDedup {
+    fn assign(&mut self, event: &UsageEventRecord) -> UsageOwnership {
+        let key = match event.source.as_str() {
+            "codex" => format!(
+                "token_count:{}:{}:{}:{}:{}:{}:{}:{}",
+                event.timestamp,
+                event.provider,
+                event.model,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens
+            ),
+            "claude-code"
+                if event.event_key.starts_with("assistant:")
+                    && !event.event_key.contains(":line:") =>
+            {
+                event.event_key.clone()
+            }
+            "warp" => event.event_key.clone(),
+            "qoder"
+                if event.event_key.starts_with("assistant:")
+                    && !event.event_key.starts_with("assistant:line:") =>
+            {
+                event.event_key.clone()
+            }
+            _ => return UsageOwnership::Counted,
+        };
+        match self.owners.entry((event.source.clone(), key)) {
+            Entry::Vacant(entry) => {
+                entry.insert(event.session_id.clone());
+                UsageOwnership::Counted
+            }
+            Entry::Occupied(entry) if entry.get() == &event.session_id => UsageOwnership::Duplicate,
+            Entry::Occupied(_) => UsageOwnership::OtherSession,
+        }
+    }
+}
+#[derive(Clone, Copy)]
 struct PersistedUsage {
     input_tokens: i64,
     output_tokens: i64,
@@ -156,8 +207,15 @@ impl Store {
             })
         })?;
 
+        let mut dedup = UsageDedup::default();
         for row in rows {
-            fold(&mut state, row?);
+            let event = row?;
+            let ownership = dedup.assign(&event);
+            if ownership == UsageOwnership::Counted
+                && after_millis.is_none_or(|cutoff| event.timestamp >= cutoff)
+            {
+                fold(&mut state, event);
+            }
         }
         Ok(state)
     }

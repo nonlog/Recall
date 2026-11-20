@@ -3,8 +3,9 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::adapters::AdapterSyncContext;
@@ -12,7 +13,7 @@ use crate::adapters::events::{
     EventContext, shell_file_evidence, tool_call_event, tool_result_event,
 };
 use crate::adapters::file_scan::{self, FileScanEntry};
-use crate::adapters::paths::resolve_home_dir;
+use crate::adapters::paths::{file_uri_to_path, resolve_home_dir};
 use crate::adapters::{RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult};
 use crate::types::{FileEvidence, FileOperation, Role};
 
@@ -20,32 +21,61 @@ const EVENT_PARSER_VERSION: u32 = 1;
 
 const TRANSCRIPT_RELATIVE_PATH: &[&str] = &[".system_generated", "logs", "transcript.jsonl"];
 
-pub(crate) struct AntigravityAdapter;
+#[derive(Clone, Copy)]
+pub(crate) enum AntigravityAdapter {
+    Cli,
+    Desktop,
+}
+
+impl AntigravityAdapter {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Cli => "antigravity-cli",
+            Self::Desktop => "antigravity",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cli => "AGY",
+            Self::Desktop => "AGYD",
+        }
+    }
+}
 
 impl SourceAdapter for AntigravityAdapter {
     fn id(&self) -> &str {
-        "antigravity-cli"
+        (*self).id()
     }
 
     fn label(&self) -> &str {
-        "AGY"
+        (*self).label()
     }
 
     fn resume_command(&self, source_id: &str) -> Option<ResumeCommand> {
-        Some(ResumeCommand::new("agy", &["--conversation", source_id]))
+        match self {
+            Self::Cli => Some(ResumeCommand::new("agy", &["--conversation", source_id])),
+            Self::Desktop => None,
+        }
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
-        Some(ResumeCommand { program: "agy".to_string(), args: vec!["-i".to_string(), prompt] })
+        match self {
+            Self::Cli => Some(ResumeCommand {
+                program: "agy".to_string(),
+                args: vec!["-i".to_string(), prompt],
+            }),
+            Self::Desktop => None,
+        }
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        let Some(cli_dir) = resolve_antigravity_dir()? else {
+        let Some(cli_dir) = resolve_antigravity_dir(*self)? else {
             return Ok(vec![]);
         };
 
         let mut sessions = Vec::new();
-        for entry in collect_antigravity_entries(&cli_dir)? {
+        for entry in collect_antigravity_entries(&cli_dir, *self)? {
             let Some(snapshot) = antigravity_snapshot(&entry) else {
                 continue;
             };
@@ -67,27 +97,34 @@ impl SourceAdapter for AntigravityAdapter {
         since_ts: Option<i64>,
         include_events: bool,
     ) -> anyhow::Result<Option<SyncScanResult>> {
-        let Some(cli_dir) = resolve_antigravity_dir()? else {
+        let Some(cli_dir) = resolve_antigravity_dir(*self)? else {
             return Ok(Some(SyncScanResult::default()));
         };
-        Ok(Some(scan_for_sync_impl(&cli_dir, context, since_ts, include_events)?))
+        Ok(Some(scan_for_sync_impl(&cli_dir, *self, context, since_ts, include_events)?))
     }
 }
 
-fn resolve_antigravity_dir() -> anyhow::Result<Option<PathBuf>> {
-    resolve_home_dir(
-        ".gemini/antigravity-cli",
-        "~/.gemini/antigravity-cli not found, skipping Antigravity CLI",
-    )
+fn resolve_antigravity_dir(adapter: AntigravityAdapter) -> anyhow::Result<Option<PathBuf>> {
+    match adapter {
+        AntigravityAdapter::Cli => resolve_home_dir(
+            ".gemini/antigravity-cli",
+            "~/.gemini/antigravity-cli not found, skipping Antigravity CLI",
+        ),
+        AntigravityAdapter::Desktop => resolve_home_dir(
+            ".gemini/antigravity",
+            "~/.gemini/antigravity not found, skipping Antigravity desktop",
+        ),
+    }
 }
 
 fn scan_for_sync_impl(
     cli_dir: &Path,
+    adapter: AntigravityAdapter,
     context: &AdapterSyncContext,
     since_ts: Option<i64>,
     include_events: bool,
 ) -> anyhow::Result<SyncScanResult> {
-    let entries = collect_antigravity_entries(cli_dir)?;
+    let entries = collect_antigravity_entries(cli_dir, adapter)?;
     file_scan::run_file_scan_with_options_and_snapshot(
         context,
         since_ts,
@@ -109,13 +146,25 @@ fn antigravity_snapshot(
     Some(file_scan::FileScanSnapshot::new(fingerprint.mtime_ms()?, fingerprint))
 }
 
-fn collect_antigravity_entries(cli_dir: &Path) -> anyhow::Result<Vec<FileScanEntry>> {
+fn collect_antigravity_entries(
+    cli_dir: &Path,
+    adapter: AntigravityAdapter,
+) -> anyhow::Result<Vec<FileScanEntry>> {
     let brain_dir = cli_dir.join("brain");
     if !brain_dir.exists() {
         return Ok(vec![]);
     }
 
-    let workspace_by_conversation = load_history_workspace_map(&cli_dir.join("history.jsonl"))?;
+    let workspace_by_conversation = match adapter {
+        AntigravityAdapter::Cli => load_history_workspace_map(&cli_dir.join("history.jsonl"))?,
+        AntigravityAdapter::Desktop => {
+            let path = cli_dir.join("conversation_summaries.db");
+            load_desktop_workspace_map(&path).unwrap_or_else(|err| {
+                warn!("failed to read Antigravity workspaces {}: {err}", path.display());
+                HashMap::new()
+            })
+        }
+    };
     let mut entries = Vec::new();
 
     for walk_entry in
@@ -149,6 +198,25 @@ fn collect_antigravity_entries(cli_dir: &Path) -> anyhow::Result<Vec<FileScanEnt
     Ok(entries)
 }
 
+fn load_desktop_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, String>> {
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt =
+        conn.prepare("SELECT conversation_id, workspace_uris FROM conversation_summaries")?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (id, uris) = row?;
+        let Ok(uris) = serde_json::from_str::<Vec<String>>(&uris) else { continue };
+        if let Some(path) = uris.iter().find_map(|uri| file_uri_to_path(uri)) {
+            map.insert(id, path);
+        }
+    }
+    Ok(map)
+}
 fn load_history_workspace_map(path: &Path) -> anyhow::Result<HashMap<String, String>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,

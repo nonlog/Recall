@@ -2302,6 +2302,7 @@ impl App {
 
     fn semantic_ready(&self) -> bool {
         !self.embedding_unavailable
+            && self.config.semantic_enabled
             && (self.semantic_progress.done_sessions > 0
                 || self.semantic_progress.processing_sessions > 0)
     }

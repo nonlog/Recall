@@ -45,6 +45,11 @@ enum Commands {
         #[arg(long, requires = "messages", value_parser = clap::value_parser!(u32).range(1..=50), help = "Maximum message matches (default 10, maximum 50)")]
         limit: Option<u32>,
     },
+    #[command(about = "Manage semantic indexing and search")]
+    Semantic {
+        #[command(subcommand)]
+        command: crate::semantic::SemanticCommands,
+    },
     #[command(about = "Operate on indexed sessions")]
     Session {
         #[command(subcommand)]
@@ -142,11 +147,10 @@ enum Commands {
             help = "Maximum sessions to export; 0 means all (default)"
         )]
         limit: usize,
-        #[arg(
-            long,
-            help = "Comma-separated JSONL fields; messages is required: metadata,messages,usage,events"
-        )]
-        include: Option<String>,
+        #[arg(long, value_enum, default_value_t = crate::export::MessageMode::All, help = "Export all messages or omit message bodies")]
+        messages: crate::export::MessageMode,
+        #[arg(long, help = "Emit a scope record before session records, including empty results")]
+        with_scope: bool,
     },
     #[command(about = "Import session records from JSON Lines")]
     Import {
@@ -339,6 +343,7 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::BackgroundWorker { sync_first }) => {
             crate::sync::run_background_worker(sync_first)?
         }
+        Some(Commands::Semantic { command }) => crate::semantic::run_semantic_command(command)?,
         Some(Commands::BenchSemantic) => crate::bench::run_semantic()?,
         Some(Commands::BenchSearch { query }) => crate::bench::run_search(&query)?,
         Some(Commands::BenchEval { dataset, verbose }) => {
@@ -381,17 +386,27 @@ pub(crate) fn run() -> Result<()> {
         Some(Commands::Usage { json, source, time, card, period }) => {
             crate::usage::run_cli(json, source.as_deref(), time.as_deref(), card, period)?
         }
-        Some(Commands::Export { source, time, project, repo, thread_role, limit, include }) => {
-            crate::export::run_cli(
-                source.as_deref(),
-                time.as_deref(),
-                project.as_deref(),
-                repo.as_deref(),
-                thread_role,
-                limit,
-                include.as_deref(),
-            )?
-        }
+        Some(Commands::Export {
+            source,
+            time,
+            project,
+            repo,
+            thread_role,
+            limit,
+            include,
+            messages,
+            with_scope,
+        }) => crate::export::run_cli(
+            source.as_deref(),
+            time.as_deref(),
+            project.as_deref(),
+            repo.as_deref(),
+            thread_role,
+            limit,
+            include.as_deref(),
+            messages,
+            with_scope,
+        )?,
         Some(Commands::Import { file, dry_run }) => crate::import::run_cli(&file, dry_run)?,
         Some(Commands::Share { command }) => match command {
             ShareCommands::Init { project_name, publish_dir } => {

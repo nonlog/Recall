@@ -34,13 +34,17 @@ recall session share --id <session-id> --format json  # publish one selected ses
 recall session delete --id <session-id> --dry-run  # preview safe session deletion
 recall share list --format json  # list published share URLs
 recall share unpublish <share-id> --yes  # take down one public page
+recall semantic status  # show semantic indexing state
+recall semantic enable  # enable embeddings and semantic search
+recall semantic disable # disable embeddings; full-text search remains available
+recall export --source codex,claude-code --with-scope --messages none # scoped metadata export
 recall session trash list  # inspect Recall trash
 recall session trash restore <entry>  # restore one entry
 recall session trash empty --yes  # permanently clear trash
 recall info  # index stats and worker status
 ```
 
-### Agent icons in terminal UI
+`recall semantic` controls the optional embedding index. It is disabled by default to avoid model downloads and background CPU use. `recall semantic enable` starts indexing queued sessions. `recall semantic disable` leaves full-text search and synchronization available. Export accepts comma-separated sources, can emit a scope record, and can omit message bodies with `--messages none`.
 
 Recall defaults to [Herdr Agent Icons Max](https://github.com/hhdebb/herdr-radar) agent logos. Release archives include the patched icon-only font and its license in `fonts/`; the patch adds the Droid logo at U+E1BB. Configure your terminal to render the font, or set `RECALL_ICON_STYLE=nerd` (also `nerd-font`) for Nerd Font marks or `RECALL_ICON_STYLE=plain` for Unicode marks. Unpatched Herdr fonts may not contain the Droid glyph.
 

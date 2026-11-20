@@ -78,6 +78,8 @@ pub(crate) struct AppConfig {
     pub(crate) excluded_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) share: Option<ShareConfig>,
+    #[serde(default)]
+    pub(crate) semantic_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +201,17 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn semantic_setting_defaults_off_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert!(!AppConfig::load_from(&path).unwrap().semantic_enabled);
+        std::fs::write(&path, "{}").unwrap();
+        let mut config = AppConfig::load_from(&path).unwrap();
+        config.semantic_enabled = true;
+        config.save_to(&path).unwrap();
+        assert!(AppConfig::load_from(&path).unwrap().semantic_enabled);
+    }
     #[test]
     fn initialized_sources_are_unchanged() {
         let mut config = AppConfig { sources_initialized: true, ..Default::default() };
