@@ -24,20 +24,21 @@ Before merging or rebasing a new upstream release:
 
 ## Automated upstream-sync guard
 
-- .github/workflows/sync-upstream.yml checks upstream main daily and on demand,
-  merges it only into a dedicated review branch, and opens or refreshes a PR.
-  It never auto-merges or pushes upstream directly to fork main.
-- Merge conflicts abort and create or update a needs-fork-review issue instead
-  of guessing a resolution.
+- `.github/workflows/sync-upstream.yml` checks upstream main daily and on demand,
+  merges it into a candidate commit, and automatically pushes that commit to
+  fork main only after the fork contract and complete `make check` pass.
+- The push uses a compare-and-swap lease against the checked-out main SHA, so a
+  concurrent main update aborts the sync instead of overwriting it.
+- Merge conflicts or validation failures leave fork main unchanged and create or
+  refresh a needs-fork-review issue or recovery PR.
 - scripts/check-fork-contract.sh is part of make check. A clean Git merge that
-  removes a fork invariant therefore still fails CI; the sync workflow leaves
-  such a candidate as a draft PR for manual review.
+  removes a fork invariant therefore fails before an automatic main push.
 - Automated merge commits use Codex <codex@openai.com> as both author and
   committer.
-- Review-branch pushes use the dedicated `UPSTREAM_SYNC_DEPLOY_KEY_B64` SSH
-  deploy-key secret so upstream changes to `.github/workflows/*` can be
-  represented without
-  granting the merged candidate persistent `GITHUB_TOKEN` git credentials.
+- Review and main-branch pushes use the dedicated
+  `UPSTREAM_SYNC_DEPLOY_KEY_B64` SSH deploy key so upstream changes to
+  `.github/workflows/*` can be represented without granting merged candidate
+  code persistent `GITHUB_TOKEN` git credentials.
 - Landmarks: .github/workflows/sync-upstream.yml,
   scripts/check-fork-contract.sh, FORK_MAINTENANCE.md.
 

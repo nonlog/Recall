@@ -1,4 +1,4 @@
-name: Prepare Upstream Sync PR
+name: Automatic Upstream Sync
 
 on:
   schedule:
@@ -223,9 +223,36 @@ jobs:
         shell: bash
         run: make check
 
-      - name: Create or refresh upstream sync PR
-        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true'
-        id: pr
+      - name: Auto-merge validated upstream candidate
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.contract.outputs.status == 'pass' && steps.audit_tool.outcome == 'success' && steps.validate.outcome == 'success'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
+          UPSTREAM_SYNC_DEPLOY_KEY_B64: ${{ secrets.UPSTREAM_SYNC_DEPLOY_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${UPSTREAM_SYNC_DEPLOY_KEY_B64:-}" ]]; then
+            echo "::error::UPSTREAM_SYNC_DEPLOY_KEY_B64 is not configured."
+            exit 1
+          fi
+
+          key_file="$RUNNER_TEMP/upstream-sync-main-deploy-key"
+          cleanup() { rm -f "$key_file"; }
+          trap cleanup EXIT
+          umask 077
+          printf '%s' "$UPSTREAM_SYNC_DEPLOY_KEY_B64" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          if ! ssh-keygen -y -f "$key_file" >/dev/null 2>&1; then
+            echo "::error::Decoded upstream sync deploy key is not a valid OpenSSH private key."
+            exit 1
+          fi
+
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git push --force-with-lease="refs/heads/main:${BASE_SHA}" origin HEAD:refs/heads/main
+
+      - name: Create or refresh upstream sync PR for manual recovery
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && (steps.contract.outputs.status != 'pass' || steps.audit_tool.outcome != 'success' || steps.validate.outcome != 'success')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -266,7 +293,7 @@ jobs:
             echo "- audit-tool setup: **${AUDIT_TOOL_STATUS:-skipped}**"
             echo "- full \`make check\`: **${VALIDATION_STATUS:-skipped}**"
             echo "- overall automated validation: **${overall_status}**"
-            echo "- merge policy: **manual review required; this workflow never auto-merges**"
+            echo "- merge policy: **automatic merge after all gates pass; manual recovery PR on conflict or validation failure**"
             echo
             echo "The sync workflow runs the complete \`make check\` itself because PRs"
             echo "created by \`GITHUB_TOKEN\` do not recursively trigger ordinary PR CI."
@@ -322,12 +349,12 @@ jobs:
           gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json url --jq .url
 
       - name: Fail when automated validation regressed
-        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && steps.pr.outputs.overall_status != 'pass'
+        if: steps.upstream.outputs.needed == 'true' && steps.merge.outputs.conflict != 'true' && (steps.contract.outputs.status != 'pass' || steps.audit_tool.outcome != 'success' || steps.validate.outcome != 'success')
         shell: bash
         run: |
-          echo "::error::The upstream merge candidate is preserved as a draft PR because fork validation failed or could not run."
+          echo "::error::The upstream merge candidate was not auto-merged because a gate failed. It is preserved as a manual recovery PR."
           exit 1
 
       - name: No upstream changes
         if: steps.upstream.outputs.needed != 'true'
-        run: echo "No upstream synchronization PR is needed."
+        run: echo "No upstream synchronization is needed."

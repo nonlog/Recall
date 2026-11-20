@@ -8,7 +8,14 @@ Release commit: see tag `v0.6.5.10`
 
 ## Current fork policy
 
-### 2026-11-20 Codex ghost-thread cleanup and managed Trash
+### 2026-11-20 Automatic upstream sync
+
+- Upstream synchronization now pushes a clean, fully validated merge commit to
+  `main` automatically. It uses the fork contract, the complete `make check`,
+  and a compare-and-swap lease against the checked-out main SHA.
+- Merge conflicts and validation failures remain fail-closed. They leave main
+  unchanged and preserve an issue or draft recovery PR for manual resolution.
+
 
 - Codex native deletion now removes matching `session_index.jsonl` records only after the thread registry and rollout deletion both verify successfully. This prevents Codex Desktop from showing a deleted rollout as `chat unavailable`.
 - Trash entries include a complete Recall JSONL export. `recall session trash list`, `restore`, and `empty --yes` manage persisted entries. TUI `Ctrl+D` uses Trash and `Ctrl+Shift+D` is the permanent path.
