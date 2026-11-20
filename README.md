@@ -59,7 +59,7 @@ recall session delete --id <session-id> --permanent # permanently delete native 
 recall session delete --id <session-id> --index-only # leave source-agent data untouched
 ```
 
-Codex and OpenCode use their official delete commands so their own metadata stays consistent. Claude Code, Pi, OMP, Antigravity, Gemini, Grok, Copilot CLI, Cline, DeepSeek Harness, Droid, and Kimi Code use validated per-session files or directories. Shared-database sources without a stable native delete API require `--index-only`; Recall deliberately does not guess writes into their databases.
+Antigravity CLI and Desktop sessions are indexed separately. Desktop sessions are read from `~/.gemini/antigravity` and use its conversation summaries database for workspace attribution. Claude Code, Pi, OMP, Antigravity, Gemini, Grok, Copilot CLI, Cline, DeepSeek Harness, Droid, and Kimi Code use validated per-session files or directories. Shared-database sources without a stable native delete API require `--index-only`; Recall deliberately does not guess writes into their databases.
 
 Droid native deletion is **local-only**: Recall validates the UUID and native
 `session_start.id` under `~/.factory/sessions` (or `DROID_SESSIONS_DIR`), then
