@@ -12,6 +12,7 @@ const CODEX_DISJOINT_REASONING_VERSION: u32 = 5;
 const CACHE_EXCLUSIVE_INPUT_VERSION: u32 = 2;
 const FLEXIBLE_REASONING_VERSION: u32 = 2;
 
+#[derive(PartialEq)]
 enum UsageOwnership {
     Counted,
     Duplicate,

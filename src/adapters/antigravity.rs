@@ -615,7 +615,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = collect_antigravity_entries(&root).unwrap();
+        let entries = collect_antigravity_entries(&root, AntigravityAdapter::Cli).unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, conversation_id);
@@ -638,6 +638,7 @@ mod tests {
 
         let fresh = scan_for_sync_impl(
             &root,
+            AntigravityAdapter::Cli,
             &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
             None,
             false,
@@ -649,6 +650,7 @@ mod tests {
 
         let result = scan_for_sync_impl(
             &root,
+            AntigravityAdapter::Cli,
             &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
             None,
             false,
@@ -669,6 +671,7 @@ mod tests {
             }
             let result = scan_for_sync_impl(
                 &root,
+                AntigravityAdapter::Cli,
                 &AdapterSyncContext::from_store_for_test(&store, "antigravity-cli").unwrap(),
                 None,
                 true,
