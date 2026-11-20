@@ -326,7 +326,7 @@ pub(crate) fn execute(
                                     let native_paths_unchanged =
                                         plan.native_roots.iter().all(|root| root.exists());
                                     if native_paths_unchanged {
-                                        let _ = fs::remove_dir_all(&backup_dir);
+                                        let _ = fs::remove_dir_all(backup_dir);
                                         return Err(error);
                                     }
                                     return Err(anyhow::anyhow!(
@@ -1666,12 +1666,11 @@ fn backup_before_native_command(
     roots: &[PathBuf],
     trash_dir: &Path,
 ) -> Result<()> {
-    let backup_result = if session.source == "opencode" {
+    if session.source == "opencode" {
         backup_opencode_export(session, trash_dir)
     } else {
         backup_paths(roots, trash_dir)
-    };
-    backup_result
+    }
 }
 
 fn backup_opencode_export(session: &Session, trash_dir: &Path) -> Result<()> {
