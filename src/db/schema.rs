@@ -1,7 +1,9 @@
 use rusqlite::{Connection, OptionalExtension};
 
+mod remote_pending;
+
 const V12_SCHEMA_VERSION: i64 = 12;
-pub(crate) const SCHEMA_VERSION: i64 = 17;
+pub(crate) const SCHEMA_VERSION: i64 = 19;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub(crate) fn register_sqlite_vec() {
@@ -66,6 +68,23 @@ pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
     if version < 17 {
         migrate_v17(conn)?;
     }
+    if version < 18 {
+        migrate_v18(conn)?;
+    }
+    if version < 19 {
+        remote_pending::migrate_v19(conn)?;
+    }
+    Ok(())
+}
+
+fn migrate_v18(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    add_column_if_missing(&tx, "ALTER TABLE sync_revisions ADD COLUMN size INTEGER")?;
+    add_column_if_missing(&tx, "ALTER TABLE sync_objects ADD COLUMN size INTEGER")?;
+    if read_schema_version(&tx)? >= 17 {
+        tx.execute_batch("PRAGMA user_version = 18;")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 

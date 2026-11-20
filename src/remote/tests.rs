@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod objects;
+mod parents;
+
 fn seed(store: &Store, text: &str, native: bool) -> String {
     let record = serde_json::json!({
         "schema_version": 7, "record_type": "session",
@@ -18,6 +21,29 @@ fn seed(store: &Store, text: &str, native: bool) -> String {
         store.clear_import_marker("codex", "shared-native-id").unwrap();
     }
     store.get_session_by_source_id("codex", "shared-native-id").unwrap().unwrap().id
+}
+
+fn raw_objects(cloud: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+    let mut raw = BTreeMap::new();
+    let mut pending: Vec<_> =
+        cloud.iter().map(|(key, body)| (object::Name::parse(key).unwrap(), body)).collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|(name, body)| {
+            let base = match name.base() {
+                Some(base) => match raw.get(base) {
+                    Some(base) => Some(base),
+                    None => return true,
+                },
+                None => None,
+            };
+            let decoded = name.decode(body, base.map(Vec::as_slice)).unwrap();
+            raw.insert(name.canonical.clone(), decoded);
+            false
+        });
+        assert!(pending.len() < before, "delta base missing");
+    }
+    raw
 }
 
 fn transfer(store: &Store, cloud: &mut BTreeMap<String, Vec<u8>>) -> Result<SyncSummary> {
@@ -41,7 +67,7 @@ fn transfer_observing(
             }
             let mut cloud = cloud.lock().expect("synthetic cloud");
             Ok(match operation {
-                Operation::List { cursor, .. } => {
+                Operation::List { prefix, cursor, .. } => {
                     if cursor.is_none() {
                         Reply::Listed(Page {
                             objects: Vec::new(),
@@ -51,6 +77,7 @@ fn transfer_observing(
                         Reply::Listed(Page {
                             objects: cloud
                                 .iter()
+                                .filter(|(key, _)| key.starts_with(prefix.as_str()))
                                 .map(|(key, value)| Object {
                                     key: key.clone(),
                                     size: value.len() as u64,
@@ -95,11 +122,8 @@ fn remote_large_revision_preserves_complete_events_and_recovers_objects() {
         .unwrap();
     let mut cloud = BTreeMap::new();
     transfer(&a, &mut cloud).unwrap();
-    let (key, encoded) = cloud.iter().find(|(key, _)| key.ends_with(".json.zst")).unwrap();
-    assert!(encoded.len() < 64 * 1024 * 1024);
-    let name = object::Name::parse(key).unwrap();
-    let key = key.clone();
-    assert!(name.decode(encoded, None).unwrap().len() > 64 * 1024 * 1024);
+    assert!(raw_objects(&cloud).values().any(|body| body.len() > 64 * 1024 * 1024));
+    assert!(cloud.values().all(|body| body.len() < 1024 * 1024));
     transfer(&b, &mut cloud).unwrap();
     let received = b.list_recent_sessions(1).unwrap().pop().unwrap();
     let actual: String = b
@@ -112,6 +136,7 @@ fn remote_large_revision_preserves_complete_events_and_recovers_objects() {
         .unwrap();
     assert_eq!(actual, attrs);
     assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 0);
+    let key = cloud.iter().max_by_key(|(_, body)| body.len()).unwrap().0.clone();
     let lost = cloud.remove(&key).unwrap();
     assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 1);
     assert_eq!(cloud[&key], lost);
@@ -162,52 +187,6 @@ fn remote_roundtrip_updates_replicas_without_native_ownership_and_recovers_objec
     assert_eq!(transfer(&b, &mut cloud).unwrap().uploaded, 1);
     assert_eq!(cloud[&lost], expected);
     assert_eq!(b.stats().unwrap().0, 1);
-}
-
-#[test]
-fn remote_delta_waits_for_legacy_parent_and_caches_the_complete_revision() {
-    crate::db::schema::register_sqlite_vec();
-    let source = Store::open_in_memory().unwrap();
-    let id = seed(&source, &"compressible synthetic message ".repeat(512), true);
-    let mut cloud = BTreeMap::new();
-    transfer(&source, &mut cloud).unwrap();
-    let base = cloud.keys().find(|key| key.ends_with(".json.zst")).unwrap().clone();
-    let canonical_base = object::Name::parse(&base).unwrap().canonical;
-    source
-        .conn
-        .execute(
-            "UPDATE messages SET content = ?1 WHERE session_id = ?2",
-            [&"updated synthetic message ".repeat(512), &id],
-        )
-        .unwrap();
-    assert_eq!(transfer(&source, &mut cloud).unwrap().uploaded, 1);
-    let delta = cloud.keys().find(|key| key.contains(".delta-")).unwrap();
-    let name = object::Name::parse(delta).unwrap();
-    assert_eq!(name.base(), Some(canonical_base.as_str()));
-    let expected = source.cached_remote(&name.canonical).unwrap().unwrap();
-    let base_bytes = cloud.remove(&base).unwrap();
-
-    let replica = Store::open_in_memory().unwrap();
-    transfer(&replica, &mut cloud).unwrap();
-    assert!(replica.cached_remote(&name.canonical).unwrap().is_none());
-    let raw_base = object::Name::parse(&base).unwrap().decode(&base_bytes, None).unwrap();
-    cloud.insert(canonical_base.clone(), raw_base);
-    let summary = transfer_observing(&replica, &mut cloud, &|key, _| {
-        if key == canonical_base {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!((summary.downloaded, summary.uploaded), (2, 0));
-    let revision = replica.cached_remote(&name.canonical).unwrap().unwrap();
-    assert_eq!(revision, expected);
-    let stored = replica.cached_stored(&name.canonical).unwrap().unwrap();
-    assert!(stored.starts_with(&crate::db::remote_store::ZSTD_MAGIC));
-    let session = replica.list_recent_sessions(1).unwrap().pop().unwrap();
-    assert!(replica.get_messages(&session.id).unwrap()[0].content.starts_with("updated"));
-    let summary = transfer(&replica, &mut cloud).unwrap();
-    assert_eq!((summary.downloaded, summary.uploaded), (0, 0));
 }
 
 #[test]
@@ -272,8 +251,8 @@ fn remote_downloads_overlap_retry_transient_gets_and_stop_on_a_failed_get() {
         Ok(())
     });
     assert!(format!("{:#}", failed.err().unwrap()).contains("synthetic get failure"));
-    let canonical = object::Name::parse(&broken).unwrap().canonical;
-    assert_eq!(c.cached_remote_size(&canonical).unwrap(), None);
+    let broken = object::Name::parse(&broken).unwrap().canonical;
+    assert_eq!(c.cached_remote_size(&broken).unwrap(), None);
 }
 
 #[test]
@@ -323,9 +302,10 @@ fn remote_concurrent_revisions_keep_one_projection_and_all_full_snapshots() {
     let mut cloud = BTreeMap::new();
     transfer(&source, &mut cloud).unwrap();
     transfer(&receiver, &mut cloud).unwrap();
-    let original = cloud.iter().find(|(key, _)| key.starts_with("v1/revisions/")).unwrap();
-    let body = object::Name::parse(original.0).unwrap().decode(original.1, None).unwrap();
-    let parent = digest(&body);
+    let raw = raw_objects(&cloud);
+    let original = raw.iter().find(|(key, _)| key.starts_with("v1/revisions/")).unwrap();
+    let parent = digest(original.1);
+    let body = original.1.clone();
     for text in ["concurrent left", "concurrent right"] {
         let mut revision: Revision = serde_json::from_slice(&body).unwrap();
         revision.parent = Some(parent.clone());
@@ -342,11 +322,73 @@ fn remote_concurrent_revisions_keep_one_projection_and_all_full_snapshots() {
     assert_eq!(revision_heads(&revisions).len(), 2);
     assert_eq!(receiver.list_usage_events_for_session(&session.id).unwrap().len(), 1);
     assert_eq!(session.alternative_versions, 2);
+    assert_eq!(transfer(&receiver, &mut cloud).unwrap().sessions_with_alternatives, 1);
     let fresh = Store::open_in_memory().unwrap();
     transfer(&fresh, &mut cloud).unwrap();
     let fresh_session = fresh.list_recent_sessions(10).unwrap().pop().unwrap();
     assert!(fresh.get_messages(&fresh_session.id).unwrap()[0].content.starts_with("concurrent "));
     assert_eq!(fresh_session.alternative_versions, 1);
+}
+
+fn pending(store: &Store) -> (i64, i64) {
+    store
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM sync_pending_snapshots),
+                    (SELECT COUNT(*) FROM sync_pending_heads)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn remote_incremental_passes_match_a_forced_full_pass() {
+    crate::db::schema::register_sqlite_vec();
+    let a = Store::open_in_memory().unwrap();
+    let id = seed(&a, "incremental base", true);
+    let mut cloud = BTreeMap::new();
+    transfer(&a, &mut cloud).unwrap();
+    assert_eq!(pending(&a), (0, 0));
+    assert_eq!(transfer(&a, &mut cloud).unwrap().uploaded, 0);
+    let revisions = |store: &Store| -> i64 {
+        store.conn.query_row("SELECT COUNT(*) FROM sync_revisions", [], |row| row.get(0)).unwrap()
+    };
+    let edits = [
+        "UPDATE usage_events SET output_tokens = output_tokens + 1 WHERE session_id = ?1",
+        "UPDATE session_events SET summary = 'edited event' WHERE session_id = ?1",
+        "UPDATE sessions SET title = 'edited title' WHERE id = ?1",
+        "DELETE FROM usage_events WHERE session_id = ?1",
+    ];
+    for edit in edits {
+        let before = revisions(&a);
+        a.conn.execute(edit, [&id]).unwrap();
+        assert_eq!(pending(&a).0, 1, "{edit}");
+        assert_eq!(transfer(&a, &mut cloud).unwrap().uploaded, 1, "{edit}");
+        assert_eq!(revisions(&a), before + 1, "{edit}");
+        assert_eq!(pending(&a), (0, 0), "{edit}");
+    }
+    a.conn.execute("UPDATE sessions SET is_import = is_import WHERE id = ?1", [&id]).unwrap();
+    assert_eq!(pending(&a), (0, 0));
+    let before = revisions(&a);
+    a.conn.execute("DELETE FROM sync_state", []).unwrap();
+    assert_eq!(transfer(&a, &mut cloud).unwrap().uploaded, 0);
+    assert_eq!(revisions(&a), before);
+    a.conn.execute("UPDATE sessions SET title = 'untracked' WHERE id = ?1", [&id]).unwrap();
+    a.conn.execute("DELETE FROM sync_pending_snapshots", []).unwrap();
+    a.prepare_remote(&ProjectScope::Directory("/synthetic".into()), &mut |_, _| {}).unwrap();
+    assert_eq!(revisions(&a), before + 1);
+    assert_eq!(transfer(&a, &mut cloud).unwrap().uploaded, 1);
+
+    let b = Store::open_in_memory().unwrap();
+    transfer(&b, &mut cloud).unwrap();
+    let received = b.list_recent_sessions(1).unwrap().pop().unwrap();
+    assert_eq!(received.title, "untracked");
+    assert_eq!(b.list_usage_events_for_session(&received.id).unwrap().len(), 0);
+    b.conn.execute("DELETE FROM sync_state", []).unwrap();
+    let summary = transfer(&b, &mut cloud).unwrap();
+    assert_eq!((summary.downloaded, summary.uploaded), (0, 0));
+    assert_eq!(b.list_recent_sessions(1).unwrap().pop().unwrap().title, received.title);
 }
 
 #[test]
