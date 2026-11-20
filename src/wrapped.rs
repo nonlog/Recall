@@ -8,8 +8,9 @@ use chrono::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::store::Store;
+use crate::db::usage_store::UsageDedup;
 use crate::types::UsageEventRecord;
-use crate::usage::{TokenTotals, UsageDedup};
+use crate::usage::TokenTotals;
 
 const INNER: usize = 52;
 const WEEKDAYS: [&str; 7] =

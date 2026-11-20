@@ -134,12 +134,18 @@ It requires all message, usage, and event arrays, including empty arrays. A
 revision is the complete indexed snapshot, not a promise that an adapter captured
 every native field. Old partial exports cannot restore fields they never carried.
 
-Objects use SHA-256 content addresses:
+Objects use SHA-256 addresses of the decoded JSON:
 
 ```text
 v1/revisions/<sha256>.json
+v1/revisions/<sha256>.json.zst
+v1/revisions/<sha256>.delta-<parent-sha256>.zst
 v1/metadata/<sha256>.json
 ```
+
+Current clients read legacy JSON, compressed revisions, and deltas. A delta
+requires its parent revision. Upgrade every client sharing a library before
+writing the new formats. Older clients may reject compressed objects.
 
 Metadata carries evidenced locations or a strict legacy-association proof
 referencing two identical snapshots. Association proofs propagate when the old
@@ -147,7 +153,7 @@ import was already published. Host names and location observations are separate
 from content revisions, so renaming a host does not create a content branch.
 An unchanged native path retains its observation timestamp; it is not a heartbeat.
 
-Core retains the exact object bytes locally. A known descendant can update an
+Core retains complete decoded content in a compressed local cache. A known descendant can update an
 indexed replica; an older revision cannot roll it back. Concurrent revisions
 remain available as complete snapshots while ordinary queries and usage count
 one row per proven logical session. A preexisting local selection is retained
@@ -158,7 +164,8 @@ recency. Network revisions never overwrite a confirmed native scanner binding.
 Every synchronization starts a full paginated enumeration, including empty pages
 with a continuation cursor. Repeated cursors and malformed or unsupported objects
 fail the operation. There is no high-water mark or remote deletion. Missing
-objects within the upload scope are restored from the retained local bytes.
+objects within the upload scope are restored from the local cache. Snapshot
+preparation and projection use local change tracking after the initial sync.
 Each data object is limited to 512 MiB. Sync downloads and uploads run up to 16
 objects at a time. Each sync transport operation has a 120-second deadline plus
 one second per 64 KiB of the object it transfers. This allows each of 16

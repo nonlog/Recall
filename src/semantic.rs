@@ -72,11 +72,11 @@ pub(crate) fn run_background_worker<F>(sync_first: bool, mut sync_fn: F) -> Resu
 where
     F: FnMut() -> Result<()>,
 {
+    // Schema migration may briefly acquire the same worker lock.
+    let store = Store::open()?;
     let Some(_lock) = try_acquire_worker_lock()? else {
         return Ok(());
     };
-
-    let store = Store::open()?;
 
     if sync_first {
         store.set_background_job_state(BACKGROUND_JOB, "sync", Some("Incremental sync"))?;
@@ -106,7 +106,9 @@ where
         Some(&format!("starting on {}", provider.device_name())),
     )?;
 
-    while process_next_session(&store, &provider)? {}
+    while crate::config::AppConfig::load()?.semantic_enabled
+        && process_next_session(&store, &provider)?
+    {}
 
     store.clear_background_job_state(BACKGROUND_JOB)?;
     Ok(())

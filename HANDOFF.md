@@ -8,6 +8,21 @@ Release commit: see tag `v0.6.5.10`
 
 ## Current fork policy
 
+### Recall 0.7.0 reconciliation
+
+The feature port through upstream `acffa6173be0` includes Antigravity Desktop,
+semantic opt-in, scoped JSONL export, usage ownership, `recall-calibrate`,
+hyphenated search, and incremental remote sync with compressed revisions and
+stable parent links. Commits `068092f`, `9e01497`, and `ea741f4` cover remote
+recovery, CLI compatibility, and incremental sync respectively.
+
+This merge retains the fork's session and TUI modules, release metadata,
+Windows persistence, and synchronous trigram index repair. The upstream
+session and TUI splits and staged trigram backfill were deferred. The worker
+opens the store before taking the worker lock so index repair can run first.
+The next upstream merge starts from `acffa6173be0`. Any deferred change can
+still be ported separately from the upstream history.
+
 ### 2026-11-20 Automatic upstream sync
 
 - Upstream synchronization now pushes a clean, fully validated merge commit to

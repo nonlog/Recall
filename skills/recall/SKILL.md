@@ -53,10 +53,12 @@ Pass a fresh high-entropy `invocation_nonce` literal on each MCP search or recen
 
 For `search_messages`, `current_session_excluded` states whether self-exclusion was applied; an explicit `session_id` includes that session even when it is current.
 
+For `search`, `session list`, `usage`, and full `sync`, pass comma-separated source ids or labels in one `--source` value. For example, `--source codex,claude-code` selects either source.
+
 Use the equivalent CLI workflow when needed:
 
 ```bash
-recall session list --project /absolute/project/path --source <source> --limit 20 --sort updated --format json
+recall session list --project /absolute/project/path --source <sources> --limit 20 --sort updated --format json
 recall session list --project owner/repo --query "<keywords>" --time 7d --limit 20 --sort updated --format json
 recall search "<keywords>" --messages --project owner/repo --limit 10 --format json
 recall search "<keywords>" --messages --session-id <session-id> --format json
@@ -134,18 +136,18 @@ An explicit share or refresh request authorizes a real deployment. Use `--dry-ru
 Use an explicit session id when provided. Otherwise sync and list recent sessions for the active project, filtering by source only when known. Select the current conversation only when its identity is unambiguous; inspect the smallest necessary tail or ask the user if several candidates remain.
 
 ```bash
-recall session list --project /absolute/project/path --source <source> --limit 5 --sort updated --sync --format json
+recall session list --project /absolute/project/path --source <sources> --limit 5 --sort updated --sync --format json
 ```
 
 Base the TL;DR on the selected session. For the current conversation, use the existing context without reloading its transcript solely for a summary. For another session, use its retrieved transcript; omit the optional TL;DR if evidence is insufficient. Never substitute the current conversation for a different session.
 
-When including a TL;DR, create a unique file with `mktemp /tmp/recall-tldr.XXXXXX`, write the short Markdown summary, and publish with that path:
+When including a TL;DR, create a temporary directory. If `/Volumes/git` is mounted, use `mktemp -d /Volumes/git/scratch/recall-tldr-XXXXXX`. Otherwise, use `mktemp -d`. Write the short Markdown summary to `<temporary-directory>/tldr.md`, then publish with that file path:
 
 ```bash
 recall session share --id <session-id> --tldr-file <temporary-tldr-path> --format json
 ```
 
-Omit `--tldr-file` when no summary is supplied; remove any temporary file after publishing. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
+Omit `--tldr-file` when no summary is supplied. After publishing succeeds or fails, delete only the temporary directory you created and its contents. Missing, unreadable, or blank TL;DR input does not block publishing. Read `share.url` from the JSON and verify it with `curl -I -L`. If the first check returns 404, publish once more and recheck, then stop. If sharing is not configured, tell the user to run `recall share init`. Return the live URL rather than raw JSON.
 
 List and unpublish shared pages with:
 

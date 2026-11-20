@@ -20,11 +20,15 @@ enum UsageOwnership {
 }
 
 #[derive(Default)]
-struct UsageDedup {
+pub(crate) struct UsageDedup {
     owners: HashMap<(String, String), String>,
 }
 
 impl UsageDedup {
+    pub(crate) fn accept(&mut self, event: &UsageEventRecord) -> bool {
+        self.assign(event) == UsageOwnership::Counted
+    }
+
     fn assign(&mut self, event: &UsageEventRecord) -> UsageOwnership {
         let key = match event.source.as_str() {
             "codex" => format!(
@@ -150,12 +154,6 @@ impl Store {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
 
-        if let Some(cutoff) = after_millis {
-            sql.push_str(&format!(" AND timestamp >= ?{param_idx}"));
-            params.push(Box::new(cutoff));
-            param_idx += 1;
-        }
-
         if let Some(source_ids) = sources
             && !source_ids.is_empty()
         {
@@ -171,7 +169,9 @@ impl Store {
             sql.push(')');
         }
 
-        sql.push_str(" ORDER BY timestamp ASC, source ASC, event_seq ASC");
+        sql.push_str(
+            " ORDER BY timestamp ASC, source ASC, event_seq ASC, session_id ASC, event_key ASC",
+        );
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
