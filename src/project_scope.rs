@@ -40,6 +40,32 @@ impl ProjectScope {
         }
     }
 
+    pub(crate) fn envelope(&self) -> serde_json::Value {
+        let (repository, directory) = match self {
+            Self::Global => (None, None),
+            Self::Directory(directory) => (None, Some(directory.as_str())),
+            Self::Repository { filter, local_root } => {
+                let identity = match filter {
+                    RepoFilter::Remote(remote) => remote.split_once('/').map(|(_, slug)| {
+                        serde_json::json!({
+                            "remote": remote,
+                            "slug": slug,
+                            "name": slug.rsplit('/').next().unwrap_or(slug),
+                        })
+                    }),
+                    _ => None,
+                };
+                (identity, local_root.as_deref())
+            }
+        };
+        serde_json::json!({
+            "kind": self.kind(),
+            "value": self.value(),
+            "repository": repository,
+            "directory": directory,
+        })
+    }
+
     pub(crate) fn value(&self) -> Option<&str> {
         match self {
             ProjectScope::Global => None,

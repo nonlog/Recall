@@ -54,7 +54,7 @@ const SESSION_EMBED_BATCH: usize = 8;
 const BACKGROUND_JOB: &str = "pipeline";
 
 pub(crate) fn ensure_background_worker(sync_first: bool) -> Result<()> {
-    if !crate::config::AppConfig::load().unwrap_or_default().semantic_enabled {
+    if !sync_first && !crate::config::AppConfig::load()?.semantic_enabled {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
@@ -78,10 +78,6 @@ where
 
     let store = Store::open()?;
 
-    if !crate::config::AppConfig::load().unwrap_or_default().semantic_enabled {
-        return Ok(());
-    }
-
     if sync_first {
         store.set_background_job_state(BACKGROUND_JOB, "sync", Some("Incremental sync"))?;
         if let Err(err) = sync_fn() {
@@ -89,6 +85,11 @@ where
             store.set_background_job_state(BACKGROUND_JOB, "error", Some(&message))?;
             return Err(err);
         }
+    }
+
+    if !crate::config::AppConfig::load()?.semantic_enabled {
+        store.clear_background_job_state(BACKGROUND_JOB)?;
+        return Ok(());
     }
 
     let provider = match EmbeddingProvider::new(false) {

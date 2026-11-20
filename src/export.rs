@@ -70,25 +70,7 @@ pub(crate) fn run_cli(
         scope,
         thread_role,
         limit: if limit == 0 { None } else { Some(limit) },
-        includes: match (include_filter, messages) {
-            (None, MessageMode::All) => ExportIncludes::full(),
-            (None, MessageMode::None) => ExportIncludes {
-                messages: false,
-                usage: true,
-                usage_ownership: false,
-                events: true,
-            },
-            (Some(include), MessageMode::All) => parse_export_includes(Some(include))?,
-            (Some(include), MessageMode::None) => apply_include_filter(
-                ExportIncludes {
-                    messages: false,
-                    usage: false,
-                    usage_ownership: false,
-                    events: false,
-                },
-                include,
-            )?,
-        },
+        includes: export_includes(include_filter, messages)?,
     };
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
@@ -98,27 +80,43 @@ pub(crate) fn run_cli(
     write_jsonl(&store, &options, &mut handle)
 }
 
+pub(crate) fn export_includes(
+    include: Option<&str>,
+    messages: MessageMode,
+) -> Result<ExportIncludes> {
+    if matches!(messages, MessageMode::All) {
+        return parse_export_includes(include);
+    }
+    let mut includes = match include {
+        None => ExportIncludes::full(),
+        Some(include) => apply_include_filter(
+            ExportIncludes { messages: false, usage: false, usage_ownership: false, events: false },
+            include,
+        )?,
+    };
+    includes.messages = false;
+    Ok(includes)
+}
+
 pub(crate) fn write_scope_record<W: Write>(options: &ExportOptions, mut writer: W) -> Result<()> {
+    let mut scope = options.scope.envelope();
+    scope["sources"] = serde_json::json!(options.sources);
+    scope["time"] = serde_json::json!(match options.time_range {
+        TimeRange::Today => "today",
+        TimeRange::Week => "7d",
+        TimeRange::Month => "30d",
+        TimeRange::All => "all",
+    });
+    scope["project"] =
+        serde_json::json!({"kind": options.scope.kind(), "value": options.scope.value()});
+    scope["thread_role"] = serde_json::json!(options.thread_role.map(|role| role.as_str()));
+    scope["limit"] = serde_json::json!(options.limit);
     serde_json::to_writer(
         &mut writer,
         &serde_json::json!({
             "record_type": "scope",
             "protocol_version": crate::PROTOCOL_VERSION,
-            "scope": {
-                "sources": options.sources,
-                "time": match options.time_range {
-                    TimeRange::Today => "today",
-                    TimeRange::Week => "7d",
-                    TimeRange::Month => "30d",
-                    TimeRange::All => "all",
-                },
-                "project": {
-                    "kind": options.scope.kind(),
-                    "value": options.scope.value(),
-                },
-                "thread_role": options.thread_role.map(|role| role.as_str()),
-                "limit": options.limit,
-            }
+            "scope": scope,
         }),
     )?;
     writer.write_all(b"\n")?;

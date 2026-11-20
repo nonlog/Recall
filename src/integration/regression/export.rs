@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn export_without_messages_can_report_scope_for_an_empty_selection() {
+    let store = setup();
+    let options = ExportOptions {
+        session_ids: Vec::new(),
+        sources: Some(vec!["codex".into(), "claude".into()]),
+        time_range: TimeRange::All,
+        scope: ProjectScope::Directory("/tmp/empty".into()),
+        thread_role: None,
+        limit: Some(10),
+        includes: crate::export::export_includes(
+            Some("messages,usage-ownership"),
+            crate::export::MessageMode::None,
+        )
+        .unwrap(),
+    };
+    assert!(!options.includes.messages);
+    assert!(options.includes.usage_ownership);
+    let mut output = Vec::new();
+    crate::export::write_scope_record(&options, &mut output).unwrap();
+    write_jsonl(&store, &options, &mut output).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(record["record_type"], "scope");
+    assert_eq!(record["scope"]["kind"], "directory");
+    assert_eq!(record["scope"]["directory"], "/tmp/empty");
+    assert_eq!(record["scope"]["sources"], serde_json::json!(["codex", "claude"]));
+}
+
+#[test]
 fn export_jsonl_emits_session_messages_and_usage_events() {
     let store = setup();
     let mut session = make_session("s1", "codex", "raw1", "Export session");
