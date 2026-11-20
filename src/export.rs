@@ -45,6 +45,7 @@ pub(crate) struct ExportOptions {
     pub(crate) includes: ExportIncludes,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_cli(
     source_filter: Option<&str>,
     time_filter: Option<&str>,
@@ -67,19 +68,16 @@ pub(crate) fn run_cli(
         scope,
         thread_role,
         limit: if limit == 0 { None } else { Some(limit) },
-        includes: {
-            let includes = match (include_filter, messages) {
-                (None, MessageMode::All) => ExportIncludes::full(),
-                (None, MessageMode::None) => {
-                    ExportIncludes { messages: false, usage: true, events: true }
-                }
-                (Some(include), MessageMode::All) => parse_export_includes(Some(include))?,
-                (Some(include), MessageMode::None) => apply_include_filter(
-                    ExportIncludes { messages: false, usage: false, events: false },
-                    include,
-                )?,
-            };
-            includes
+        includes: match (include_filter, messages) {
+            (None, MessageMode::All) => ExportIncludes::full(),
+            (None, MessageMode::None) => {
+                ExportIncludes { messages: false, usage: true, events: true }
+            }
+            (Some(include), MessageMode::All) => parse_export_includes(Some(include))?,
+            (Some(include), MessageMode::None) => apply_include_filter(
+                ExportIncludes { messages: false, usage: false, events: false },
+                include,
+            )?,
         },
     };
     let stdout = std::io::stdout();
